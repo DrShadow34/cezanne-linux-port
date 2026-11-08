@@ -3,7 +3,7 @@
 # repository: first run collect-stock-firmware.sh (as root on the phone while
 # its super partition still holds the stock system, or with images of super
 # and scp1), which writes stock-firmware.tar.zst next to this file; then
-# build. What goes where (hardware.md, Firmware column):
+# build. What goes where (HARDWARE.md, Firmware column):
 #   /usr/lib/firmware/            CONNSYS Wi-Fi / BT / FM blobs and configs,
 #                                 AW8697 haptics library (vendor /firmware)
 #   /usr/lib/firmware/cirrus/     CS35L41 speaker protection, per amp

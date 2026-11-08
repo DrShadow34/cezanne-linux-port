@@ -567,10 +567,10 @@ index 642b3ba..ca6798a 100644
          }
      }
 diff --git a/aperture/src/lib.rs b/aperture/src/lib.rs
-index cb57112..6bcf102 100644
+index cb57112..b130797 100644
 --- a/aperture/src/lib.rs
 +++ b/aperture/src/lib.rs
-@@ -21,6 +21,7 @@ use gst::prelude::*;
+@@ -21,9 +21,11 @@ use gst::prelude::*;
  mod camera;
  mod code_detector;
  mod device_provider;
@@ -578,6 +578,10 @@ index cb57112..6bcf102 100644
  mod enums;
  mod error;
  mod pipeline_tee;
++mod png;
+ mod utils;
+ mod viewfinder;
+ 
 diff --git a/aperture/src/pipeline_tee.rs b/aperture/src/pipeline_tee.rs
 index 8e8d0c8..552cf55 100644
 --- a/aperture/src/pipeline_tee.rs
@@ -599,6 +603,85 @@ index 8e8d0c8..552cf55 100644
  
          imp.hashmap
              .lock()
+diff --git a/aperture/src/png.rs b/aperture/src/png.rs
+new file mode 100644
+index 0000000..215379f
+--- /dev/null
++++ b/aperture/src/png.rs
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! EXIF orientation for PNG pictures.
++//!
++//! The camerabin's image-orientation tag reaches JPEG pictures as EXIF, but
++//! the PNG encoder drops it: pictures taken with the phone turned were saved
++//! sideways with nothing saying so (viewers showed them sideways, and the
++//! post-processing ran its subject networks on a sideways scene).  This adds
++//! the EXIF chunk (`eXIf`, before the image data) that glycin and exiv2
++//! read.
++
++use std::path::Path;
++
++/// Writes the EXIF orientation (1, 6, 3 or 8) into the PNG at `path`; a
++/// PNG that has EXIF already is left as it is.  A file that does not end
++/// in IEND yet (still being written: camerabin reports a picture before
++/// its file is complete) gives `UnexpectedEof`.
++pub fn set_orientation(path: &Path, orientation: u16) -> std::io::Result<()> {
++    let data = std::fs::read(path)?;
++    if !data.ends_with(b"\x00\x00\x00\x00IEND\xae\x42\x60\x82") {
++        return Err(std::io::ErrorKind::UnexpectedEof.into());
++    }
++    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "not a PNG");
++    // signature, then IHDR (13 bytes of data) is the first chunk
++    if data.len() < 33 || &data[..8] != b"\x89PNG\r\n\x1a\n" || &data[12..16] != b"IHDR" {
++        return Err(bad());
++    }
++    let mut pos = 8;
++    while pos + 8 <= data.len() {
++        let len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
++        match &data[pos + 4..pos + 8] {
++            b"eXIf" => return Ok(()),
++            b"IDAT" | b"IEND" => break,
++            _ => pos += 12 + len,
++        }
++    }
++
++    // big-endian TIFF, IFD0 with the one Orientation entry
++    let mut exif = b"MM\x00\x2a\x00\x00\x00\x08".to_vec();
++    exif.extend_from_slice(&1u16.to_be_bytes());
++    exif.extend_from_slice(&0x0112u16.to_be_bytes());
++    exif.extend_from_slice(&3u16.to_be_bytes()); // SHORT
++    exif.extend_from_slice(&1u32.to_be_bytes());
++    exif.extend_from_slice(&orientation.to_be_bytes());
++    exif.extend_from_slice(&[0, 0]);
++    exif.extend_from_slice(&0u32.to_be_bytes()); // no next IFD
++
++    let mut chunk = (exif.len() as u32).to_be_bytes().to_vec();
++    chunk.extend_from_slice(b"eXIf");
++    chunk.extend_from_slice(&exif);
++    let crc = crc32(&chunk[4..]);
++    chunk.extend_from_slice(&crc.to_be_bytes());
++
++    let mut out = Vec::with_capacity(data.len() + chunk.len());
++    out.extend_from_slice(&data[..33]);
++    out.extend_from_slice(&chunk);
++    out.extend_from_slice(&data[33..]);
++    // a whole file under the picture's name at any moment
++    let tmp = path.with_extension("png.orientation-tmp");
++    std::fs::write(&tmp, &out)?;
++    std::fs::rename(&tmp, path)
++}
++
++/// The PNG chunk CRC (CRC-32, ISO 3309), over the type and the data.
++fn crc32(bytes: &[u8]) -> u32 {
++    let mut crc = 0xffff_ffffu32;
++    for &b in bytes {
++        crc ^= u32::from(b);
++        for _ in 0..8 {
++            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
++        }
++    }
++    !crc
++}
 diff --git a/aperture/src/utils.rs b/aperture/src/utils.rs
 index 72ab13b..f0b47b2 100644
 --- a/aperture/src/utils.rs
@@ -644,7 +727,7 @@ index 72ab13b..f0b47b2 100644
  
  // Whether the system supports h264 video encoding.
 diff --git a/aperture/src/viewfinder.rs b/aperture/src/viewfinder.rs
-index 7209cb5..c68500a 100644
+index 7209cb5..56f3722 100644
 --- a/aperture/src/viewfinder.rs
 +++ b/aperture/src/viewfinder.rs
 @@ -17,6 +17,22 @@ use crate::code_detector::QrCodeDetector;
@@ -670,7 +753,7 @@ index 7209cb5..c68500a 100644
  const PROVIDER_TIMEOUT: u64 = 2;
  
  #[derive(Debug)]
-@@ -70,8 +86,36 @@ mod imp {
+@@ -70,8 +86,42 @@ mod imp {
  
          pub timeout_handler: RefCell<Option<glib::SourceId>>,
  
@@ -696,18 +779,24 @@ index 7209cb5..c68500a 100644
 +        /// Device orientation (quarter turns counter-clockwise) for tagging
 +        /// pictures.
 +        pub device_orientation: Cell<u32>,
++        /// The picture being taken: clockwise quarter turns to show it
++        /// upright (for the PNG's EXIF, written when it is saved).
++        pub taken_quarters: Cell<u32>,
 +        /// Picture encoding: PNG (lossless) or JPEG at this quality.
 +        pub picture_png: Cell<bool>,
 +        pub jpeg_quality: Cell<u32>,
-+        /// What the camerabin's image profile was built with.
++        /// What the camerabin's image profile was built with (PNG, JPEG
++        /// quality); in effect from the camerabin's next start on.
 +        pub image_profile_for: Cell<Option<(bool, u32)>>,
 +        /// Tap-to-focus indicator, in widget coordinates.
 +        pub focus_point: Cell<Option<(f32, f32)>>,
 +        pub focus_timeout: RefCell<Option<glib::SourceId>>,
++        /// Manual focus: the lens position in dioptres; autofocus if `None`.
++        pub manual_focus: Cell<Option<f32>>,
      }
  
      impl Viewfinder {
-@@ -216,9 +260,7 @@ mod imp {
+@@ -216,9 +266,7 @@ mod imp {
          type Type = super::Viewfinder;
          type ParentType = gtk::Widget;
  
@@ -718,7 +807,7 @@ index 7209cb5..c68500a 100644
      }
  
      #[glib::derived_properties]
-@@ -235,6 +277,10 @@ mod imp {
+@@ -235,6 +283,10 @@ mod imp {
                  .build()
                  .expect("Missing GStreamer Bad Plug-ins");
              self.camerabin.set(camerabin.clone()).unwrap();
@@ -729,7 +818,7 @@ index 7209cb5..c68500a 100644
  
              let bus = self.camerabin().bus().unwrap();
              let watch = bus
-@@ -251,9 +297,27 @@ mod imp {
+@@ -251,9 +303,27 @@ mod imp {
                  .unwrap();
              self.bus_watch.set(watch).unwrap();
  
@@ -757,7 +846,7 @@ index 7209cb5..c68500a 100644
                  .build()
                  .expect("Missing gst-plugin-gtk4");
  
-@@ -269,7 +333,20 @@ mod imp {
+@@ -269,7 +339,20 @@ mod imp {
                      .intersect(&yuv_caps)
                      .is_empty()
              };
@@ -779,7 +868,7 @@ index 7209cb5..c68500a 100644
                  let bin = gst::Bin::default();
  
                  bin.add(&paintablesink).unwrap();
-@@ -281,31 +358,21 @@ mod imp {
+@@ -281,31 +364,21 @@ mod imp {
  
                  bin.upcast()
              } else {
@@ -823,7 +912,7 @@ index 7209cb5..c68500a 100644
              };
  
              tee.add_branch(&sink);
-@@ -445,6 +512,39 @@ mod imp {
+@@ -445,6 +518,39 @@ mod imp {
              self.parent_unrealize();
          }
  
@@ -863,7 +952,7 @@ index 7209cb5..c68500a 100644
          fn snapshot(&self, snapshot: &gtk::Snapshot) {
              if self.is_front_camera.get() {
                  let w = self.obj().width() as f32;
-@@ -456,6 +556,15 @@ mod imp {
+@@ -456,6 +562,15 @@ mod imp {
              } else {
                  self.parent_snapshot(snapshot);
              }
@@ -879,7 +968,7 @@ index 7209cb5..c68500a 100644
          }
      }
  }
-@@ -572,6 +681,112 @@ impl Viewfinder {
+@@ -572,6 +687,144 @@ impl Viewfinder {
          }
      }
  
@@ -893,8 +982,11 @@ index 7209cb5..c68500a 100644
 +        let Some(src) = self.camera_source() else {
 +            return false;
 +        };
-+        // the front camera has a fixed-focus lens
-+        if imp.is_front_camera.get() || src.find_property("af-windows").is_none() {
++        // the front camera has a fixed-focus lens; manual focus ignores taps
++        if imp.is_front_camera.get()
++            || imp.manual_focus.get().is_some()
++            || src.find_property("af-windows").is_none()
++        {
 +            return false;
 +        }
 +        let Some(paintable) = imp.picture.paintable() else {
@@ -962,7 +1054,7 @@ index 7209cb5..c68500a 100644
 +        let window = gst::Array::new([x0, y0, ww as i32, wh as i32]);
 +        log::debug!("Focus at {x:.0},{y:.0} -> sensor window {x0},{y0} {ww:.0}x{wh:.0}");
 +
-+        // a tap means autofocus there, also coming from manual focus
++        // a tap means autofocus there
 +        src.set_property_from_str("af-mode", "continuous");
 +        src.set_property_from_str("af-metering", "windows");
 +        src.set_property("af-windows", gst::Array::new([window]));
@@ -989,14 +1081,43 @@ index 7209cb5..c68500a 100644
 +        true
 +    }
 +
++    /// Manual focus at `dioptres` (0: infinity), or continuous autofocus
++    /// with `None`.  Rear cameras; kept over camera switches.
++    pub fn set_manual_focus(&self, dioptres: Option<f32>) {
++        let imp = self.imp();
++        if imp.manual_focus.replace(dioptres) == dioptres {
++            return;
++        }
++        self.apply_focus_mode();
++    }
++
++    fn apply_focus_mode(&self) {
++        let imp = self.imp();
++        let Some(src) = self.camera_source() else {
++            return;
++        };
++        if imp.is_front_camera.get() || src.find_property("af-mode").is_none() {
++            return;
++        }
++        // libcamerasrc replays the last values when the camera restarts, and
++        // the AF keeps its mode over a picture's reconfiguration
++        match imp.manual_focus.get() {
++            Some(dioptres) => {
++                src.set_property_from_str("af-mode", "manual");
++                src.set_property("lens-position", dioptres);
++            }
++            None => src.set_property_from_str("af-mode", "continuous"),
++        }
++    }
++
      /// Takes a picture.
      ///
      /// The recording will be saved to `location`. This method throws an error
-@@ -606,15 +821,255 @@ impl Viewfinder {
+@@ -606,15 +859,255 @@ impl Viewfinder {
          imp.is_taking_picture.set(true);
  
          self.set_tags();
-+        self.update_image_profile();
++        imp.taken_quarters.set(self.picture_quarters());
 +
 +        self.save_raw(location.as_ref());
  
@@ -1249,23 +1370,78 @@ index 7209cb5..c68500a 100644
      /// Starts recording a video.
      ///
      /// The recording will be saved to `location`. This method throws an error
-@@ -716,6 +1171,7 @@ impl Viewfinder {
+@@ -716,6 +1209,11 @@ impl Viewfinder {
  
      /// Starts the viewfinder.
      pub fn start_stream(&self) {
 +        self.update_raw_branch();
++        // the camerabin takes a new image profile when it leaves NULL
++        if self.imp().camerabin().current_state() == gst::State::Null {
++            self.update_image_profile();
++        }
          glib::spawn_future_local(glib::clone!(
              #[weak(rename_to = obj)]
              self,
-@@ -822,6 +1278,7 @@ impl Viewfinder {
+@@ -821,7 +1319,49 @@ impl Viewfinder {
+     }
  
      fn on_image_done(&self, file: &gio::File) {
-         self.imp().is_taking_picture.set(false);
+-        self.imp().is_taking_picture.set(false);
++        let imp = self.imp();
++        imp.is_taking_picture.set(false);
 +        self.restore_preview_caps();
++        let png = imp.image_profile_for.get().is_some_and(|(png, _)| png);
++        self.apply_picture_encoding();
++
++        // the PNG encoder drops the orientation tag (JPEG keeps it as EXIF):
++        // tag the file once it is complete, then report the picture
++        if png
++            && let Some(path) = file.path()
++        {
++            let orientation = [1, 6, 3, 8][(imp.taken_quarters.get() % 4) as usize];
++            let mut tries = 0;
++            let file = file.clone();
++            glib::timeout_add_local(
++                std::time::Duration::from_millis(50),
++                glib::clone!(
++                    #[weak(rename_to = obj)]
++                    self,
++                    #[upgrade_or]
++                    glib::ControlFlow::Break,
++                    move || {
++                        tries += 1;
++                        match crate::png::set_orientation(&path, orientation) {
++                            Err(err)
++                                if err.kind() == std::io::ErrorKind::UnexpectedEof
++                                    && tries < 100 =>
++                            {
++                                return glib::ControlFlow::Continue;
++                            }
++                            Err(err) => log::warn!(
++                                "Cannot tag {} with its orientation: {err}",
++                                path.display()
++                            ),
++                            Ok(()) => {}
++                        }
++                        obj.emit_picture_done(Some(&file));
++                        glib::ControlFlow::Break
++                    }
++                ),
++            );
++            return;
++        }
  
          self.emit_picture_done(Some(file));
      }
-@@ -846,6 +1303,19 @@ impl Viewfinder {
+@@ -834,6 +1374,7 @@ impl Viewfinder {
+             let file = gio::File::for_path(path);
+             self.emit_recording_done(Some(&file));
+         }
++        self.apply_picture_encoding();
+     }
+ 
+     fn on_pipeline_error(&self, err: &gst::message::Error) {
+@@ -846,6 +1387,19 @@ impl Viewfinder {
  
          self.cancel_current_operation();
  
@@ -1285,7 +1461,7 @@ index 7209cb5..c68500a 100644
          if self.imp().camerabin().current_state() != gst::State::Playing {
              self.imp().set_state(ViewfinderState::Error);
          }
-@@ -855,6 +1325,7 @@ impl Viewfinder {
+@@ -855,6 +1409,7 @@ impl Viewfinder {
          let imp = self.imp();
  
          if imp.is_taking_picture.replace(false) {
@@ -1293,7 +1469,7 @@ index 7209cb5..c68500a 100644
              self.emit_picture_done(None);
          }
          if imp.is_recording_video.replace(None).is_some() {
-@@ -892,6 +1363,9 @@ impl Viewfinder {
+@@ -892,6 +1447,9 @@ impl Viewfinder {
          if let Some(datetime) = gst::DateTime::new_now_local_time() {
              tagsetter.add_tag::<gst::tags::DateTime>(&datetime, gst::TagMergeMode::Replace);
          }
@@ -1303,7 +1479,7 @@ index 7209cb5..c68500a 100644
          if let Some(camera) = self.camera() {
              let device_model = camera.display_name();
              tagsetter.add_tag::<gst::tags::DeviceModel>(
-@@ -939,6 +1413,17 @@ impl Viewfinder {
+@@ -939,6 +1497,17 @@ impl Viewfinder {
                      .field("bitrate", DEFAULT_BITRATE)
                      .build(),
              )
@@ -1321,7 +1497,7 @@ index 7209cb5..c68500a 100644
              .item(
                  ElementPropertiesMapItem::builder("vp8enc")
                      .field("target-bitrate", DEFAULT_BITRATE)
-@@ -956,57 +1441,29 @@ impl Viewfinder {
+@@ -956,57 +1525,29 @@ impl Viewfinder {
              )
              .build();
  
@@ -1398,7 +1574,7 @@ index 7209cb5..c68500a 100644
                  );
  
                  let caps = gst::Caps::builder("video/quicktime").build();
-@@ -1014,13 +1471,24 @@ impl Viewfinder {
+@@ -1014,13 +1555,24 @@ impl Viewfinder {
                      .name("MP4 audio/video")
                      .description("Standard MP4/H264/MP3");
  
@@ -1429,7 +1605,7 @@ index 7209cb5..c68500a 100644
  
                  if !self.disable_audio_recording() {
                      let audio_profile = gst_pbutils::EncodingAudioProfile::builder(
-@@ -1068,6 +1536,7 @@ impl Viewfinder {
+@@ -1068,6 +1620,7 @@ impl Viewfinder {
                      }
                  );
  
@@ -1437,7 +1613,7 @@ index 7209cb5..c68500a 100644
                  let caps = gst::Caps::builder("video/webm").build();
                  let mut container_profile = gst_pbutils::EncodingContainerProfile::builder(&caps)
                      .name("WebM audio/video")
-@@ -1094,15 +1563,133 @@ impl Viewfinder {
+@@ -1094,15 +1647,164 @@ impl Viewfinder {
              }
          };
  
@@ -1494,15 +1670,23 @@ index 7209cb5..c68500a 100644
 +        );
 +    }
 +
-+    /// The image encoding profile for the picture format and quality.
++    /// What the image profile is built from: PNG, JPEG quality.
++    fn image_profile_key(&self) -> (bool, u32) {
++        let imp = self.imp();
++        let quality = imp.jpeg_quality.get();
++        let quality = if quality == 0 { 95 } else { quality.min(100) };
++        (imp.picture_png.get(), quality)
++    }
++
++    /// The image encoding profile for the picture format and quality.  The
++    /// camerabin applies it on its next start (NULL to READY) only.
 +    fn update_image_profile(&self) {
 +        use gst_pbutils::encoding_profile::EncodingProfileBuilder;
 +        use gst_pbutils::{ElementProperties, ElementPropertiesMapItem};
 +
 +        let imp = self.imp();
-+        let quality = imp.jpeg_quality.get();
-+        let quality = if quality == 0 { 95 } else { quality.min(100) };
-+        let key = (imp.picture_png.get(), quality);
++        let key = self.image_profile_key();
++        let quality = key.1;
 +        if imp.image_profile_for.get() == Some(key) {
 +            return;
 +        }
@@ -1569,16 +1753,39 @@ index 7209cb5..c68500a 100644
 +        imp.image_profile_for.set(Some(key));
 +    }
 +
-+    /// Picture encoding: PNG, or JPEG at `jpeg_quality` (1-100).  Applies
-+    /// from the next picture on.
++    /// Picture encoding: PNG, or JPEG at `jpeg_quality` (1-100).  The
++    /// camerabin takes an image profile only when it starts, so a running
++    /// viewfinder restarts for a new one (after the picture or the
++    /// recording in progress).
 +    pub fn set_picture_encoding(&self, png: bool, jpeg_quality: u32) {
 +        let imp = self.imp();
 +        imp.picture_png.set(png);
 +        imp.jpeg_quality.set(jpeg_quality);
++        self.apply_picture_encoding();
++    }
++
++    fn apply_picture_encoding(&self) {
++        let imp = self.imp();
++        if imp.image_profile_for.get() == Some(self.image_profile_key())
++            || imp.is_taking_picture.get()
++            || imp.is_recording_video.borrow().is_some()
++        {
++            return;
++        }
++        if matches!(
++            imp.camerabin().current_state(),
++            gst::State::Playing | gst::State::Paused
++        ) {
++            log::debug!("Restarting the camera for the picture encoding");
++            self.stop_stream();
++            self.start_stream();
++        } else {
++            self.update_image_profile();
++        }
      }
  
      fn init(&self) {
-@@ -1142,6 +1729,28 @@ impl Viewfinder {
+@@ -1142,6 +1844,28 @@ impl Viewfinder {
          let bin = gst::Bin::new();
  
          let capsfilter = gst::ElementFactory::make("capsfilter").build()?;
@@ -1607,7 +1814,7 @@ index 7209cb5..c68500a 100644
          let decodebin3 = gst::ElementFactory::make("decodebin3").build()?;
          let capsfilter_post_decode = gst::ElementFactory::make("capsfilter").build()?;
          let caps_post_decode = gst::Caps::builder("video/x-raw").build();
-@@ -1213,12 +1822,26 @@ impl Viewfinder {
+@@ -1213,12 +1937,22 @@ impl Viewfinder {
          }
  
          if let Some(capsfilter) = imp.capsfilter.get() {
@@ -1626,16 +1833,12 @@ index 7209cb5..c68500a 100644
          imp.is_front_camera.set(is_front_camera);
 +        imp.rotation.set(camera.rotation());
 +
-+        // Continuous autofocus where the camera has a lens
-+        if let Some(src) = self.camera_source().filter(|_| !is_front_camera) {
-+            if src.find_property("af-mode").is_some() {
-+                src.set_property_from_str("af-mode", "continuous");
-+            }
-+        }
++        // continuous autofocus where the camera has a lens, or manual focus
++        self.apply_focus_mode();
  
          Ok(())
      }
-@@ -1237,6 +1860,80 @@ impl Viewfinder {
+@@ -1237,6 +1971,80 @@ impl Viewfinder {
      }
  }
  
@@ -1717,7 +1920,7 @@ index 7209cb5..c68500a 100644
      let bin = gst::Bin::new();
  
 diff --git a/data/org.gnome.Snapshot.gschema.xml.in b/data/org.gnome.Snapshot.gschema.xml.in
-index 21d605f..e7702db 100644
+index 21d605f..5fa7ae2 100644
 --- a/data/org.gnome.Snapshot.gschema.xml.in
 +++ b/data/org.gnome.Snapshot.gschema.xml.in
 @@ -7,6 +7,7 @@
@@ -1750,7 +1953,7 @@ index 21d605f..e7702db 100644
      <key name="countdown" type="i">
        <default>0</default>
        <summary>Countdown timer</summary>
-@@ -59,6 +70,55 @@
+@@ -59,6 +70,66 @@
        <summary>Picture format</summary>
        <description>Whether to save pictures as png or jpeg</description>
      </key>
@@ -1798,6 +2001,17 @@ index 21d605f..e7702db 100644
 +      <summary>Portrait Pictures of People</summary>
 +      <description>Blur the background around the people in the picture, from the APU's person mask (else by depth from the stereo pair) (Redmi K30 Ultra); excludes the portrait key</description>
 +    </key>
++    <key name="manual-focus" type="b">
++      <default>false</default>
++      <summary>Manual Focus</summary>
++      <description>Focus with the slider over the viewfinder instead of autofocus, on cameras with a focus motor (the main camera on the Redmi K30 Ultra)</description>
++    </key>
++    <key name="focus-position" type="d">
++      <range min="0" max="12"/>
++      <default>2.0</default>
++      <summary>Manual Focus Position</summary>
++      <description>The lens position for manual focus in dioptres, 0 being infinity (uncalibrated: a linear map of the focus motor's range)</description>
++    </key>
 +    <key name="save-raw" type="b">
 +      <default>false</default>
 +      <summary>Save RAW Photos</summary>
@@ -1838,6 +2052,16 @@ index 0000000..4096bdd
 +<svg height="16px" viewBox="0 0 16 16" width="16px" xmlns="http://www.w3.org/2000/svg">
 +    <path d="m 9.5 0.5 l -6.5 8.5 h 4.25 l -1.25 6.5 l 6.5 -8.75 h -4.25 z"/>
 +</svg>
+diff --git a/data/resources/icons/focus-far-symbolic.svg b/data/resources/icons/focus-far-symbolic.svg
+new file mode 100644
+index 0000000..14f6b30
+--- /dev/null
++++ b/data/resources/icons/focus-far-symbolic.svg
+@@ -0,0 +1,4 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
++  <!-- far focus: mountains -->
++  <path fill="#222" d="M0.5 13.5 L5.5 4 L8.4 9.4 L11 5.5 L15.5 13.5 Z"/>
++</svg>
 diff --git a/data/resources/icons/lens-macro-symbolic.svg b/data/resources/icons/lens-macro-symbolic.svg
 new file mode 100644
 index 0000000..db85b5d
@@ -1849,10 +2073,10 @@ index 0000000..db85b5d
 +  <path fill="#222" d="M4 1.5 L6 3.5 L8 1 L10 3.5 L12 1.5 L12 6 A4 4 0 0 1 8.75 9.93 L8.75 12.2 C9.6 11.2 11 10.6 12.5 10.6 C12.2 12.9 10.6 14.6 8.75 14.95 L8.75 15 L7.25 15 L7.25 14.95 C5.4 14.6 3.8 12.9 3.5 10.6 C5 10.6 6.4 11.2 7.25 12.2 L7.25 9.93 A4 4 0 0 1 4 6 Z"/>
 +</svg>
 diff --git a/data/resources/resources.gresource.xml.in b/data/resources/resources.gresource.xml.in
-index 032e6fc..5dc37a4 100644
+index 032e6fc..9715814 100644
 --- a/data/resources/resources.gresource.xml.in
 +++ b/data/resources/resources.gresource.xml.in
-@@ -19,5 +19,9 @@
+@@ -19,5 +19,10 @@
      <file preprocess="xml-stripblanks" alias ="external-link-symbolic.svg">icons/external-link-symbolic.svg</file>
      <file preprocess="xml-stripblanks" alias ="pick-camera-alt2-symbolic.svg">icons/pick-camera-alt2-symbolic.svg</file>
      <file preprocess="xml-stripblanks" alias ="qr-code-symbolic.svg">icons/qr-code-symbolic.svg</file>
@@ -1860,13 +2084,14 @@ index 032e6fc..5dc37a4 100644
 +    <file preprocess="xml-stripblanks" alias ="flash-off-symbolic.svg">icons/flash-off-symbolic.svg</file>
 +    <file preprocess="xml-stripblanks" alias ="flash-auto-symbolic.svg">icons/flash-auto-symbolic.svg</file>
 +    <file preprocess="xml-stripblanks" alias ="lens-macro-symbolic.svg">icons/lens-macro-symbolic.svg</file>
++    <file preprocess="xml-stripblanks" alias ="focus-far-symbolic.svg">icons/focus-far-symbolic.svg</file>
    </gresource>
  </gresources>
 diff --git a/data/resources/style.css b/data/resources/style.css
-index 638e11c..fc97245 100644
+index 638e11c..1762fb2 100644
 --- a/data/resources/style.css
 +++ b/data/resources/style.css
-@@ -78,12 +78,60 @@ button.gallerycontrols.circular {
+@@ -78,12 +78,80 @@ button.gallerycontrols.circular {
    min-height: 24px;
  }
  
@@ -1913,6 +2138,26 @@ index 638e11c..fc97245 100644
 +  font-weight: bold;
 +}
 +
++/* manual focus slider over the viewfinder, next to the lens selector */
++camera .focus-slider {
++  background-color: alpha(black, 0.45);
++  color: white;
++  border-radius: 500px;
++  padding: 4px 14px;
++}
++
++camera .focus-slider.vertical {
++  padding: 14px 4px;
++}
++
++camera .focus-slider scale.horizontal {
++  min-width: 200px;
++}
++
++camera .focus-slider scale.vertical {
++  min-height: 180px;
++}
++
 +camera .hdr-button {
 +  font-weight: bold;
 +  padding-left: 8px;
@@ -1932,34 +2177,46 @@ index 638e11c..fc97245 100644
 +  padding: 5px;
  }
 diff --git a/data/resources/ui/camera.ui b/data/resources/ui/camera.ui
-index 0b993e5..cc923b1 100644
+index 0b993e5..e9143d8 100644
 --- a/data/resources/ui/camera.ui
 +++ b/data/resources/ui/camera.ui
-@@ -12,6 +12,7 @@
+@@ -10,8 +10,11 @@
+       <object class="AdwBreakpoint" id="single_landscape_bp">
+         <condition>max-aspect-ratio: 4/3 or max-height: 600</condition>
          <setter object="multi_layout_view" property="layout-name">single_landscape_bp</setter>
++        <setter object="focus_box" property="orientation">horizontal</setter>
++        <setter object="focus_scale" property="orientation">horizontal</setter>
          <setter object="camera_mode_toggles" property="orientation">horizontal</setter>
          <setter object="camera_controls" property="orientation">horizontal</setter>
 +        <setter object="lens_toggles" property="orientation">horizontal</setter>
          <signal name="apply" handler="change_breakpoint" object="Camera" swapped="yes" />
        </object>
      </child>
-@@ -21,6 +22,7 @@
+@@ -19,8 +22,11 @@
+       <object class="AdwBreakpoint" id="dual_portrait_bp">
+         <condition>max-height: 400</condition>
          <setter object="multi_layout_view" property="layout-name">dual_portrait_bp</setter>
++        <setter object="focus_box" property="orientation">vertical</setter>
++        <setter object="focus_scale" property="orientation">vertical</setter>
          <setter object="camera_mode_toggles" property="orientation">vertical</setter>
          <setter object="camera_controls" property="orientation">vertical</setter>
 +        <setter object="lens_toggles" property="orientation">vertical</setter>
          <signal name="apply" handler="change_breakpoint" object="Camera" swapped="yes" />
        </object>
      </child>
-@@ -30,6 +32,7 @@
+@@ -28,8 +34,11 @@
+       <object class="AdwBreakpoint" id="dual_landscape_bp">
+         <condition>max-aspect-ratio: 4/3 and max-width: 500</condition>
          <setter object="multi_layout_view" property="layout-name">dual_landscape_bp</setter>
++        <setter object="focus_box" property="orientation">horizontal</setter>
++        <setter object="focus_scale" property="orientation">horizontal</setter>
          <setter object="camera_mode_toggles" property="orientation">horizontal</setter>
          <setter object="camera_controls" property="orientation">horizontal</setter>
 +        <setter object="lens_toggles" property="orientation">horizontal</setter>
          <signal name="apply" handler="change_breakpoint" object="Camera" swapped="yes" />
        </object>
      </child>
-@@ -99,36 +102,113 @@
+@@ -99,36 +108,113 @@
                    <object class="GtkWindowHandle">
                      <child>
                        <object class="GtkOverlay">
@@ -2098,7 +2355,7 @@ index 0b993e5..cc923b1 100644
                                </object>
                              </child>
                              <child type="primary-menu">
-@@ -139,6 +219,7 @@
+@@ -139,6 +225,7 @@
                                  <property name="tooltip-text" translatable="yes">Main Menu</property>
                                  <property name="primary">True</property>
                                  <style>
@@ -2106,7 +2363,7 @@ index 0b993e5..cc923b1 100644
                                    <class name="circular" />
                                    <class name="flat" />
                                  </style>
-@@ -149,6 +230,39 @@
+@@ -149,6 +236,88 @@
                                  <property name="orientation">vertical</property>
                                </object>
                              </child>
@@ -2143,10 +2400,59 @@ index 0b993e5..cc923b1 100644
 +                                </style>
 +                              </object>
 +                            </child>
++                            <child type="focus-slider">
++                              <!-- manual focus (settings), shown on cameras with a focus
++                                   motor: near (left / top) to far, in dioptres -->
++                              <object class="GtkBox" id="focus_box">
++                                <property name="orientation">vertical</property>
++                                <property name="halign">center</property>
++                                <property name="valign">center</property>
++                                <property name="spacing">6</property>
++                                <property name="visible">False</property>
++                                <style>
++                                  <class name="focus-slider" />
++                                </style>
++                                <child>
++                                  <object class="GtkImage">
++                                    <property name="icon-name">lens-macro-symbolic</property>
++                                    <style>
++                                      <class name="rotatable" />
++                                    </style>
++                                  </object>
++                                </child>
++                                <child>
++                                  <object class="GtkScale" id="focus_scale">
++                                    <property name="orientation">vertical</property>
++                                    <property name="inverted">True</property>
++                                    <property name="draw-value">False</property>
++                                    <property name="tooltip-text" translatable="yes">Focus Distance</property>
++                                    <property name="adjustment">
++                                      <object class="GtkAdjustment">
++                                        <property name="lower">0</property>
++                                        <property name="upper">12</property>
++                                        <property name="step-increment">0.05</property>
++                                        <property name="page-increment">0.5</property>
++                                      </object>
++                                    </property>
++                                    <accessibility>
++                                      <property name="label" translatable="yes">Focus Distance</property>
++                                    </accessibility>
++                                  </object>
++                                </child>
++                                <child>
++                                  <object class="GtkImage">
++                                    <property name="icon-name">focus-far-symbolic</property>
++                                    <style>
++                                      <class name="rotatable" />
++                                    </style>
++                                  </object>
++                                </child>
++                              </object>
++                            </child>
                              <child type="camera-mode-toggle">
                                <object class="AdwToggleGroup" id="camera_mode_toggles">
                                  <property name="orientation">vertical</property>
-@@ -156,6 +270,7 @@
+@@ -156,6 +325,7 @@
                                  <property name="active" bind-source="Camera" bind-property="capture-mode" bind-flags="sync-create|bidirectional"/>
                                  <style>
                                    <class name="round" />
@@ -2154,7 +2460,7 @@ index 0b993e5..cc923b1 100644
                                  </style>
                                  <child>
                                    <object class="AdwToggle">
-@@ -242,6 +357,16 @@
+@@ -242,6 +412,21 @@
                                                  <property name="id">camera-mode-toggle</property>
                                                </object>
                                              </child>
@@ -2165,13 +2471,18 @@ index 0b993e5..cc923b1 100644
 +                                            </child>
 +                                            <child>
 +                                              <object class="AdwLayoutSlot">
++                                                <property name="id">focus-slider</property>
++                                              </object>
++                                            </child>
++                                            <child>
++                                              <object class="AdwLayoutSlot">
 +                                                <property name="id">lens-toggle</property>
 +                                              </object>
 +                                            </child>
                                            </object>
                                          </child>
                                          <child type="center">
-@@ -250,8 +375,26 @@
+@@ -250,8 +435,26 @@
                                            </object>
                                          </child>
                                          <child type="end">
@@ -2200,7 +2511,7 @@ index 0b993e5..cc923b1 100644
                                            </object>
                                          </child>
                                        </object>
-@@ -307,8 +450,20 @@
+@@ -307,8 +510,20 @@
                                            </object>
                                          </child>
                                          <child type="end">
@@ -2223,7 +2534,7 @@ index 0b993e5..cc923b1 100644
                                            </object>
                                          </child>
                                        </object>
-@@ -338,6 +493,28 @@
+@@ -338,6 +553,33 @@
                                              <property name="id">camera-controls</property>
                                            </object>
                                          </child>
@@ -2235,6 +2546,11 @@ index 0b993e5..cc923b1 100644
 +                                            <child>
 +                                              <object class="AdwLayoutSlot">
 +                                                <property name="id">recording-time</property>
++                                              </object>
++                                            </child>
++                                            <child>
++                                              <object class="AdwLayoutSlot">
++                                                <property name="id">focus-slider</property>
 +                                              </object>
 +                                            </child>
 +                                            <child>
@@ -2252,7 +2568,7 @@ index 0b993e5..cc923b1 100644
                                        </object>
                                      </child>
                                    </object>
-@@ -361,9 +538,19 @@
+@@ -361,9 +603,19 @@
                                            <class name="controlsframe" />
                                          </style>
                                          <child type="start">
@@ -2275,7 +2591,7 @@ index 0b993e5..cc923b1 100644
                                            </object>
                                          </child>
                                          <child type="end">
-@@ -373,6 +560,11 @@
+@@ -373,6 +625,11 @@
                                              <property name="halign">end</property>
                                              <property name="valign">center</property>
                                              <property name="spacing">6</property>
@@ -2287,7 +2603,7 @@ index 0b993e5..cc923b1 100644
                                              <child>
                                                <object class="AdwLayoutSlot">
                                                  <property name="id">primary-menu</property>
-@@ -389,11 +581,26 @@
+@@ -389,11 +646,33 @@
                                        </object>
                                      </child>
                                      <child>
@@ -2298,6 +2614,13 @@ index 0b993e5..cc923b1 100644
 +                                        <child>
 +                                          <object class="AdwLayoutSlot">
 +                                            <property name="id">recording-time</property>
++                                          </object>
++                                        </child>
++                                        <child>
++                                          <object class="AdwLayoutSlot">
++                                            <property name="id">focus-slider</property>
++                                            <property name="halign">center</property>
++                                            <property name="margin-bottom">12</property>
 +                                          </object>
 +                                        </child>
 +                                        <child>
@@ -2316,7 +2639,7 @@ index 0b993e5..cc923b1 100644
                                          <style>
                                            <class name="cameracontrols" />
                                            <class name="controlsframe" />
-@@ -401,7 +608,7 @@
+@@ -401,7 +680,7 @@
                                          </style>
                                          <child type="start">
                                            <object class="AdwLayoutSlot">
@@ -2325,7 +2648,7 @@ index 0b993e5..cc923b1 100644
                                            </object>
                                          </child>
                                          <child type="center">
-@@ -415,6 +622,8 @@
+@@ -415,6 +694,8 @@
                                            </object>
                                          </child>
                                        </object>
@@ -2334,7 +2657,7 @@ index 0b993e5..cc923b1 100644
                                      </child>
                                    </object>
                                  </property>
-@@ -450,6 +659,11 @@
+@@ -450,6 +731,11 @@
                                                  <property name="id">countdown-button</property>
                                                </object>
                                              </child>
@@ -2346,7 +2669,7 @@ index 0b993e5..cc923b1 100644
                                            </object>
                                          </child>
                                          <child type="center">
-@@ -480,22 +694,44 @@
+@@ -480,22 +766,51 @@
                                        </object>
                                      </child>
                                      <child>
@@ -2357,6 +2680,13 @@ index 0b993e5..cc923b1 100644
 +                                        <child>
 +                                          <object class="AdwLayoutSlot">
 +                                            <property name="id">recording-time</property>
++                                          </object>
++                                        </child>
++                                        <child>
++                                          <object class="AdwLayoutSlot">
++                                            <property name="id">focus-slider</property>
++                                            <property name="halign">center</property>
++                                            <property name="margin-bottom">12</property>
 +                                          </object>
 +                                        </child>
 +                                        <child>
@@ -3267,10 +3597,19 @@ index 0000000..1b88156
 +    }
 +}
 diff --git a/src/widgets/camera.rs b/src/widgets/camera.rs
-index 47b393e..a3bf5a9 100644
+index 47b393e..bf97e79 100644
 --- a/src/widgets/camera.rs
 +++ b/src/widgets/camera.rs
-@@ -42,6 +42,8 @@ mod imp {
+@@ -34,6 +34,8 @@ mod imp {
+ 
+         pub recording_duration: Cell<u32>,
+         pub recording_source: RefCell<Option<glib::source::SourceId>>,
++        /// Pending picture encoding change (it restarts the camera).
++        pub encoding_source: RefCell<Option<glib::source::SourceId>>,
+ 
+         /// Whether the camera is actually being looked at: the camera page is
+         /// the visible page in the window's navigation view, *and* the window
+@@ -42,6 +44,8 @@ mod imp {
          /// GStreamer pipeline -- they never change `ViewfinderState`.
          pub page_visible: Cell<bool>,
  
@@ -3279,7 +3618,7 @@ index 47b393e..a3bf5a9 100644
          #[property(get, set = Self::set_capture_mode, explicit_notify, default)]
          capture_mode: Cell<crate::CaptureMode>,
  
-@@ -75,7 +77,58 @@ mod imp {
+@@ -75,7 +79,62 @@ mod imp {
          #[template_child]
          pub bottom_sheet: TemplateChild<adw::BottomSheet>,
          #[template_child]
@@ -3298,6 +3637,10 @@ index 47b393e..a3bf5a9 100644
 +        /// Rear lens selector: its toggles stand for these cameras.
 +        #[template_child]
 +        pub lens_toggles: TemplateChild<adw::ToggleGroup>,
++        #[template_child]
++        pub focus_box: TemplateChild<gtk::Box>,
++        #[template_child]
++        pub focus_scale: TemplateChild<gtk::Scale>,
 +        pub lens_cameras: RefCell<Vec<aperture::Camera>>,
 +        pub updating_lens: Cell<bool>,
 +        /// The rear camera to return to from the front one.
@@ -3338,7 +3681,7 @@ index 47b393e..a3bf5a9 100644
      }
  
      #[glib::object_subclass]
-@@ -110,6 +163,7 @@ mod imp {
+@@ -110,6 +169,7 @@ mod imp {
                  };
                  self.obj()
                      .set_detect_codes(matches!(capture_mode, CaptureMode::QrDetection));
@@ -3346,7 +3689,7 @@ index 47b393e..a3bf5a9 100644
  
                  self.obj().notify_capture_mode();
              }
-@@ -149,6 +203,13 @@ mod imp {
+@@ -149,6 +209,13 @@ mod imp {
              let provider = aperture::DeviceProvider::instance();
              self.provider.set(provider.clone()).unwrap();
  
@@ -3360,7 +3703,7 @@ index 47b393e..a3bf5a9 100644
              let create_shortcut = |shortcut, value: CaptureMode| {
                  Shortcut::new(
                      ShortcutTrigger::parse_string(shortcut),
-@@ -196,6 +257,127 @@ mod imp {
+@@ -196,6 +263,143 @@ mod imp {
                  }
              ));
  
@@ -3459,8 +3802,24 @@ index 47b393e..a3bf5a9 100644
 +                move |_| {
 +                    obj.update_flash();
 +                    obj.update_lens_toggles();
++                    obj.update_focus();
 +                }
 +            ));
++            // manual focus (settings): the slider's lens position
++            self.settings()
++                .bind("focus-position", &self.focus_scale.adjustment(), "value")
++                .build();
++            for key in ["manual-focus", "focus-position"] {
++                self.settings().connect_changed(
++                    Some(key),
++                    glib::clone!(
++                        #[weak]
++                        obj,
++                        move |_, _| obj.update_focus()
++                    ),
++                );
++            }
++            obj.update_focus();
 +            self.lens_toggles.connect_active_name_notify(glib::clone!(
 +                #[weak]
 +                obj,
@@ -3488,7 +3847,7 @@ index 47b393e..a3bf5a9 100644
              self.viewfinder.connect_code_detected(glib::clone!(
                  #[weak]
                  obj,
-@@ -216,6 +398,21 @@ mod imp {
+@@ -216,6 +420,21 @@ mod imp {
  
              self.qr_screen_bin.set_viewfinder(self.viewfinder.clone());
  
@@ -3510,7 +3869,7 @@ index 47b393e..a3bf5a9 100644
              obj.update_state();
  
              self.viewfinder.connect_is_recording_notify(glib::clone!(
-@@ -264,6 +461,9 @@ mod imp {
+@@ -264,6 +483,9 @@ mod imp {
              ));
  
              self.camera_controls.set_selection(self.selection.clone());
@@ -3520,7 +3879,7 @@ index 47b393e..a3bf5a9 100644
              self.camera_controls.connect_camera_switched(glib::clone!(
                  #[weak]
                  obj,
-@@ -293,8 +493,10 @@ mod imp {
+@@ -293,8 +515,10 @@ mod imp {
                  .bind("capture-mode", &*obj, "capture-mode")
                  .build();
  
@@ -3533,7 +3892,28 @@ index 47b393e..a3bf5a9 100644
                  aperture::VideoFormat::H264Mp4
              } else {
                  log::debug!("Did not find openh264enc feature, using the vp8/webm profile");
-@@ -329,7 +531,26 @@ mod imp {
+@@ -302,6 +526,20 @@ mod imp {
+             };
+             self.viewfinder.set_video_format(format);
+ 
++            // before the camera starts: the camerabin takes the picture
++            // encoding when it starts, a change restarts it
++            obj.update_picture_encoding();
++            for key in ["picture-format", "jpeg-quality"] {
++                self.settings().connect_changed(
++                    Some(key),
++                    glib::clone!(
++                        #[weak]
++                        obj,
++                        move |_, _| obj.queue_picture_encoding()
++                    ),
++                );
++            }
++
+             self.settings()
+                 .bind(
+                     "enable-hardware-encoding",
+@@ -329,7 +567,26 @@ mod imp {
          }
      }
  
@@ -3561,7 +3941,7 @@ index 47b393e..a3bf5a9 100644
      impl BreakpointBinImpl for Camera {}
  }
  
-@@ -366,35 +587,39 @@ impl Camera {
+@@ -366,35 +623,39 @@ impl Camera {
              #[strong]
              provider,
              async move {
@@ -3628,14 +4008,8 @@ index 47b393e..a3bf5a9 100644
                  }
  
                  if let Err(err) = provider.start_with_default(glib::clone!(
-@@ -445,9 +670,29 @@ impl Camera {
-         window.set_shutter_enabled(false);
- 
+@@ -447,7 +708,23 @@ impl Camera {
          let filename = utils::picture_file_name(format);
-+        imp.viewfinder.set_picture_encoding(
-+            matches!(format, crate::PictureFormat::Png),
-+            imp.settings().int("jpeg-quality").max(1) as u32,
-+        );
          let path = utils::pictures_dir()?.join(filename);
  
 -        imp.viewfinder.take_picture(path)?;
@@ -3659,7 +4033,7 @@ index 47b393e..a3bf5a9 100644
          imp.flash_bin.flash();
  
          let settings = imp.settings();
-@@ -458,17 +703,92 @@ impl Camera {
+@@ -458,17 +735,104 @@ impl Camera {
          Ok(())
      }
  
@@ -3699,13 +4073,30 @@ index 47b393e..a3bf5a9 100644
 +    }
  
 -        let current = self.imp().viewfinder.camera();
++    /// Manual focus (settings) on a camera with a focus motor: the slider
++    /// moves the lens; autofocus otherwise.
++    fn update_focus(&self) {
++        let imp = self.imp();
++        let settings = imp.settings();
++        let manual = settings.boolean("manual-focus")
++            && imp.viewfinder.camera().is_some_and(|c| has_focus_motor(&c));
++        imp.focus_box.set_visible(manual);
++        imp.viewfinder
++            .set_manual_focus(manual.then(|| settings.double("focus-position") as f32));
++    }
+ 
+-        let mut pos = 0;
+-        if current == provider.camera(0) {
+-            pos += 1;
 +    /// Rebuilds the rear lens selector: one toggle per rear camera, ordered
 +    /// by field of view, shown while a rear camera is in use.
 +    fn update_lens_toggles(&self) {
 +        let imp = self.imp();
 +        let Some(provider) = imp.provider.get() else {
 +            return;
-+        };
+         };
+-        if let Some(camera) = provider.camera(pos) {
+-            self.set_camera_inner(Some(camera));
 +        let current = imp.viewfinder.camera();
 +        let mut backs: Vec<aperture::Camera> = (0..provider.n_items())
 +            .filter_map(|i| provider.camera(i))
@@ -3736,10 +4127,7 @@ index 47b393e..a3bf5a9 100644
 +        }
 +        imp.updating_lens.set(false);
 +    }
- 
--        let mut pos = 0;
--        if current == provider.camera(0) {
--            pos += 1;
++
 +    fn lens_selected(&self, toggles: &adw::ToggleGroup) {
 +        let imp = self.imp();
 +        if imp.updating_lens.get() {
@@ -3750,16 +4138,14 @@ index 47b393e..a3bf5a9 100644
 +            .and_then(|name| name.strip_prefix("lens").and_then(|n| n.parse::<usize>().ok()))
 +        else {
 +            return;
-         };
--        if let Some(camera) = provider.camera(pos) {
--            self.set_camera_inner(Some(camera));
++        };
 +        let camera = imp.lens_cameras.borrow().get(pos).cloned();
 +        if camera.is_some() && camera != imp.viewfinder.camera() {
 +            self.set_camera_inner(camera);
          }
      }
  
-@@ -487,14 +807,283 @@ impl Camera {
+@@ -487,14 +851,283 @@ impl Camera {
          imp.viewfinder.set_camera(camera);
      }
  
@@ -4049,7 +4435,7 @@ index 47b393e..a3bf5a9 100644
      }
  
      pub fn set_countdown(&self, countdown: u32) {
-@@ -536,6 +1125,7 @@ impl Camera {
+@@ -536,6 +1169,7 @@ impl Camera {
  
      pub fn set_gallery(&self, gallery: crate::Gallery) {
          let imp = self.imp();
@@ -4057,7 +4443,49 @@ index 47b393e..a3bf5a9 100644
  
          imp.viewfinder.connect_picture_done(glib::clone!(
              #[weak]
-@@ -578,7 +1168,92 @@ impl Camera {
+@@ -569,6 +1203,41 @@ impl Camera {
+         self.imp().viewfinder.stop_stream();
+     }
+ 
++    /// The viewfinder's picture encoding from the settings.
++    fn update_picture_encoding(&self) {
++        let imp = self.imp();
++        if let Some(source) = imp.encoding_source.take() {
++            source.remove();
++        }
++        let settings = imp.settings();
++        imp.viewfinder.set_picture_encoding(
++            crate::PictureFormat::from(settings.enum_("picture-format"))
++                == crate::PictureFormat::Png,
++            settings.int("jpeg-quality").max(1) as u32,
++        );
++    }
++
++    /// A settings change, once it settles: the JPEG quality row sets the
++    /// quality at every step, and each new encoding restarts the camera.
++    fn queue_picture_encoding(&self) {
++        let imp = self.imp();
++        if let Some(source) = imp.encoding_source.take() {
++            source.remove();
++        }
++        let source = glib::timeout_add_local_once(
++            std::time::Duration::from_millis(700),
++            glib::clone!(
++                #[weak(rename_to = obj)]
++                self,
++                move || {
++                    obj.imp().encoding_source.take();
++                    obj.update_picture_encoding();
++                }
++            ),
++        );
++        imp.encoding_source.replace(Some(source));
++    }
++
+     pub fn start_stream(&self) {
+         self.imp().viewfinder.start_stream();
+     }
+@@ -578,7 +1247,92 @@ impl Camera {
          self.update_idle_inhibit();
      }
  
@@ -4150,7 +4578,7 @@ index 47b393e..a3bf5a9 100644
          let Some(window) = self.root().and_downcast::<crate::Window>() else {
              return;
          };
-@@ -609,8 +1284,22 @@ impl Camera {
+@@ -609,8 +1363,22 @@ impl Camera {
      fn update_cameras_button(&self, provider: &aperture::DeviceProvider) {
          let imp = self.imp();
  
@@ -4175,7 +4603,7 @@ index 47b393e..a3bf5a9 100644
  
          // We need to set the correct selected item at least when loading. The
          // default camera might not be the first one. A similar thing happens
-@@ -721,6 +1410,17 @@ async fn stream() -> anyhow::Result<OwnedFd> {
+@@ -721,6 +1489,23 @@ async fn stream() -> anyhow::Result<OwnedFd> {
  }
  
  // Id used to identify the last-used camera.
@@ -4188,6 +4616,12 @@ index 47b393e..a3bf5a9 100644
 +        Some("s5k5e9") => (2, String::new(), Some("lens-macro-symbolic"), gettext("Macro")),
 +        _ => (3, camera.display_name().to_string(), None, camera.display_name().to_string()),
 +    }
++}
++
++/// The main camera has a focus motor (VCM); the ultrawide and the macro
++/// camera are fixed-focus.
++fn has_focus_motor(camera: &aperture::Camera) -> bool {
++    camera.model().as_deref() == Some("imx682")
 +}
 +
  fn id_from_pw(camera: &aperture::Camera) -> glib::GString {
@@ -4253,10 +4687,10 @@ index 45cba8f..d4cde0f 100644
  }
 diff --git a/src/widgets/camera_settings.rs b/src/widgets/camera_settings.rs
 new file mode 100644
-index 0000000..c82797e
+index 0000000..f9e5442
 --- /dev/null
 +++ b/src/widgets/camera_settings.rs
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,355 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +//! Camera settings sheet: libcamera controls of the current camera.
 +//!
@@ -4325,13 +4759,6 @@ index 0000000..c82797e
 +                num("saturation", "Saturation", 0.0, 2.0, 0.05, 2, None),
 +                num("sharpness", "Sharpness", 0.0, 10.0, 0.5, 1, None),
 +                num("gamma", "Gamma", 1.0, 3.0, 0.1, 1, None),
-+            ],
-+        ),
-+        (
-+            gettext("Focus"),
-+            vec![
-+                ctl("af-mode", "Focus Mode"),
-+                num("lens-position", "Lens Position (dioptres)", 0.0, 15.0, 0.1, 1, None),
 +            ],
 +        ),
 +    ]
@@ -4568,6 +4995,18 @@ index 0000000..c82797e
 +        capture.add(&row);
 +    }
 +    page.add(&capture);
++
++    // manual focus: the slider over the viewfinder sets the lens position
++    let focus = adw::PreferencesGroup::builder().title(gettext("Focus")).build();
++    let manual_focus = adw::SwitchRow::builder()
++        .title(gettext("Manual Focus"))
++        .subtitle(gettext(
++            "A slider over the viewfinder instead of autofocus (main camera)",
++        ))
++        .build();
++    settings.bind("manual-focus", &manual_focus, "active").build();
++    focus.add(&manual_focus);
++    page.add(&focus);
 +
 +    let mut manual: Vec<(adw::PreferencesRow, &'static str)> = Vec::new();
 +    let mut switches: Vec<(adw::SwitchRow, &'static str)> = Vec::new();

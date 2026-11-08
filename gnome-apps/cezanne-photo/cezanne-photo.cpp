@@ -22,12 +22,15 @@
  * the frames do not match.
  *
  * --portrait: the background blurred around the subject, after noise
- * reduction and before HDR: the subject from the mask of cezanne-upscaled
- * on the APU, the blur by its depth map (portraitApu(), seconds; --subject
+ * reduction and HDR (the bracket's frames are sharp: merged after the blur
+ * they put background detail back): the subject from the mask of
+ * cezanne-upscaled on the APU without what its depth puts well behind the
+ * subject, the blur by that depth (portraitApu(), seconds; --subject
  * objects: the salient object, the default; --subject people: the people
  * in the picture), else by depth from the main + mono stereo pair
  * (portrait(), minutes; it uses the bracket's middle (EV 0) frame;
- * CEZANNE_PORTRAIT=stereo always).
+ * CEZANNE_PORTRAIT=stereo always).  The networks see the picture upright
+ * by its EXIF orientation (sideways they find no subject).
  *
  * --upscale: AI super-resolution as the last step, natively 4x; 2x is that
  * reduced by Lanczos (a 16 MP picture becomes 64 MP).  On the APU when
@@ -1174,27 +1177,18 @@ cv::Mat portraitApu(const cv::Mat &pic, int upright, bool people)
 	cv::Size qs(pic.cols / 4, pic.rows / 4);
 	cv::resize(Ig, gq, qs, 0, 0, cv::INTER_AREA);
 	cv::resize(sal, aq, qs, 0, 0, cv::INTER_LINEAR);
-	aq = cv::min(cv::max(guided(gq, aq, 8, 1e-3), 0), 1);
-	cv::Mat A, C;
-	cv::resize(aq, A, pic.size(), 0, 0, cv::INTER_LINEAR);
-	A = cv::min(cv::max(guided(Ig, A, 12, 1e-3), 0), 1);
-	A = cv::min(cv::max((A - 0.25) / 0.5, 0), 1);
-	debugMap("apu-alpha", A);
 
 	/*
-	 * The blur strength by depth as the stereo path's (portrait()): the
-	 * depth map normalised and snapped to the picture's edges at a quarter
-	 * of the resolution, the focus the subject's median depth, the step
-	 * from the far background (10th percentile) to it the scale; at least
-	 * 0.35 outside the subject.  Without depth: one strength.
+	 * Depth (the blur strength, as the stereo path's portrait()): the depth
+	 * map normalised and snapped to the picture's edges at a quarter of the
+	 * resolution, the focus the subject's median depth, the step from the
+	 * far background (10th percentile) to it the scale.
 	 */
-	cv::Mat depth = depthApu(pic, upright);
-	if (depth.empty()) {
-		C = 1 - A;
-	} else {
+	cv::Mat depth = depthApu(pic, upright), dq;
+	float df = 1.f, dfar = 0.f, step = 1.f;
+	if (!depth.empty()) {
 		double mn, mx;
 		cv::minMaxLoc(depth, &mn, &mx);
-		cv::Mat dq;
 		cv::resize((depth - mn) / std::max(mx - mn, 1e-6), dq, qs, 0, 0, cv::INTER_LINEAR);
 		dq = guided(gq, dq, 8, 1e-3);
 		std::vector<float> fv, av;
@@ -1206,10 +1200,59 @@ cv::Mat portraitApu(const cv::Mat &pic, int upright, bool people)
 			}
 		std::nth_element(av.begin(), av.begin() + av.size() / 10, av.end());
 		std::nth_element(fv.begin(), fv.begin() + fv.size() / 2, fv.end());
-		float df = fv.empty() ? 1.f : fv[fv.size() / 2], dfar = av[av.size() / 10];
-		float step = std::max(df - dfar, 0.1f);
-		cv::Mat coc = cv::min(cv::max(cv::abs(dq - df) / (0.5 * step), 0.35), 1.0);
+		df = fv.empty() ? 1.f : fv[fv.size() / 2];
+		dfar = av[av.size() / 10];
+		step = std::max(df - dfar, 0.1f);
 		debugMap("apu-depth", dq);
+		/*
+		 * A subject is in front of most of the picture; a mask behind the
+		 * median depth took something in the background (on a sideways
+		 * picture: the window blinds beside a figure, which then stayed
+		 * sharp while the figure was blurred)
+		 */
+		std::nth_element(av.begin(), av.begin() + av.size() / 2, av.end());
+		float dmed = av[av.size() / 2];
+		if (df < dmed - 0.05f) {
+			std::fprintf(stderr, "cezanne-photo: portrait: the mask lies behind most of the picture "
+				     "(depth %.2f, median %.2f): not used\n", df, dmed);
+			return {};
+		}
+		/*
+		 * The mask without what lies well behind the subject: the salient
+		 * object network also takes background things that touch the
+		 * subject in the picture (a monitor stand behind a figure's head,
+		 * keys beside it), and they stayed sharp in the blur.  Kept: from
+		 * about halfway in depth between the far background and the
+		 * subject, with a soft ramp.
+		 */
+		cv::Mat gate = cv::min(cv::max((dq - (dfar + 0.35f * step)) / (0.3f * step), 0), 1);
+		aq = aq.mul(gate);
+	}
+	aq = cv::min(cv::max(guided(gq, aq, 8, 1e-3), 0), 1);
+	area = cv::countNonZero(aq > 0.5f) / double(aq.total());
+	if (area < 0.01) {
+		std::fprintf(stderr, "cezanne-photo: portrait: no %s in front of the background\n",
+			     people ? "people" : "subject");
+		return {};
+	}
+	cv::Mat A, C;
+	cv::resize(aq, A, pic.size(), 0, 0, cv::INTER_LINEAR);
+	A = cv::min(cv::max(guided(Ig, A, 12, 1e-3), 0), 1);
+	A = cv::min(cv::max((A - 0.25) / 0.5, 0), 1);
+	debugMap("apu-alpha", A);
+
+	/* blur strength: at least 0.35 outside the subject; without depth one
+	 * strength */
+	if (depth.empty()) {
+		C = 1 - A;
+	} else {
+		cv::Mat coc = cv::min(cv::max(cv::abs(dq - df) / (0.5 * step), 0.35), 1.0);
+		/*
+		 * Smoothed over about the blur radius: snapped to the picture's
+		 * edges it changed in a step, and a nearer background object came
+		 * out as a less blurred cut-out with a sharp outline
+		 */
+		cv::GaussianBlur(coc, coc, cv::Size(0, 0), pic.cols * 0.018 / 4 / 2);
 		cv::resize(coc, C, pic.size(), 0, 0, cv::INTER_LINEAR);
 		C = C.mul(1 - A);
 		debugMap("apu-coc", C);
@@ -1378,8 +1421,20 @@ cv::Mat lowLight(const cv::Mat &pic, const std::string &prefix, int level)
 	cv::sqrt(vY.mul(vG) + 1e-8, ncc);
 	ncc = win(bY.mul(bG)) / ncc;
 	cv::Mat conf = cv::min(cv::max((ncc - 0.2) / 0.4, 0), 1);
-	/* nothing to correlate (flat): the mono's smoothing is safe */
-	conf.setTo(1.0f, vY < (sig * 0.7f) * (sig * 0.7f));
+	/*
+	 * Nothing to correlate in the picture (flat): the mono's smoothing is
+	 * safe only where the mono is flat as well.  Close up, the main
+	 * camera's own defocus blur is flat while the fixed-focus mono stays
+	 * sharp, and the mono's edges there (warped by a disparity that is
+	 * wrong in occlusions) came out as sharp, misplaced cut-outs in the
+	 * blurred background.  The decision is smoothed: a hard switch left
+	 * speckled borders.
+	 */
+	const float flat = (sig * 0.7f) * (sig * 0.7f);
+	cv::Mat flatY = vY < flat, flatG = vG < flat;
+	conf.setTo(1.0f, flatY & flatG);
+	conf.setTo(0.0f, flatY & ~flatG);
+	cv::GaussianBlur(conf, conf, cv::Size(0, 0), 4);
 	cv::resize(conf, conf, pic.size(), 0, 0, cv::INTER_LINEAR);
 	conf = conf.mul(cv::min(cv::max(CV, 0), 1));
 	debugMap("lowlight-conf", conf);
@@ -1470,6 +1525,14 @@ cv::Mat hdr(const cv::Mat &pic, const std::string &prefix)
 	}
 	std::nth_element(ratios.begin(), ratios.begin() + ratios.size() / 2, ratios.end());
 	cv::Mat monoLin = radW * ratios[ratios.size() / 2];
+	/*
+	 * The mono's level, not its detail: a homography cannot align a second
+	 * camera's view of near things (parallax), and the fixed-focus mono is
+	 * sharp where the main camera's view is defocused; its detail came out
+	 * as misplaced sharp edges in the bright parts of blurred backgrounds
+	 * (white keys behind a close-up subject)
+	 */
+	cv::GaussianBlur(monoLin, monoLin, cv::Size(0, 0), 6);
 
 	/*
 	 * HDR luma: the picture's where well exposed (its own detail and
@@ -1582,6 +1645,17 @@ int main(int argc, char **argv)
 		pic = l.empty() ? denoise(pic, level) : l;
 		changed = true;
 	}
+	/* HDR before the portrait blur: the bracket's frames are sharp, and
+	 * merged after the blur they put background detail back */
+	if (!prefix.empty()) {
+		cv::Mat h = hdr(pic, prefix);
+		if (h.empty())
+			status = 2;
+		else {
+			pic = h;
+			changed = true;
+		}
+	}
 	if (!portraitPrefix.empty()) {
 		/* the APU's mask first (CEZANNE_PORTRAIT=stereo: depth only) */
 		const char *mode = std::getenv("CEZANNE_PORTRAIT");
@@ -1592,15 +1666,6 @@ int main(int argc, char **argv)
 			status = 4;
 		else {
 			pic = p;
-			changed = true;
-		}
-	}
-	if (!prefix.empty()) {
-		cv::Mat h = hdr(pic, prefix);
-		if (h.empty())
-			status = 2;
-		else {
-			pic = h;
 			changed = true;
 		}
 	}

@@ -16,4 +16,4 @@ file's own `SPDX-License-Identifier` or the table below says otherwise.
 | `system/cezanne-base/` | GPL-2.0-or-later ([../LICENSES/GPL-2.0-or-later.txt](../LICENSES/GPL-2.0-or-later.txt)), as its PKGBUILD declares; the libcamera tuning files in `etc/libcamera/ipa/simple/` are CC0-1.0 |
 
 No firmware is included. The firmware the drivers load comes from the
-phone's stock partitions; see the Firmware column of `../hardware.md`.
+phone's stock partitions; see the Firmware column of `../HARDWARE.md`.

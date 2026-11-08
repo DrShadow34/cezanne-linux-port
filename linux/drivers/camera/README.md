@@ -608,6 +608,69 @@ Everything here is done; the camera app is complete for now.
   maximum - at high gain one hot pixel made it nearly black and the match
   count fell from 375 to 144 (99.5th percentile now).
 
+### Close-up artefacts and sideways PNGs (2026-11-08, cezanne-photo 1.0-13, snapshot 51.0-1.9)
+
+User report: with HDR + portrait (+ 64MP) close-ups came out washed out
+with wrongly cut objects; the same shot without them was fine. Inputs of a
+real shot captured with a wrapper around cezanne-photo (picture + the
+three bracket frames + arguments, before the helper deletes them), the
+steps run one by one (old and new helper):
+- Low light: where the picture is flat it trusted the mono's smoothing.
+  Close up, the main camera's own defocus blur is flat while the
+  fixed-focus mono is sharp, and the mono's edges there - warped by a
+  disparity that is wrong in occlusions - became sharp, misplaced shapes in
+  the blurred background (a monitor stand, keyboard keys), with speckled
+  borders from the hard switch. Now: flat in the picture only counts as
+  safe where the mono is flat too; the decision map is smoothed.
+- HDR ran after the portrait blur and merged the sharp bracket back into
+  the background (or failed to align with the blurred picture and was
+  skipped); now before it. Its mono radiance is low-passed: the homography
+  cannot align a second camera's view of near things.
+- Portrait: U^2-Net's salient mask also takes background things touching
+  the subject; the mask is now gated by MiDaS depth (dropped from about
+  halfway between the far background and the subject), and the blur
+  strength map is smoothed over the blur radius (a nearer background object
+  was a less blurred cut-out with a hard outline). A mask whose subject lies
+  behind the picture's median depth is not used (on a sideways picture the
+  network took the window blinds beside the figure: blinds sharp, figure
+  blurred); the stereo path then decides.
+- The upscaler is not involved (a crop through it keeps luma / saturation:
+  0.297 -> 0.291 saturation).
+- Snapshot: PNG pictures lost the device orientation (pngenc drops the
+  image-orientation tag that JPEG gets as EXIF): landscape shots were saved
+  sideways and the subject networks saw a sideways scene ("no salient
+  subject" -> the slow stereo fallback). aperture/src/png.rs now writes an
+  eXIf chunk; exiv2 (cezanne-photo's reading and copying) and glycin
+  (gallery, Loupe) honour it. camerabin reports the picture before its file
+  is complete: the tag is written once the PNG ends in IEND (polled every
+  50 ms), and picture-done (gallery, processing) follows it.
+- snapshot 51.0-1.9: the "PNG" pictures were JPEG data under a .png name
+  (upstream Snapshot only changes the extension; the fork's PNG profile
+  never took effect). camerabin applies an image-profile only when it
+  leaves NULL (gst_camera_bin_create_elements), and the fork set it at the
+  shutter while PLAYING. Now the camera widget sets the encoding before the
+  camera starts and on a picture-format / jpeg-quality change (after 0.7 s,
+  the quality row writes every step); the viewfinder rebuilds the profile
+  in start_stream() and restarts a running camerabin for a new one (after
+  the picture or recording in progress). The JPEG quality setting had not
+  applied either (always 95).
+
+### Manual focus (2026-11-08, snapshot 51.0-1.10)
+
+Settings > Focus > Manual Focus (gsetting manual-focus) shows a slider over
+the viewfinder next to the lens selector on cameras with a focus motor (the
+main camera): near (tulip) to far (mountains), the lens position in
+dioptres (gsetting focus-position, 0..12). The viewfinder sets af-mode
+manual + lens-position on libcamerasrc; the soft-ISP AF keeps both over the
+picture's reconfiguration (same sensor mode) and libcamerasrc replays them
+when the camera restarts. Taps do not refocus in manual mode.
+
+The scale is the AF's uncalibrated linear map of the VCM range: the lowest
+quarter (0..4) does not move the lens (all far focus); a close-up at ~15 cm
+is around 7. Autofocus fails on low-texture subjects: a tap window with
+little structure falls back to the whole frame (af.cpp measure()), so a
+smooth figure in front of blinds loses to the blinds.
+
 ### Tools (mainline/camera/tools)
 
 lens_tuning.py (EEPROM shading -> tuning), calibrate_distortion.py

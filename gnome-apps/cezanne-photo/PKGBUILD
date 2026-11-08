@@ -8,7 +8,7 @@
 # finds both helpers in PATH.
 pkgname=cezanne-photo
 pkgver=1.0
-pkgrel=10
+pkgrel=13
 pkgdesc="Redmi K30 Ultra camera helpers: mono sensor brackets, HDR, portrait, low light, denoise"
 arch=(aarch64)
 url="https://localhost/arch-port"
