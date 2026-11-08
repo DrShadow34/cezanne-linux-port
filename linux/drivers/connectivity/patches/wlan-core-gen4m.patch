@@ -1,0 +1,677 @@
+diff --git a/Kbuild.main b/Kbuild.main
+index 832e1c0..672c094 100644
+--- a/Kbuild.main
++++ b/Kbuild.main
+@@ -164,7 +164,10 @@ endif
+ ccflags-y += -DCFG_KERNEL_AN13_515=$(CFG_KERNEL_AN13_515)
+ ccflags-y += -DCFG_KERNEL_AN14_515=$(CFG_KERNEL_AN14_515)
+ 
+-ccflags-y += -Werror $(call cc-disable-warning, unused-but-set-variable)
++# mainline port: warnings stay warnings; stand-ins for vendor kernel headers
++ccflags-y += $(call cc-disable-warning, unused-but-set-variable)
++ccflags-y += -I$(KO_CODE_PATH)/../compat/include
++ccflags-y += -include $(KO_CODE_PATH)/../compat/include/compat_mainline.h
+ ccflags-y += $(call cc-disable-warning, attribute-warning)
+ ccflags-y += $(call cc-disable-warning, cast-function-type-strict)
+ #ccflags-y:=$(filter-out -U$(WLAN_CHIP_ID),$(ccflags-y))
+diff --git a/common/wlan_lib.c b/common/wlan_lib.c
+index 07bdacf..36f0a60 100644
+--- a/common/wlan_lib.c
++++ b/common/wlan_lib.c
+@@ -8047,7 +8047,10 @@ void wlanInitFeatureOptionImpl(struct ADAPTER *prAdapter, uint8_t *pucKey)
+ 		  FEATURE_TO_CUSTOMER); /* power on full cal */
+ 	INIT_UINT(prWifiVar->ucWow, "Wow", FEATURE_DISABLED,
+ 		  FEATURE_TO_CUSTOMER);
+-	INIT_UINT(prWifiVar->ucAdvPws, "AdvPws", FEATURE_DISABLED,
++	/* cezanne: enabled as in the 4.14 BSP gen4m (MIUI): in suspend the
++	 * firmware listens every WowOffMdtim-th DTIM instead of every one
++	 */
++	INIT_UINT(prWifiVar->ucAdvPws, "AdvPws", FEATURE_ENABLED,
+ 		  FEATURE_TO_CUSTOMER);
+ 	INIT_UINT(prWifiVar->ucWowOnMdtim, "WowOnMdtim", 1,
+ 		  FEATURE_TO_CUSTOMER);
+diff --git a/os/linux/gl_cfg80211.c b/os/linux/gl_cfg80211.c
+index d58fd5f..e77a919 100644
+--- a/os/linux/gl_cfg80211.c
++++ b/os/linux/gl_cfg80211.c
+@@ -2858,7 +2858,9 @@ int mtk_cfg80211_remain_on_channel(struct wiphy *wiphy,
+ 		if (!IS_BSS_INDEX_VALID(ucBssIndex))
+ 			return -EINVAL;
+ 
++#if KERNEL_VERSION(7, 3, 0) > CFG80211_VERSION_CODE
+ 		*cookie = prGlueInfo->u8Cookie++;
++#endif
+ 
+ 		prMsgChnlReq = cnmMemAlloc(prGlueInfo->prAdapter,
+ 			   RAM_TYPE_MSG, sizeof(struct MSG_REMAIN_ON_CHANNEL));
+@@ -3025,7 +3027,9 @@ int _mtk_cfg80211_mgmt_tx(struct wiphy *wiphy,
+ 		WIPHY_PRIV(wiphy, prGlueInfo);
+ 		ASSERT(prGlueInfo);
+ 
++#if KERNEL_VERSION(7, 3, 0) > CFG80211_VERSION_CODE
+ 		*cookie = prGlueInfo->u8Cookie++;
++#endif
+ #if CFG_SUPPORT_TX_MGMT_USE_DATAQ
+ 		u2MgmtTxMaxLen = prGlueInfo->prAdapter
+ 				->chip_info->cmd_max_pkt_size
+diff --git a/os/linux/gl_init.c b/os/linux/gl_init.c
+index d43f49a..938acd1 100644
+--- a/os/linux/gl_init.c
++++ b/os/linux/gl_init.c
+@@ -20,6 +20,7 @@
+  *                    E X T E R N A L   R E F E R E N C E S
+  *******************************************************************************
+  */
++#include <linux/suspend.h>
+ #include "gl_os.h"
+ #include "debug.h"
+ #include "wlan_lib.h"
+@@ -1290,6 +1291,176 @@ const uint32_t mtk_cipher_suites[] = {
+ 	WLAN_CIPHER_SUITE_NO_GROUP_ADDR
+ };
+ 
++#if KERNEL_VERSION(6, 17, 0) <= CFG80211_VERSION_CODE
++/*
++ * mainline port: cfg80211 in 6.17+ passes a wireless_dev to the key and
++ * station ops and adds radio/link indexes to a few others. Adapt to the
++ * driver's existing handlers.
++ */
++static int mtk_cfg7_add_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int link_id, u8 key_index, bool pairwise, const u8 *mac_addr,
++	struct key_params *params)
++{
++	return mtk_cfg_add_key(wiphy, wdev->netdev, link_id, key_index,
++			       pairwise, mac_addr, params);
++}
++
++static int mtk_cfg7_get_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int link_id, u8 key_index, bool pairwise, const u8 *mac_addr,
++	void *cookie, void (*callback)(void *cookie, struct key_params *))
++{
++	return mtk_cfg_get_key(wiphy, wdev->netdev, link_id, key_index,
++			       pairwise, mac_addr, cookie, callback);
++}
++
++static int mtk_cfg7_del_key(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int link_id, u8 key_index, bool pairwise, const u8 *mac_addr)
++{
++	return mtk_cfg_del_key(wiphy, wdev->netdev, link_id, key_index,
++			       pairwise, mac_addr);
++}
++
++static int mtk_cfg7_set_default_mgmt_key(struct wiphy *wiphy,
++	struct wireless_dev *wdev, int link_id, u8 key_index)
++{
++	return mtk_cfg_set_default_mgmt_key(wiphy, wdev->netdev, link_id,
++					    key_index);
++}
++
++static int mtk_cfg7_get_station(struct wiphy *wiphy, struct wireless_dev *wdev,
++	const u8 *mac, struct station_info *sinfo)
++{
++	return mtk_cfg_get_station(wiphy, wdev->netdev, mac, sinfo);
++}
++
++/*
++ * Station mode: the connected AP is the only station. NetworkManager reads
++ * the link signal with a station dump; without one the strength it shows
++ * only changes with scan results (stale for as long as nothing scans).
++ */
++static int mtk_cfg7_dump_station(struct wiphy *wiphy,
++	struct wireless_dev *wdev, int idx, u8 *mac,
++	struct station_info *sinfo)
++{
++	struct GLUE_INFO *prGlueInfo = NULL;
++	struct net_device *ndev = wdev->netdev;
++	uint32_t u4BufLen = 0;
++	uint8_t ucBssIndex;
++
++	if (idx != 0 || !ndev)
++		return -ENOENT;
++
++	WIPHY_PRIV(wiphy, prGlueInfo);
++	if (!wlanIsDriverReady(prGlueInfo, WLAN_DRV_READY_CHECK_WLAN_ON |
++		WLAN_DRV_READY_CHECK_HIF_SUSPEND))
++		return -ENOENT;
++#if CFG_ENABLE_WIFI_DIRECT && CFG_ENABLE_WIFI_DIRECT_CFG_80211
++	if (mtk_IsP2PNetDevice(prGlueInfo, ndev) > 0)
++		return -ENOENT;
++#endif
++
++	ucBssIndex = wlanGetBssIdx(ndev);
++	if (!IS_BSS_INDEX_AIS(prGlueInfo->prAdapter, ucBssIndex))
++		return -ENOENT;
++	if (kalGetMediaStateIndicated(prGlueInfo, ucBssIndex) !=
++	    MEDIA_STATE_CONNECTED)
++		return -ENOENT;
++	if (kalIoctlByBssIdx(prGlueInfo, wlanoidQueryBssid, mac, MAC_ADDR_LEN,
++			     &u4BufLen, ucBssIndex) != WLAN_STATUS_SUCCESS ||
++	    u4BufLen != MAC_ADDR_LEN || is_zero_ether_addr(mac))
++		return -ENOENT;
++
++	return mtk_cfg_get_station(wiphy, ndev, mac, sinfo);
++}
++
++static int mtk_cfg7_change_station(struct wiphy *wiphy,
++	struct wireless_dev *wdev, const u8 *mac,
++	struct station_parameters *params)
++{
++	return mtk_cfg_change_station(wiphy, wdev->netdev, mac, params);
++}
++
++static int mtk_cfg7_add_station(struct wiphy *wiphy, struct wireless_dev *wdev,
++	const u8 *mac, struct station_parameters *params)
++{
++	return mtk_cfg_add_station(wiphy, wdev->netdev, mac, params);
++}
++
++static int mtk_cfg7_del_station(struct wiphy *wiphy, struct wireless_dev *wdev,
++	struct station_del_parameters *params)
++{
++	return mtk_cfg_del_station(wiphy, wdev->netdev, params);
++}
++
++#if KERNEL_VERSION(7, 3, 0) <= CFG80211_VERSION_CODE
++/*
++ * 7.3+: cfg80211 assigns the remain-on-channel and mgmt_tx cookies and passes
++ * them in; the handlers keep them (no u8Cookie++) and report status with them.
++ */
++static int mtk_cfg7_remain_on_channel(struct wiphy *wiphy,
++	struct wireless_dev *wdev, struct ieee80211_channel *chan,
++	unsigned int duration, u64 cookie, const u8 *rx_addr)
++{
++	return mtk_cfg_remain_on_channel(wiphy, wdev, chan, duration, &cookie);
++}
++
++static int mtk_cfg7_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
++	struct cfg80211_mgmt_tx_params *params, u64 cookie)
++{
++	return mtk_cfg_mgmt_tx(wiphy, wdev, params, &cookie);
++}
++#else
++static int mtk_cfg7_remain_on_channel(struct wiphy *wiphy,
++	struct wireless_dev *wdev, struct ieee80211_channel *chan,
++	unsigned int duration, u64 *cookie, const u8 *rx_addr)
++{
++	return mtk_cfg_remain_on_channel(wiphy, wdev, chan, duration, cookie);
++}
++#endif
++
++static int mtk_cfg7_start_radar_detection(struct wiphy *wiphy,
++	struct net_device *dev, struct cfg80211_chan_def *chandef,
++	u32 cac_time_ms, int link_id)
++{
++	return mtk_cfg_start_radar_detection(wiphy, dev, chandef, cac_time_ms);
++}
++
++static int mtk_cfg7_set_wiphy_params(struct wiphy *wiphy, int radio_idx,
++	u32 changed)
++{
++	return mtk_cfg_set_wiphy_params(wiphy, changed);
++}
++
++static int mtk_cfg7_set_txpower(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int radio_idx, enum nl80211_tx_power_setting type, int mbm)
++{
++	return mtk_cfg_set_txpower(wiphy, wdev, type, mbm);
++}
++
++static int mtk_cfg7_get_txpower(struct wiphy *wiphy, struct wireless_dev *wdev,
++	int radio_idx, unsigned int link_id, int *dbm)
++{
++	return mtk_cfg_get_txpower(wiphy, wdev, dbm);
++}
++
++#define mtk_cfg_add_key			mtk_cfg7_add_key
++#define mtk_cfg_get_key			mtk_cfg7_get_key
++#define mtk_cfg_del_key			mtk_cfg7_del_key
++#define mtk_cfg_set_default_mgmt_key	mtk_cfg7_set_default_mgmt_key
++#define mtk_cfg_get_station		mtk_cfg7_get_station
++#define mtk_cfg_change_station		mtk_cfg7_change_station
++#define mtk_cfg_add_station		mtk_cfg7_add_station
++#define mtk_cfg_del_station		mtk_cfg7_del_station
++#define mtk_cfg_remain_on_channel	mtk_cfg7_remain_on_channel
++#if KERNEL_VERSION(7, 3, 0) <= CFG80211_VERSION_CODE
++#define mtk_cfg_mgmt_tx			mtk_cfg7_mgmt_tx
++#endif
++#define mtk_cfg_start_radar_detection	mtk_cfg7_start_radar_detection
++#define mtk_cfg_set_wiphy_params	mtk_cfg7_set_wiphy_params
++#define mtk_cfg_set_txpower		mtk_cfg7_set_txpower
++#define mtk_cfg_get_txpower		mtk_cfg7_get_txpower
++#endif
++
+ static struct cfg80211_ops mtk_cfg_ops = {
+ 	.add_virtual_intf = mtk_cfg_add_iface,
+ 	.del_virtual_intf = mtk_cfg_del_iface,
+@@ -1309,6 +1480,9 @@ static struct cfg80211_ops mtk_cfg_ops = {
+ #endif
+ 	.set_default_key = mtk_cfg_set_default_key,
+ 	.get_station = mtk_cfg_get_station,
++#if KERNEL_VERSION(6, 17, 0) <= CFG80211_VERSION_CODE
++	.dump_station = mtk_cfg7_dump_station,
++#endif
+ #if (CFG_ADVANCED_80211_MLO == 1) || \
+ 	(KERNEL_VERSION(6, 1, 0) <= CFG80211_VERSION_CODE)
+ 	.get_channel = mtk_cfg_get_channel,
+@@ -1400,6 +1574,22 @@ static struct cfg80211_ops mtk_cfg_ops = {
+ 	.tx_control_port = mtk_cfg80211_tx_control_port,
+ #endif
+ };
++#if KERNEL_VERSION(6, 17, 0) <= CFG80211_VERSION_CODE
++#undef mtk_cfg_add_key
++#undef mtk_cfg_get_key
++#undef mtk_cfg_del_key
++#undef mtk_cfg_set_default_mgmt_key
++#undef mtk_cfg_get_station
++#undef mtk_cfg_change_station
++#undef mtk_cfg_add_station
++#undef mtk_cfg_del_station
++#undef mtk_cfg_remain_on_channel
++#undef mtk_cfg_mgmt_tx
++#undef mtk_cfg_start_radar_detection
++#undef mtk_cfg_set_wiphy_params
++#undef mtk_cfg_set_txpower
++#undef mtk_cfg_get_txpower
++#endif
+ 
+ #if KERNEL_VERSION(3, 18, 0) <= CFG80211_VERSION_CODE
+ 
+@@ -7702,6 +7892,107 @@ static int32_t wlanOnPreNetRegister(struct GLUE_INFO *prGlueInfo,
+ 	return 0;
+ }
+ 
++/*
++ * Linux has no early suspend: enter the firmware's screen-off mode (packet
++ * filter, ARP/NS offload, multi-DTIM) around system suspend instead, so only
++ * frames for us wake the AP and the link stays up while suspended.
++ */
++static struct GLUE_INFO *wlanPmGlueInfo(void)
++{
++	struct net_device *prDev;
++
++	if (u4WlanDevNum == 0 || u4WlanDevNum > CFG_MAX_WLAN_DEVICES)
++		return NULL;
++	prDev = arWlanDevInfo[u4WlanDevNum - 1].prDev;
++	if (!prDev)
++		return NULL;
++	return *((struct GLUE_INFO **) netdev_priv(prDev));
++}
++
++/*
++ * 802.11 power save and the driver's suspend mode (RX filter without
++ * all-multicast, multicast list) while the phone sleeps. The power save is
++ * the WOW one of wlanSuspendPmHandle(), which only the PCIe / USB / SDIO
++ * HIFs call: without it the radio listens all the time in suspend (deep
++ * suspend ~177 mA instead of ~88 mA). Switching either sends firmware
++ * commands whose interrupt comes a moment later and would wake (or abort)
++ * the suspend it was meant for, so both stay on across the short wakes of
++ * the AOD and go back off only after WOW_PS_HOLD_MS awake (the phone is in
++ * use: no power save latency, as cfg80211 set it). Switching the suspend
++ * mode on every suspend and resume aborted 3-5 suspends after each AOD
++ * minute update (~30 s awake per 10 min).
++ */
++#define WOW_PS_BSS_NONE		0xff
++#define WOW_PS_HOLD_MS		15000
++#define WOW_PS_SETTLE_MS	500
++static uint8_t ucWowPsBssIndex = WOW_PS_BSS_NONE;
++
++static void wlan_wow_ps_restore(struct work_struct *work)
++{
++	struct GLUE_INFO *prGlueInfo = wlanPmGlueInfo();
++
++	if (prGlueInfo && prGlueInfo->prAdapter && !kalIsHalted()) {
++		if (ucWowPsBssIndex != WOW_PS_BSS_NONE)
++			nicConfigPowerSaveProfileEntry(prGlueInfo->prAdapter,
++				ucWowPsBssIndex, Param_PowerModeCAM,
++				FALSE, PS_CALLER_WOW);
++		if (prGlueInfo->fgIsInSuspendMode) {
++			DBGLOG(INIT, INFO, "suspend mode 0\n");
++			prGlueInfo->fgIsInSuspendMode = FALSE;
++			wlanSetSuspendMode(prGlueInfo, FALSE);
++		}
++	}
++	ucWowPsBssIndex = WOW_PS_BSS_NONE;
++}
++
++static DECLARE_DELAYED_WORK(wlan_wow_ps_restore_work, wlan_wow_ps_restore);
++
++static int wlan_suspend_mode_pm_notifier(struct notifier_block *nb,
++					 unsigned long event, void *unused)
++{
++	struct GLUE_INFO *prGlueInfo = wlanPmGlueInfo();
++	u_int8_t fgSwitched = FALSE;
++
++	if (event != PM_SUSPEND_PREPARE && event != PM_POST_SUSPEND)
++		return NOTIFY_DONE;
++	if (!prGlueInfo || !prGlueInfo->prAdapter || kalIsHalted())
++		return NOTIFY_DONE;
++
++	if (event == PM_POST_SUSPEND) {
++		schedule_delayed_work(&wlan_wow_ps_restore_work,
++				      msecs_to_jiffies(WOW_PS_HOLD_MS));
++		return NOTIFY_DONE;
++	}
++
++	cancel_delayed_work_sync(&wlan_wow_ps_restore_work);
++	if (ucWowPsBssIndex == WOW_PS_BSS_NONE) {
++		struct BSS_INFO *prAisBssInfo =
++			aisGetConnectedBssInfo(prGlueInfo->prAdapter);
++
++		if (prAisBssInfo) {
++			ucWowPsBssIndex = prAisBssInfo->ucBssIndex;
++			nicConfigPowerSaveProfileEntry(prGlueInfo->prAdapter,
++				ucWowPsBssIndex, Param_PowerModeFast_PSP,
++				FALSE, PS_CALLER_WOW);
++			fgSwitched = TRUE;
++		}
++	}
++	if (!prGlueInfo->fgIsInSuspendMode) {
++		DBGLOG(INIT, INFO, "suspend mode 1\n");
++		prGlueInfo->fgIsInSuspendMode = TRUE;
++		/* waits for the command queue: the firmware has the PS change too */
++		wlanSetSuspendMode(prGlueInfo, TRUE);
++		fgSwitched = TRUE;
++	}
++	if (fgSwitched)
++		msleep(WOW_PS_SETTLE_MS);	/* take its interrupt awake */
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block wlan_suspend_mode_pm_nb = {
++	.notifier_call = wlan_suspend_mode_pm_notifier,
++};
++
+ static void wlanOnPostNetRegister(void)
+ {
+ 	DBGLOG(INIT, TRACE, "start.\n");
+@@ -7712,6 +8003,7 @@ static void wlanOnPostNetRegister(void)
+ #endif
+ 	/* 4 <5> Register Notifier callback */
+ 	wlanRegisterInetAddrNotifier();
++	register_pm_notifier(&wlan_suspend_mode_pm_nb);
+ }
+ 
+ static
+@@ -9183,6 +9475,9 @@ static void wlanRemove(void)
+ 	wlanNetDestroy(gprWdev[0]);
+ 	prDev = NULL;
+ 
++	unregister_pm_notifier(&wlan_suspend_mode_pm_nb);
++	cancel_delayed_work_sync(&wlan_wow_ps_restore_work);
++
+ 	/* 4 <8> Unregister early suspend callback */
+ #if CFG_ENABLE_EARLY_SUSPEND
+ 	glUnregisterEarlySuspend(&wlan_early_suspend_desc);
+@@ -10050,6 +10345,9 @@ wlanNotifyFwSuspend(struct GLUE_INFO *prGlueInfo,
+ 		DBGLOG(REQ, WARN, "%s: unexpected prGlueInfo(0x%p)!\n",
+ 			   __func__, prNetDevPrivate->prGlueInfo);
+ 
++	/* Wow and AdvPws both off left mdtim and the rest uninitialized */
++	kalMemZero(&rSuspendCmd, sizeof(rSuspendCmd));
++	rSuspendCmd.ucMdtim = 1;
+ 	rSuspendCmd.ucBssIndex = prNetDevPrivate->ucBssIdx;
+ 	rSuspendCmd.ucEnableSuspendMode = fgSuspend;
+ 
+diff --git a/os/linux/gl_kal.c b/os/linux/gl_kal.c
+index a1ce05a..f850923 100644
+--- a/os/linux/gl_kal.c
++++ b/os/linux/gl_kal.c
+@@ -21,6 +21,7 @@
+  *                    E X T E R N A L   R E F E R E N C E S
+  *******************************************************************************
+  */
++#include <net/gro.h>
+ #include "gl_os.h"
+ #include "gl_kal.h"
+ #include "gl_wext.h"
+@@ -2077,14 +2078,22 @@ uint32_t kal_is_skb_gro(struct ADAPTER *prAdapter, uint8_t ucBssIdx)
+ 	return 0;
+ }
+ 
++#if KERNEL_VERSION(6, 15, 0) <= CFG80211_VERSION_CODE
++/* mainline port: GRO state moved into napi->gro */
++#define napi_gro_flush(napi, flush_old)	gro_flush(&(napi)->gro, flush_old)
++#define NAPI_GRO(napi)	(&(napi)->gro)
++#else
++#define NAPI_GRO(napi)	(napi)
++#endif
++
+ static inline void napi_gro_flush_list(struct napi_struct *napi)
+ {
+ 	napi_gro_flush(napi, false);
+ #if KERNEL_VERSION(5, 4, 0) <= CFG80211_VERSION_CODE
+-	if (napi->rx_count) {
+-		netif_receive_skb_list(&napi->rx_list);
+-		INIT_LIST_HEAD(&napi->rx_list);
+-		napi->rx_count = 0;
++	if (NAPI_GRO(napi)->rx_count) {
++		netif_receive_skb_list(&NAPI_GRO(napi)->rx_list);
++		INIT_LIST_HEAD(&NAPI_GRO(napi)->rx_list);
++		NAPI_GRO(napi)->rx_count = 0;
+ 	}
+ #endif
+ }
+@@ -2125,7 +2134,7 @@ void kal_gro_flush(struct ADAPTER *prAdapter)
+ 		DBGLOG_LIMITED(INIT, TRACE, "napi_gro_flush.\n");
+ #if KERNEL_VERSION(5, 4, 0) <= CFG80211_VERSION_CODE
+ 		prGlueInfo->u4PendingFlushNum =
+-			prGlueInfo->napi.rx_count;
++			NAPI_GRO(&prGlueInfo->napi)->rx_count;
+ #else
+ 		prGlueInfo->u4PendingFlushNum = 0;
+ #endif
+@@ -14955,7 +14964,7 @@ void kalSetThreadSchPolicyPriority(struct GLUE_INFO *prGlueInfo)
+ }
+ 
+ #if KERNEL_VERSION(5, 4, 0) <= CFG80211_VERSION_CODE
+-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
++MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+ #endif
+ 
+ /* For Linux kernel version wrapper */
+@@ -15013,7 +15022,7 @@ uint8_t kalRxGroInit(struct net_device *prDev)
+ void kalNapiThreadedInit(struct GLUE_INFO *prGlueInfo)
+ {
+ #if KERNEL_VERSION(5, 15, 0) <= CFG80211_VERSION_CODE
+-	if (dev_set_threaded(&prGlueInfo->dummy_dev, TRUE) != 0) {
++	if (dev_set_threaded(prGlueInfo->dummy_dev, TRUE) != 0) {
+ 		prGlueInfo->napi_thread = NULL;
+ 		DBGLOG(INIT, ERROR, "Napi Threaded Init Fail\n");
+ 	} else {
+@@ -15037,12 +15046,15 @@ uint8_t kalNapiInit(struct GLUE_INFO *prGlueInfo)
+ 	spin_lock_init(&prGlueInfo->napi_spinlock);
+ 	skb_queue_head_init(&prGlueInfo->rRxNapiSkbQ);
+ 	/* use dummy device to register napi */
+-	init_dummy_netdev(&prGlueInfo->dummy_dev);
++	/* mainline port: dummy netdevs are allocated, not embedded */
++	prGlueInfo->dummy_dev = alloc_netdev_dummy(0);
++	if (!prGlueInfo->dummy_dev)
++		return FALSE;
+ #if (KERNEL_VERSION(6, 1, 0) <= CFG80211_VERSION_CODE)
+-	netif_napi_add(&prGlueInfo->dummy_dev, &prGlueInfo->napi,
++	netif_napi_add(prGlueInfo->dummy_dev, &prGlueInfo->napi,
+ 			kalNapiPoll);
+ #else
+-	netif_napi_add(&prGlueInfo->dummy_dev, &prGlueInfo->napi,
++	netif_napi_add(prGlueInfo->dummy_dev, &prGlueInfo->napi,
+ 			kalNapiPoll, NAPI_POLL_WEIGHT);
+ #endif
+ #if CFG_SUPPORT_RX_NAPI_THREADED
+@@ -15058,6 +15070,8 @@ uint8_t kalNapiInit(struct GLUE_INFO *prGlueInfo)
+ uint8_t kalNapiUninit(struct GLUE_INFO *prGlueInfo)
+ {
+ 	netif_napi_del(&prGlueInfo->napi);
++	free_netdev(prGlueInfo->dummy_dev);
++	prGlueInfo->dummy_dev = NULL;
+ #if CFG_SUPPORT_RX_NAPI_THREADED
+ 	kalNapiThreadedUninit(prGlueInfo);
+ #endif /* CFG_SUPPORT_RX_NAPI_THREADED */
+diff --git a/os/linux/gl_p2p_cfg80211.c b/os/linux/gl_p2p_cfg80211.c
+index 2daeeb9..a73ef77 100644
+--- a/os/linux/gl_p2p_cfg80211.c
++++ b/os/linux/gl_p2p_cfg80211.c
+@@ -1990,19 +1990,18 @@ int mtk_p2p_cfg80211_start_ap(struct wiphy *wiphy,
+ 					 settings->inactivity_timeout,
+ 					 settings->beacon_interval,
+ 					 settings->dtim_period,
+-					 settings->ht_required,
+-					 settings->vht_required);
++					 0, 0);	/* *_required gone from cfg80211 */
+ #if KERNEL_VERSION(5, 8, 0) <= CFG80211_VERSION_CODE
+ 		i4Written += kalSnprintf(aucLogBuf + i4Written,
+ 					 LOG_BUFFER_SIZE - i4Written,
+ 					 " he[%d]",
+-					 settings->he_required);
++					 0);
+ #endif
+ #if KERNEL_VERSION(5, 11, 0) <= CFG80211_VERSION_CODE
+ 		i4Written += kalSnprintf(aucLogBuf + i4Written,
+ 					 LOG_BUFFER_SIZE - i4Written,
+ 					 " sae_h2e[%d]",
+-					 settings->sae_h2e_required);
++					 0);
+ #endif
+ 
+ 		if (chandef) {
+@@ -2915,7 +2914,9 @@ int mtk_p2p_cfg80211_remain_on_channel(struct wiphy *wiphy,
+ 
+ 		prGlueP2pDevInfo = prGlueInfo->prP2PDevInfo;
+ 
++#if KERNEL_VERSION(7, 3, 0) > CFG80211_VERSION_CODE
+ 		*cookie = prGlueP2pDevInfo->u8Cookie++;
++#endif
+ 
+ 		prMsgChnlReq = cnmMemAlloc(prGlueInfo->prAdapter,
+ 			RAM_TYPE_MSG, sizeof(struct MSG_P2P_CHNL_REQUEST));
+@@ -3078,7 +3079,9 @@ int _mtk_p2p_cfg80211_mgmt_tx(struct wiphy *wiphy,
+ 			}
+ 		}
+ 
++#if KERNEL_VERSION(7, 3, 0) > CFG80211_VERSION_CODE
+ 		*cookie = prGlueInfo->prP2PDevInfo->u8Cookie++;
++#endif
+ 
+ 		prMsgTxReq = cnmMemAlloc(prGlueInfo->prAdapter,
+ 				RAM_TYPE_MSG,
+diff --git a/os/linux/gl_p2p_kal.c b/os/linux/gl_p2p_kal.c
+index 6ca1e19..37d01a4 100644
+--- a/os/linux/gl_p2p_kal.c
++++ b/os/linux/gl_p2p_kal.c
+@@ -1814,7 +1814,7 @@ kalP2PGOStationUpdate(struct GLUE_INFO *prGlueInfo,
+ #endif
+ #endif
+ 
+-		cfg80211_new_sta(prP2pGlueInfo->aprRoleHandler,
++		cfg80211_new_sta(prP2pGlueInfo->aprRoleHandler->ieee80211_ptr,
+ 			aucBssid,
+ 			&rStationInfo, GFP_KERNEL);
+ 	} else {
+@@ -1849,7 +1849,7 @@ kalP2PGOStationUpdate(struct GLUE_INFO *prGlueInfo,
+ #endif
+ #endif
+ 
+-			cfg80211_del_sta_sinfo(prP2pGlueInfo->aprRoleHandler,
++			cfg80211_del_sta_sinfo(prP2pGlueInfo->aprRoleHandler->ieee80211_ptr,
+ 				aucBssid, &rStationInfo, GFP_KERNEL);
+ 		}
+ #if CFG_STAINFO_FEATURE
+diff --git a/os/linux/include/gl_os.h b/os/linux/include/gl_os.h
+index 98fa30f..f787ce9 100644
+--- a/os/linux/include/gl_os.h
++++ b/os/linux/include/gl_os.h
+@@ -1038,7 +1038,7 @@ struct GLUE_INFO {
+ #endif /* CFG_SUPPORT_TX_FREE_SKB_WORK */
+ 
+ #if CFG_SUPPORT_RX_GRO
+-	struct net_device dummy_dev;
++	struct net_device *dummy_dev;
+ 	struct napi_struct napi;
+ 	OS_SYSTIME tmGROFlushTimeout;
+ 	spinlock_t napi_spinlock;
+diff --git a/os/linux/plat/mt6885/plat_priv.c b/os/linux/plat/mt6885/plat_priv.c
+index a645498..b1151a1 100644
+--- a/os/linux/plat/mt6885/plat_priv.c
++++ b/os/linux/plat/mt6885/plat_priv.c
+@@ -86,29 +86,22 @@ int32_t kalCheckTputLoad(struct ADAPTER *prAdapter,
+ 	       TRUE : FALSE;
+ }
+ 
++/*
++ * mainline port: the vendor kernel boosted CPU frequency (cpu_ctrl), task
++ * util clamps and DDR OPP (mtk pm_qos) here; none of that exists on
++ * mainline. Keep the RPS steering: Rx on the little cores normally, on the
++ * big cores under load.
++ */
+ int32_t kalBoostCpu(struct ADAPTER *prAdapter,
+ 		    uint32_t u4TarPerfLevel,
+ 		    uint32_t u4BoostCpuTh)
+ {
+ 	struct GLUE_INFO *prGlueInfo = NULL;
+-	struct ppm_limit_data freq_to_set[MAX_CLUSTER_NUM];
+-	int32_t i = 0, i4Freq = -1;
+-
+-	static struct pm_qos_request wifi_qos_request;
+ 	static u_int8_t fgRequested = ENUM_CPU_BOOST_STATUS_INIT;
+ 
+-	uint32_t u4ClusterNum = topo_ctrl_get_nr_clusters();
+-
+ 	WIPHY_PRIV(wlanGetWiphy(), prGlueInfo);
+-	/* ACAO, we dont have to set core number */
+-	i4Freq = (u4TarPerfLevel >= u4BoostCpuTh) ? MAX_CPU_FREQ : -1;
+-	for (i = 0; i < u4ClusterNum && i < MAX_CLUSTER_NUM; i++) {
+-		freq_to_set[i].min = i4Freq;
+-		freq_to_set[i].max = i4Freq;
+-	}
+ 
+ 	if (fgRequested == ENUM_CPU_BOOST_STATUS_INIT) {
+-		/* initially enable rps working at small cores */
+ 		kalSetRpsMap(prGlueInfo, CPU_LITTLE_CORE);
+ 		fgRequested = ENUM_CPU_BOOST_STATUS_STOP;
+ 	}
+@@ -118,41 +111,13 @@ int32_t kalBoostCpu(struct ADAPTER *prAdapter,
+ 			pr_info("kalBoostCpu start (%d>=%d)\n",
+ 				u4TarPerfLevel, u4BoostCpuTh);
+ 			fgRequested = ENUM_CPU_BOOST_STATUS_START;
+-
+-			set_task_util_min_pct(prGlueInfo->u4TxThreadPid, 100);
+-			set_task_util_min_pct(prGlueInfo->u4RxThreadPid, 100);
+-			set_task_util_min_pct(prGlueInfo->u4HifThreadPid, 100);
+ 			kalSetRpsMap(prGlueInfo, CPU_BIG_CORE);
+-			update_userlimit_cpu_freq(CPU_KIR_WIFI,
+-				u4ClusterNum, freq_to_set);
+-
+-			KAL_ACQUIRE_MUTEX(prAdapter, MUTEX_BOOST_CPU);
+-			pr_info("Max Dram Freq start\n");
+-			pm_qos_add_request(&wifi_qos_request,
+-					   PM_QOS_DDR_OPP,
+-					   DDR_OPP_0);
+-			pm_qos_update_request(&wifi_qos_request, DDR_OPP_0);
+-			KAL_RELEASE_MUTEX(prAdapter, MUTEX_BOOST_CPU);
+-		}
+-	} else {
+-		if (fgRequested == ENUM_CPU_BOOST_STATUS_START) {
+-			pr_info("kalBoostCpu stop (%d<%d)\n",
+-				u4TarPerfLevel, u4BoostCpuTh);
+-			fgRequested = ENUM_CPU_BOOST_STATUS_STOP;
+-
+-			set_task_util_min_pct(prGlueInfo->u4TxThreadPid, 0);
+-			set_task_util_min_pct(prGlueInfo->u4RxThreadPid, 0);
+-			set_task_util_min_pct(prGlueInfo->u4HifThreadPid, 0);
+-			kalSetRpsMap(prGlueInfo, CPU_LITTLE_CORE);
+-			update_userlimit_cpu_freq(CPU_KIR_WIFI,
+-				u4ClusterNum, freq_to_set);
+-
+-			KAL_ACQUIRE_MUTEX(prAdapter, MUTEX_BOOST_CPU);
+-			pr_info("Max Dram Freq end\n");
+-			pm_qos_update_request(&wifi_qos_request, DDR_OPP_UNREQ);
+-			pm_qos_remove_request(&wifi_qos_request);
+-			KAL_RELEASE_MUTEX(prAdapter, MUTEX_BOOST_CPU);
+ 		}
++	} else if (fgRequested == ENUM_CPU_BOOST_STATUS_START) {
++		pr_info("kalBoostCpu stop (%d<%d)\n",
++			u4TarPerfLevel, u4BoostCpuTh);
++		fgRequested = ENUM_CPU_BOOST_STATUS_STOP;
++		kalSetRpsMap(prGlueInfo, CPU_LITTLE_CORE);
+ 	}
+ 	kalTraceInt(fgRequested == ENUM_CPU_BOOST_STATUS_START, "kalBoostCpu");
+ 

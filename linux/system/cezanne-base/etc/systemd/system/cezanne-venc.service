@@ -1,0 +1,12 @@
+[Unit]
+Description=Video encoder (cezanne-venc, V4L2 stateful H.264)
+# late, as cezanne-vdec.service (see /etc/modprobe.d/cezanne-venc.conf)
+After=display-manager.service cezanne-vdec.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/modprobe cezanne-venc
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,12 @@
+{
+  "uuid": "cezanne-osk@arch-port",
+  "name": "Cezanne On-Screen Keyboard",
+  "description": "Maximized windows shrink above the on-screen keyboard instead of sliding up (the stock slide leaves them drawn off their real position).",
+  "shell-version": [
+    "51"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

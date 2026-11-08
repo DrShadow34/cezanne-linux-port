@@ -1,0 +1,156 @@
+# Valve's native aarch64 Steam client for the cezanne port (Arch Linux ARM
+# has no Steam). Valve publishes it quietly next to the x86 one: the client
+# manifest steam_client_linuxarm64 lists zips for each platform; the "_all"
+# ones (UI, resources) and the "_linuxarm64_linuxarm64" ones are the native
+# client (steamrtarm64/steam, CEF web helper, codecs, SDL3). They are pinned
+# here as a bootstrap: /usr/bin/steam copies it into ~/.local/share/Steam on
+# the first start and the client updates itself there. update-sources.sh
+# pins the current client manifest, runtime and launcher; cezanne-build
+# (type follow) runs it before each build and rebuilds when upstream-version
+# (runtime, launcher) changes, not for every client release.
+# The client runs on the host, not in Valve's container: it calls
+# steam-runtime-launcher-service by name (bin/ + pressure-vessel/ of Valve's
+# arm64 Steam Runtime 3c tarball) and steamui.so links gtk2, which Arch
+# Linux ARM dropped: the runtime's two gtk2 libraries go to lib/ (the
+# launcher's LD_LIBRARY_PATH); its 207 MB container platform is left out.
+# Icons, desktop file and controller udev rules come from Valve's
+# steam-launcher tarball, as in Arch's x86 steam package; the desktop entry
+# starts Big Picture (-gamepadui), which fits the phone and brings Steam's
+# own touch keyboard.
+# Reference: github.com/Daaboulex/steam-arm64-nix (NixOS packaging).
+pkgname=steam-arm64
+# BEGIN sources (update-sources.sh)
+pkgver=1792618285.257593.87
+_launcher=1.0.0.87
+_launchersum=649375d2f9377f8009aaf3e2ff09978041eb9114897d9c5a3886f1d82e27ba1f
+_runtime=3c.0.20260824.257593
+_runtimesum=2f2be461b6a4360828e200e1644e18cd957eedc36a38e5a1e13a39276320b6e2
+_zips=(
+  tenfoot_images_all.zip.86419c7a56c12dd107b5e0d46f50c8a9b121f3cc
+  steamui_websrc_all.zip.24dd80531ce5c8cf19b5bfdd2e580ab55ebf8365
+  resources_misc_all.zip.99ed79ed868d732d8e9e9a45444b8f003191e3dd
+  resources_hidpi_all.zip.a110d78e994c028dc1c412951e87a0c4e9c819f7
+  resources_all.zip.213fe769fd8484a0d149453c5655e70c1d13b086
+  strings_en_all.zip.e716a67d7fa91ba70490a6417e25d45c5435e393
+  strings_all.zip.ad0779a3a2612ae06fe66604b121245d3905fd12
+  public_all.zip.f7b7316d122d96ff7f79b6eede24edd5b142d7bf
+  bins_hardware_all.zip.58d828f4b4d9969be201b7731579a74bae0c3ea8
+  steamui_websrc_sounds_all.zip.74727ca40ef88c5012bb631488fd285418dce825
+  steamui_websrc_movies_all.zip.40e78cdda48e9a8a74baf614e0cdc7a6b96d26d1
+  webkit_linuxarm64_linuxarm64.zip.c1d5fa58a564375f71b34bccaa51c19be1143137
+  sdl3_linuxarm64_linuxarm64.zip.1079b9b8da6c5077c141565a84a48deafb77c84c
+  codecs_linuxarm64_linuxarm64.zip.fdde94b671c09c96665ef20f699137ece6f0d7c7
+  bins_linuxarm64_linuxarm64.zip.426e3ea97690dd3ddacbfb4b509a4ca9e916b62d
+  bins_sdk_linuxarm64_linuxarm64.zip.627e92fd6abe85137b0946352d67da876717e6f8
+  resource_linuxarm64_linuxarm64.zip.6e5691ac5a1a55a554250468a98c3f8e454fea4a
+)
+_zipsums=(
+  990676bc29d01736477c6b571b5048258a6156284ef242503112fc68567cbf01
+  275f353463226631c3a43e90994f65a64262c30a961dccd257ccfc4b08f2f1a1
+  187e562403c7544af7162e08baf7677d030ad6f60947c2cdc7dcbcbf0a7a7fe6
+  5bdb97ec734f035c1d06a59b62980028b1b05b920c544ae3673b1a515d3d507e
+  769840cdb2b22ad9798a1a3950de2fe82b8b5d3d37389dcc9b1393f77480d67b
+  0c56193fac4fa518eaaac0dc66ecd21a3cee510ece85594b6c308f8d31ee98a3
+  5a5370f3b16675cc39d928d8557ff42f4f6caa427ea4d6bc7f98ee31d8ef9513
+  c3cf55bac18220f9c3587c91e94777d31968781c76628154794cf15a7de6f6a0
+  90b8202eb03a0a95bf444d0daa6849c7e63a0e32fa9367ddb369d6218d2978b1
+  c823bd39d234e7d9a5fdb5ec6605eae3f175e52bb847725e8826ff526a61641c
+  885a32533327f0fd5ea98e6c6f13552e965cab4852dad7ce9ccf3d929d726b5b
+  b8687e0f20668d24055d8f2e9f6c4fbcbe84fbb99a7bc9de4595530be7029990
+  0faefe140e16df62b8af79e86148ebf5d5f8eb924e32d8d91daf6b4676328034
+  e7b6fc64e7508bc8a54529595d927fd362801cc79cebc88db9e6293860e5a591
+  a77faaf185f7b0681886d1c30e989d2cd1821cea421d41556e733b9d065b85a1
+  5eeb7875cb4031aa00abb7474fcefeaf98c1c6aead2f3013b4d8766f48a7b28b
+  f78280db38d95a74096a00f7d2bc3061286db135e9e61bbf963eb65de39d66fc
+)
+# END sources
+# bump with a packaging change while the sources stay (else the rebuild is
+# not published); update-sources.sh changes pkgver, so back to 1 then
+pkgrel=1
+pkgdesc="Valve's native aarch64 Steam client"
+arch=(aarch64)
+url="https://store.steampowered.com/"
+license=(LicenseRef-steam-subscriber-agreement)
+depends=(bash coreutils util-linux file lsof pciutils usbutils xdg-utils xz
+         python
+         alsa-lib at-spi2-core brotli bzip2 cairo dbus expat fontconfig
+         freetype2 gdk-pixbuf2 glib2 glibc libasyncns libcups libdrm libgcc
+         libglvnd libibus libice libnm libpipewire libpulse libsm libsndfile
+         libssh2 libstdc++ libva libvdpau libx11 libxcb libxcomposite
+         libxcursor libxdamage libxext libxfixes libxi libxinerama
+         libxkbcommon libxrandr libxrender libxtst mesa nspr nss openal
+         openssl pango sdl2-compat systemd-libs vulkan-icd-loader zlib zstd)
+makedepends=(unzip)
+optdepends=('zenity: dialogs of the client')
+provides=(steam)
+conflicts=(steam)
+options=(!strip !debug)
+_cdn=https://client-update.fastly.steamstatic.com
+source=("https://repo.steampowered.com/steam/archive/stable/steam_${_launcher}.tar.gz"
+        "steam-runtime-steamrt-arm64-${_runtime}.tar.xz::https://repo.steampowered.com/steamrt3c/images/${_runtime}/steam-runtime-steamrt-arm64.tar.xz"
+        steam
+        "${_zips[@]/#/$_cdn/}")
+# makepkg would unpack the zips itself (it goes by content, not name)
+noextract=("${_zips[@]}")
+sha256sums=("$_launchersum"
+            "$_runtimesum"
+            'SKIP'
+            "${_zipsums[@]}")
+
+package() {
+  local lib="$pkgdir/usr/lib/steam-arm64"
+  local boot="$lib/bootstrap" rt="$srcdir/steam-runtime-steamrt-arm64"
+  local z entry target f size
+
+  install -d "$boot"
+  for z in "${_zips[@]}"; do
+    unzip -qq -o "$srcdir/$z" -d "$boot"
+  done
+  # some entries come with Windows paths: "steamrtarm64\libs\libcurl.so"
+  while IFS= read -r -d '' entry; do
+    target="$boot/$(basename "$entry" | tr '\\' /)"
+    if [ -d "$entry" ]; then
+      mkdir -p "$target"
+      cp -a "$entry/." "$target/"
+      rm -rf "$entry"
+    else
+      mkdir -p "$(dirname "$target")"
+      mv "$entry" "$target"
+    fi
+  done < <(find "$boot" -mindepth 1 -maxdepth 1 -name '*\\*' -print0 | sort -z)
+  chmod -R u+rwX,go+rX,go-w "$boot"
+  # the zips keep no modes: executables are the ELF files and scripts
+  while IFS= read -r -d '' f; do
+    case "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" in
+      7f454c46|2321*) chmod 755 "$f" ;;
+    esac
+  done < <(find "$boot" -type f -print0)
+  test -x "$boot/steamrtarm64/steam"
+
+  install -d "$lib/runtime" "$lib/lib"
+  cp -a "$rt/bin" "$rt/pressure-vessel" "$rt/VERSIONS.txt" "$lib/runtime/"
+  cp -a "$rt"/steamrt3c_platform_*/files/lib/aarch64-linux-gnu/lib{gtk,gdk}-x11-2.0.so.0.* "$lib/lib/"
+  for f in "$lib"/lib/*.so.0.*; do
+    ln -s "${f##*/}" "${f%.so.0.*}.so.0"	# the tarball has no soname links
+  done
+  test -e "$lib/runtime/bin/steam-runtime-launcher-service"
+  test -e "$lib/lib/libgtk-x11-2.0.so.0"
+
+  install -Dm755 steam "$pkgdir/usr/bin/steam"
+  cd steam-launcher
+  # the phone's screen is too narrow for the desktop client: Big Picture
+  # (touch, Steam's own keyboard); it leaves to the desktop client on exit
+  sed 's|^Exec=/usr/bin/steam %U$|Exec=/usr/bin/steam -gamepadui %U|' steam.desktop |
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/steam.desktop"
+  grep -q '^Exec=/usr/bin/steam -gamepadui %U$' "$pkgdir/usr/share/applications/steam.desktop"
+  for f in icons/*/steam.png; do
+    size=${f#icons/}; size=${size%%/*}
+    install -Dm644 "$f" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/steam.png"
+  done
+  install -Dm644 subprojects/steam-devices/60-steam-input.rules \
+    "$pkgdir/usr/lib/udev/rules.d/60-steam-input.rules"
+  install -Dm644 subprojects/steam-devices/60-steam-vr.rules \
+    "$pkgdir/usr/lib/udev/rules.d/60-steam-vr.rules"
+  install -Dm644 steam_subscriber_agreement.txt \
+    "$pkgdir/usr/share/licenses/$pkgname/steam_subscriber_agreement.txt"
+}

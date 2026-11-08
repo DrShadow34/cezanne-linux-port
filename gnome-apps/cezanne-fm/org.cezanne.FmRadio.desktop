@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=FM Radio
+Comment=Listen to FM radio with the phone's receiver
+Exec=cezanne-fm
+Icon=org.cezanne.FmRadio
+Terminal=false
+Type=Application
+Categories=GTK;AudioVideo;Audio;Player;
+Keywords=radio;FM;tuner;station;
+StartupNotify=true

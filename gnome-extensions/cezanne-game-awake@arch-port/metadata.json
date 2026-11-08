@@ -1,0 +1,12 @@
+{
+  "uuid": "cezanne-game-awake@arch-port",
+  "name": "Cezanne Game Awake",
+  "description": "Keeps the screen on and the phone awake while a game runs (a Steam game, or any fullscreen window): no idle lock and sleep while it loads or is played with a gamepad. The power key still puts the phone to sleep.",
+  "shell-version": [
+    "51"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

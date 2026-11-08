@@ -1,0 +1,13 @@
+[Unit]
+Description=Speaker amp firmware, calibration and gains (cezanne)
+After=sound.target
+Wants=sound.target
+Before=pipewire.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cezanne-audio-init
+
+[Install]
+WantedBy=multi-user.target

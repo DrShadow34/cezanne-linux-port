@@ -1,0 +1,37 @@
+# Caffeine (GNOME Shell extension, third-party, user asked for it
+# 2026-11-04): a quick settings toggle / timer that keeps the session from
+# going idle or suspending, so the phone stays awake for a while.
+pkgname=gnome-shell-extension-caffeine
+pkgver=61
+pkgrel=1
+pkgdesc="GNOME Shell extension: disable the screensaver and auto suspend"
+arch=(any)
+url="https://github.com/eonpatapon/gnome-shell-extension-caffeine"
+license=(GPL-2.0-or-later)
+depends=(gnome-shell)
+makedepends=(gettext)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/eonpatapon/gnome-shell-extension-caffeine/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('34d020a531aec454d3db441cc150ff0bc45d557d7d95a20f6c252563c7b21507')
+
+_uuid=caffeine@patapon.info
+
+build() {
+  cd "$pkgname-$pkgver/$_uuid"
+  local po
+  for po in locale/*.po; do
+    mkdir -p "$srcdir/mo/$(basename "$po" .po)/LC_MESSAGES"
+    msgfmt -o "$srcdir/mo/$(basename "$po" .po)/LC_MESSAGES/$pkgname.mo" "$po"
+  done
+}
+
+package() {
+  cd "$pkgname-$pkgver/$_uuid"
+  local d=$pkgdir/usr/share/gnome-shell/extensions/$_uuid
+  install -d "$d"
+  cp -r --no-preserve=ownership extension.js prefs.js mprisMediaPlayer2.js metadata.json \
+    icons preferences "$d"/
+  # system schema dir: compiled by glib2's pacman hook
+  install -Dm644 schemas/org.gnome.shell.extensions.caffeine.gschema.xml -t \
+    "$pkgdir/usr/share/glib-2.0/schemas"
+  cp -r "$srcdir/mo" "$pkgdir/usr/share/locale"
+}

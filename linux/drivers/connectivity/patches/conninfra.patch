@@ -1,0 +1,543 @@
+diff --git a/Kbuild b/Kbuild
+index 32a64ba..3d96c1a 100644
+--- a/Kbuild
++++ b/Kbuild
+@@ -17,7 +17,7 @@ ifndef TOP
+ endif
+ 
+ # Force build fail on modpost warning
+-KBUILD_MODPOST_FAIL_ON_WARNINGS := y
++# KBUILD_MODPOST_FAIL_ON_WARNINGS := y
+ 
+ ###############################################################################
+ # Option for some ALPS specific feature, ex: AEE.
+@@ -41,12 +41,19 @@ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/gpu/drm/mediatek/mediatek_v2
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/memory/mediatek/
+ 
+ ###############################################################################
+-ccflags-y += -Werror
++# ccflags-y += -Werror  (dropped for the mainline port)
+ ccflags-y += -Wno-error=format
+ ccflags-y += -Wno-error=format-extra-args
+ 
+ ###############################################################################
+-KO_CODE_PATH := $(if $(filter /%,$(src)),,$(srctree)/)$(src)
++KO_CODE_PATH := $(CONNINFRA_SRC)
++# mainline port: stand-ins for vendor kernel headers
++ccflags-y += -I$(CONNINFRA_SRC)/../compat/include
++ccflags-y += -include $(CONNINFRA_SRC)/../compat/include/compat_mainline.h
++# the platform switches are make variables here; C code tests them too
++ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6885),y)
++ccflags-y += -DCONFIG_MTK_COMBO_CHIP_CONSYS_6885=1
++endif
+ 
+ MODULE_NAME := conninfra
+ ifeq ($(CONFIG_WLAN_DRV_BUILD_IN),y)
+@@ -288,6 +295,8 @@ $(MODULE_NAME)-objs += conf/conninfra_conf.o
+ 
+ # adaptor
+ $(MODULE_NAME)-objs += adaptor/conninfra_dev.o
++$(MODULE_NAME)-objs += adaptor/connv3_absent.o
++$(MODULE_NAME)-objs += adaptor/mainline_exports.o
+ $(MODULE_NAME)-objs += adaptor/conn_kern_adaptor.o
+ $(MODULE_NAME)-objs += adaptor/connsyslog/fw_log_mcu.o
+ $(MODULE_NAME)-objs += adaptor/connsyslog/connsyslog_to_user.o
+@@ -318,17 +327,6 @@ $(MODULE_NAME)-objs += conn_drv/connv2/debug_utility/conninfra_dbg.o
+ ############################
+ # connv3
+ ############################
+-$(MODULE_NAME)-objs += conn_drv/connv3/src/connv3.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/src/connv3_drv.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/core/connv3_core.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/connv3_hw.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/connv3_hw_plat_data.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/connv3_pmic_mng.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/connv3_pinctrl_mng.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/connv3_hw_dbg.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/debug_utility/connsyslog/connv3_mcu_log.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/debug_utility/coredump/connv3_coredump.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/debug_utility/coredump/connv3_dump_mng.o
+ 
+ # By Plaftfrom
+ ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6885),y)
+@@ -580,50 +578,26 @@ $(MODULE_NAME)-objs += conn_drv/connv2/drv_init/wlan_drv_init.o
+ ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6983),y)
+ ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/conn_drv/connv3/platform/mt6983),)
+ 
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6983/mt6983.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6983/mt6983_pmic.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6983/mt6983_pinctrl.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6639/mt6639_dbg.o
+ endif
+ endif
+ 
+ ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6985),y)
+ ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/conn_drv/connv3/platform/mt6985),)
+ 
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6985/mt6985.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6985/mt6985_pmic.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6985/mt6985_pinctrl.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6639/mt6639_dbg.o
+ endif
+ endif
+ 
+ ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6989),y)
+ ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/conn_drv/connv3/platform/mt6989),)
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6989/mt6989.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6989/mt6989_pmic.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6989/mt6989_pinctrl.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6639/mt6639_dbg.o
+ # add mt6653 for de-risk plan
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6989/mt6989_mt6653.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6653/mt6653_dbg.o
+ endif
+ ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/conn_drv/connv3/platform/mt6989v2),)
+ # for mt6989v2
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6989v2/mt6989v2.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6989v2/mt6989v2_pmic.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6989v2/mt6989v2_pinctrl.o
+ endif
+ endif
+ 
+ ifeq ($(CONFIG_MTK_COMBO_CHIP_CONSYS_6991),y)
+ ifneq ($(wildcard $(PATH_TO_CONNINFRA_DRV)/conn_drv/connv3/platform/mt6991),)
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6991/mt6991.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6991/mt6991_pmic.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6991/mt6991_pinctrl.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6653/mt6653_dbg.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6639/mt6639_dbg.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6991/mt6991_mt6639.o
+-$(MODULE_NAME)-objs += conn_drv/connv3/platform/mt6991/mt6991_mt6639_pmic.o
+ endif
+ endif
+ 
+diff --git a/adaptor/conninfra_dev.c b/adaptor/conninfra_dev.c
+index 72c53de..7801010 100755
+--- a/adaptor/conninfra_dev.c
++++ b/adaptor/conninfra_dev.c
+@@ -370,6 +370,36 @@ static void conn_adaptor_dev_pwr_on_off_handler(struct work_struct *work)
+ 	}
+ }
+ 
++/*
++ * mainline port: there is no MTK display notifier, so screen state (which
++ * starts the RF pre-calibration on the first unblank) comes from userspace:
++ * echo 1 > /sys/module/conninfra/parameters/screen_on
++ */
++static int conn_adaptor_screen_on_set(const char *val,
++				      const struct kernel_param *kp)
++{
++	bool on;
++	int ret = kstrtobool(val, &on);
++
++	if (ret)
++		return ret;
++	atomic_set(&g_es_lr_flag_for_blank, on);
++	pr_info("Conninfra screen %s (userspace)\n", on ? "on" : "off");
++	schedule_work(&g_pwr_on_off_work);
++	return 0;
++}
++
++static int conn_adaptor_screen_on_get(char *buf, const struct kernel_param *kp)
++{
++	return sysfs_emit(buf, "%d\n", atomic_read(&g_es_lr_flag_for_blank));
++}
++
++static const struct kernel_param_ops conn_adaptor_screen_on_ops = {
++	.set = conn_adaptor_screen_on_set,
++	.get = conn_adaptor_screen_on_get,
++};
++module_param_cb(screen_on, &conn_adaptor_screen_on_ops, NULL, 0644);
++
+ static int mtk_conn_adaptor_suspend(void)
+ {
+ 	int ret = 0;
+diff --git a/adaptor/connv3_absent.c b/adaptor/connv3_absent.c
+new file mode 100644
+index 0000000..aedd82d
+--- /dev/null
++++ b/adaptor/connv3_absent.c
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: GPL-2.0
++/* mainline port: connv3 (newer CONNSYS generations) is not built */
++#include "connv3_drv.h"
++
++int connv3_drv_init(void)
++{
++	return 0;
++}
++
++int connv3_drv_deinit(void)
++{
++	return 0;
++}
+diff --git a/adaptor/mainline_exports.c b/adaptor/mainline_exports.c
+new file mode 100644
+index 0000000..3ae1873
+--- /dev/null
++++ b/adaptor/mainline_exports.c
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * mainline port: symbols the vendor kernel's built-in connectivity adapter
++ * exported to the connectivity modules.
++ */
++#include <linux/module.h>
++#include <linux/sched/debug.h>
++
++void connectivity_export_show_stack(struct task_struct *tsk, unsigned long *sp)
++{
++	sched_show_task(tsk ? tsk : current);
++}
++EXPORT_SYMBOL(connectivity_export_show_stack);
+diff --git a/conn_drv/connv2/core/conninfra_core.c b/conn_drv/connv2/core/conninfra_core.c
+index 68a3b48..9fff05d 100755
+--- a/conn_drv/connv2/core/conninfra_core.c
++++ b/conn_drv/connv2/core/conninfra_core.c
+@@ -600,7 +600,9 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 	int i, ret, cur_state;
+ 	int bt_cal_ret, wf_cal_ret;
+ 	struct subsys_drv_inst *drv_inst;
+-	int pre_cal_done_state = (0x1 << CONNDRV_TYPE_BT) | (0x1 << CONNDRV_TYPE_WIFI);
++	/* mainline port: BT takes part only when its driver registered */
++	bool with_bt = g_conninfra_ctx.drv_inst[CONNDRV_TYPE_BT].ops_cb.pre_cal_cb.do_cal_cb != NULL;
++	int pre_cal_done_state = (with_bt ? (0x1 << CONNDRV_TYPE_BT) : 0) | (0x1 << CONNDRV_TYPE_WIFI);
+ 	struct timespec64 begin, bt_cal_begin, wf_cal_begin, end, backup_end;
+ 	struct subsys_drv_inst *wifi_drv = &g_conninfra_ctx.drv_inst[CONNDRV_TYPE_WIFI];
+ 	unsigned int cal_result_offset = 0, cal_result_size = 0;
+@@ -622,6 +624,8 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 
+ 	/* check if func already on */
+ 	for (i = 0; i < CAL_DRV_COUNT; i++) {
++		if (!with_bt && cal_drvs[i] == CONNDRV_TYPE_BT)
++			continue;
+ 		if (g_conninfra_ctx.drv_inst[cal_drvs[i]].drv_status == DRV_STS_POWER_ON) {
+ 			pr_warn("[%s] %s already on\n", __func__, g_drv_name[cal_drvs[i]]);
+ 			osal_unlock_sleepable_lock(&g_conninfra_ctx.core_lock);
+@@ -634,15 +638,18 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 	if (ret)
+ 		pr_info("[pre_cal] clean data fail, ret = %d", ret);
+ 
+-	ret = conninfra_core_power_on(CONNDRV_TYPE_BT);
+-	if (ret) {
+-		pr_err("BT power on fail during pre_cal");
+-		return -1;
++	if (with_bt) {
++		ret = conninfra_core_power_on(CONNDRV_TYPE_BT);
++		if (ret) {
++			pr_err("BT power on fail during pre_cal");
++			return -1;
++		}
+ 	}
+ 	ret = conninfra_core_power_on(CONNDRV_TYPE_WIFI);
+ 	if (ret) {
+ 		pr_err("WIFI power on fail during pre_cal");
+-		conninfra_core_power_off(CONNDRV_TYPE_BT);
++		if (with_bt)
++			conninfra_core_power_off(CONNDRV_TYPE_BT);
+ 		return -2;
+ 	}
+ 
+@@ -653,6 +660,8 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 	sema_init(&g_conninfra_ctx.pre_cal_sema, 1);
+ 
+ 	for (i = 0; i < CAL_DRV_COUNT; i++) {
++		if (!with_bt && cal_drvs[i] == CONNDRV_TYPE_BT)
++			continue;
+ 		drv_inst = &g_conninfra_ctx.drv_inst[cal_drvs[i]];
+ 		ret = msg_thread_send_1(&drv_inst->msg_ctx,
+ 				INFRA_SUBDRV_OPID_CAL_PWR_ON, cal_drvs[i]);
+@@ -666,7 +675,7 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 			continue;
+ 		cur_state = atomic_read(&g_conninfra_ctx.pre_cal_state);
+ 		pr_info("[pre_cal] cur state =[%d]", cur_state);
+-		if ((cur_state & (0x1 << CONNDRV_TYPE_BT)) == 0) {
++		if (with_bt && (cur_state & (0x1 << CONNDRV_TYPE_BT)) == 0) {
+ 			pr_info("[pre_cal] BT pwr_on callback is not back");
+ 			drv_inst = &g_conninfra_ctx.drv_inst[CONNDRV_TYPE_BT];
+ 			osal_thread_show_stack(&drv_inst->msg_ctx.thread);
+@@ -682,6 +691,8 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 	osal_gettimeofday(&bt_cal_begin);
+ 
+ 	/* Do Calibration */
++	bt_cal_ret = CONNINFRA_CB_RET_CAL_PASS_POWER_OFF;
++	if (with_bt) {
+ 	drv_inst = &g_conninfra_ctx.drv_inst[CONNDRV_TYPE_BT];
+ 	bt_cal_ret = msg_thread_send_wait_1(&drv_inst->msg_ctx,
+ 			INFRA_SUBDRV_OPID_CAL_DO_CAL, 0, CONNDRV_TYPE_BT);
+@@ -694,6 +705,7 @@ static int opfunc_pre_cal(struct msg_op_data *op)
+ 	if (bt_cal_ret == CONNINFRA_CB_RET_CAL_PASS_POWER_OFF ||
+ 		bt_cal_ret == CONNINFRA_CB_RET_CAL_FAIL_POWER_OFF)
+ 		conninfra_core_power_off(CONNDRV_TYPE_BT);
++	}
+ 
+ 	pr_info("[pre_cal] >>>>>>>> BT do cal done");
+ 
+@@ -1132,8 +1144,8 @@ static int opfunc_pre_cal_prepare(struct msg_op_data *op)
+ 
+ 	spin_lock_irqsave(&g_conninfra_ctx.infra_lock, flag);
+ 
+-	if (bt_drv->ops_cb.pre_cal_cb.do_cal_cb == NULL ||
+-		wifi_drv->ops_cb.pre_cal_cb.do_cal_cb == NULL) {
++	/* mainline port: no BT driver yet; calibrate Wi-Fi alone */
++	if (wifi_drv->ops_cb.pre_cal_cb.do_cal_cb == NULL) {
+ 		pr_info("[%s] [pre_cal] [%p][%p]", __func__,
+ 			bt_drv->ops_cb.pre_cal_cb.do_cal_cb,
+ 			wifi_drv->ops_cb.pre_cal_cb.do_cal_cb);
+@@ -1172,7 +1184,8 @@ static int opfunc_pre_cal_prepare(struct msg_op_data *op)
+ 		cur_status = cal_info->status;
+ 
+ 		if ((cur_status == PRE_CAL_NOT_INIT || cur_status == PRE_CAL_NEED_RESCHEDULE) &&
+-			bt_drv->drv_status == DRV_STS_POWER_OFF &&
++			(bt_drv->ops_cb.pre_cal_cb.do_cal_cb == NULL ||
++			 bt_drv->drv_status == DRV_STS_POWER_OFF) &&
+ 			wifi_drv->drv_status == DRV_STS_POWER_OFF) {
+ 			cal_info->status = PRE_CAL_SCHEDULED;
+ 			cal_info->caller = op->op_data[0];
+diff --git a/conn_drv/connv2/debug_utility/connsyslog/connsyslog.c b/conn_drv/connv2/debug_utility/connsyslog/connsyslog.c
+index 6c01c3b..8ec7d4a 100644
+--- a/conn_drv/connv2/debug_utility/connsyslog/connsyslog.c
++++ b/conn_drv/connv2/debug_utility/connsyslog/connsyslog.c
+@@ -1387,7 +1387,7 @@ static int connlog_cancel_alarm_timer(void)
+ }
+ 
+ 
+-static enum alarmtimer_restart connlog_alarm_timer_handler(struct alarm *alarm,
++static void connlog_alarm_timer_handler(struct alarm *alarm,
+ 	ktime_t now)
+ {
+ 	ktime_t kt;
+@@ -1411,8 +1411,6 @@ static enum alarmtimer_restart connlog_alarm_timer_handler(struct alarm *alarm,
+ 	kt = ktime_set(gLogAlarm.alarm_sec, 0);
+ 	alarm_start_relative(&gLogAlarm.alarm_timer, kt);
+ 	spin_unlock_irqrestore(&gLogAlarm.alarm_lock, gLogAlarm.flags);
+-
+-	return ALARMTIMER_NORESTART;
+ }
+ 
+ static int connlog_alarm_init(void)
+diff --git a/conn_drv/connv2/platform/mt6885/include/mt6885_pos.h b/conn_drv/connv2/platform/mt6885/include/mt6885_pos.h
+index 8d1f63e..1281c6f 100755
+--- a/conn_drv/connv2/platform/mt6885/include/mt6885_pos.h
++++ b/conn_drv/connv2/platform/mt6885/include/mt6885_pos.h
+@@ -12,12 +12,13 @@ unsigned int consys_emi_set_remapping_reg_mt6885(phys_addr_t, phys_addr_t, phys_
+ int consys_conninfra_on_power_ctrl_mt6885(unsigned int enable);
+ int consys_conninfra_wakeup_mt6885(void);
+ int consys_conninfra_sleep_mt6885(void);
+-void consys_set_if_pinmux_mt6885(unsigned int enable);
++void consys_set_if_pinmux_mt6885(unsigned int enable, unsigned int curr_status,
++	unsigned int next_status);
+ int consys_polling_chipid_mt6885(void);
+ 
+ int connsys_d_die_cfg_mt6885(void);
+-int connsys_spi_master_cfg_mt6885(unsigned int);
+-int connsys_a_die_cfg_mt6885(void);
++int connsys_spi_master_cfg_mt6885(unsigned int curr_status, unsigned int next_status);
++int connsys_a_die_cfg_mt6885(unsigned int curr_status, unsigned int next_status);
+ int connsys_afe_wbg_cal_mt6885(void);
+ int connsys_subsys_pll_initial_mt6885(void);
+ int connsys_low_power_setting_mt6885(unsigned int, unsigned int);
+diff --git a/conn_drv/connv2/platform/mt6885/mt6885.c b/conn_drv/connv2/platform/mt6885/mt6885.c
+index 83d24c3..d357f81 100755
+--- a/conn_drv/connv2/platform/mt6885/mt6885.c
++++ b/conn_drv/connv2/platform/mt6885/mt6885.c
+@@ -12,6 +12,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
++#include <linux/pm_runtime.h>
+ #include <linux/of_address.h>
+ #include <linux/types.h>
+ 
+@@ -74,7 +75,7 @@ static int consys_thermal_query(void);
+ static int consys_power_state(char *buf, unsigned int size);
+ static int consys_bus_clock_ctrl(enum consys_drv_type, unsigned int, int);
+ static unsigned long long consys_soc_timestamp_get(void);
+-static unsigned int consys_adie_detection_mt6885(void);
++static unsigned int consys_adie_detection_mt6885(unsigned int drv_type);
+ 
+ 
+ /*******************************************************************************
+@@ -158,9 +159,26 @@ const struct conninfra_plat_data mt6885_plat_data = {
+ ********************************************************************************
+ */
+ 
+-/* mtcmos contorl */
++/*
++ * mtcmos control. The vendor kernel exposes the CONN MTCMOS as a clock;
++ * mainline has it as a genpd power domain, so drive it through runtime PM
++ * when the node has power-domains (the clock remains as a fallback).
++ */
++static struct device *consys_pd_dev;
++
+ int consys_clk_get_from_dts(struct platform_device *pdev)
+ {
++	if (of_property_present(pdev->dev.of_node, "power-domains")) {
++		consys_pd_dev = &pdev->dev;
++		pm_runtime_enable(consys_pd_dev);
++		/*
++		 * CONNSYS keeps its firmware state across system sleep (as on
++		 * Android): a wakeup device keeps the domain on in suspend.
++		 */
++		device_init_wakeup(consys_pd_dev, true);
++		return 0;
++	}
++
+ 	clk_scp_conn_main = devm_clk_get(&pdev->dev, "conn");
+ 	if (IS_ERR(clk_scp_conn_main)) {
+ 		pr_err("[CCF]cannot get clk_scp_conn_main clock.\n");
+@@ -175,6 +193,19 @@ int consys_platform_spm_conn_ctrl_mt6885(unsigned int enable)
+ {
+ 	int ret = 0;
+ 
++	if (consys_pd_dev) {
++		if (enable) {
++			ret = pm_runtime_resume_and_get(consys_pd_dev);
++			if (ret) {
++				pr_err("Turn on conn_infra power fail. Ret=%d\n", ret);
++				return -1;
++			}
++		} else {
++			pm_runtime_put_sync(consys_pd_dev);
++		}
++		return 0;
++	}
++
+ 	if (enable) {
+ 		ret = clk_prepare_enable(clk_scp_conn_main);
+ 		if (ret) {
+@@ -503,7 +534,7 @@ static unsigned long long consys_soc_timestamp_get(void)
+ 	return timestamp;
+ }
+ 
+-static unsigned int consys_adie_detection_mt6885(void)
++static unsigned int consys_adie_detection_mt6885(unsigned int drv_type)
+ {
+ 	return 0x6635;
+ }
+diff --git a/conn_drv/connv2/platform/mt6885/mt6885_pmic.c b/conn_drv/connv2/platform/mt6885/mt6885_pmic.c
+index 6a57935..2e7790e 100755
+--- a/conn_drv/connv2/platform/mt6885/mt6885_pmic.c
++++ b/conn_drv/connv2/platform/mt6885/mt6885_pmic.c
+@@ -66,7 +66,7 @@
+ 
+ static int consys_plt_pmic_get_from_dts(struct platform_device *pdev, struct conninfra_dev_cb* dev_cb);
+ 
+-static int consys_plt_pmic_common_power_ctrl(unsigned int enable);
++static int consys_plt_pmic_common_power_ctrl(unsigned int enable, unsigned int curr_status, unsigned int next_status);
+ static int consys_plt_pmic_wifi_power_ctrl(unsigned int enable);
+ static int consys_plt_pmic_bt_power_ctrl(unsigned int enable);
+ static int consys_plt_pmic_gps_power_ctrl(unsigned int enable);
+@@ -351,10 +351,14 @@ int consys_pmic_vcn33_2_power_ctl(bool enable)
+ 	return 0;
+ }
+ 
+-int consys_plt_pmic_common_power_ctrl(unsigned int enable)
++int consys_plt_pmic_common_power_ctrl(unsigned int enable, unsigned int curr_status, unsigned int next_status)
+ {
+ 	int ret;
+ 
++	/* connv2 calls this for every radio; only the first on / last off acts */
++	if (enable ? curr_status != 0 : next_status != 0)
++		return 0;
++
+ 	if (enable) {
+ 		if (consys_is_rc_mode_enable_mt6885()) {
+ 			/* RC mode */
+diff --git a/conn_drv/connv2/platform/mt6885/mt6885_pos.c b/conn_drv/connv2/platform/mt6885/mt6885_pos.c
+index 83645b9..72ac792 100755
+--- a/conn_drv/connv2/platform/mt6885/mt6885_pos.c
++++ b/conn_drv/connv2/platform/mt6885/mt6885_pos.c
+@@ -584,8 +584,13 @@ int consys_conninfra_sleep_mt6885(void)
+ 	return 0;
+ }
+ 
+-void consys_set_if_pinmux_mt6885(unsigned int enable)
++void consys_set_if_pinmux_mt6885(unsigned int enable, unsigned int curr_status,
++	unsigned int next_status)
+ {
++	/* connv2 calls this for every radio; only the first on / last off acts */
++	if (enable ? curr_status != 0 : next_status != 0)
++		return ;
++
+ #ifndef CONFIG_FPGA_EARLY_PORTING
+ 	if (enable) {
+ 		/* Set pinmux for the interface between D-die and A-die
+@@ -822,7 +827,7 @@ int connsys_d_die_cfg_mt6885(void)
+ 	return 0;
+ }
+ 
+-int connsys_spi_master_cfg_mt6885(unsigned int next_status)
++int connsys_spi_master_cfg_mt6885(unsigned int curr_status, unsigned int next_status)
+ {
+ 	unsigned int bt_only = 0;
+ 
+@@ -1130,12 +1135,16 @@ static int connsys_a_die_thermal_cal(int efuse_valid, unsigned int efuse)
+ }
+ //#endif
+ 
+-int connsys_a_die_cfg_mt6885(void)
++int connsys_a_die_cfg_mt6885(unsigned int curr_status, unsigned int next_status)
+ {
+ 	int efuse_valid;
+ 	bool adie_26m = true;
+ 	unsigned int adie_id = 0;
+ 
++	/* the A-die is configured on the first power on only */
++	if (curr_status != 0)
++		return 0;
++
+ 	if (consys_co_clock_type_mt6885() == CONNSYS_CLOCK_SCHEMATIC_52M_COTMS) {
+ 		pr_info("A-die clock 52M\n");
+ 		adie_26m = false;
+diff --git a/conn_drv/connv2/src/connv2_drv.c b/conn_drv/connv2/src/connv2_drv.c
+index 54ba21c..3c1eefd 100755
+--- a/conn_drv/connv2/src/connv2_drv.c
++++ b/conn_drv/connv2/src/connv2_drv.c
+@@ -74,7 +74,7 @@
+ extern const struct of_device_id apconninfra_of_ids[];
+ 
+ static int mtk_conninfra_probe(struct platform_device *pdev);
+-static int mtk_conninfra_remove(struct platform_device *pdev);
++static void mtk_conninfra_remove(struct platform_device *pdev);
+ 
+ static struct platform_driver mtk_conninfra_dev_drv = {
+ 	.probe = mtk_conninfra_probe,
+@@ -674,14 +674,12 @@ int mtk_conninfra_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-int mtk_conninfra_remove(struct platform_device *pdev)
++void mtk_conninfra_remove(struct platform_device *pdev)
+ {
+ 	atomic_set(&g_connv2_hw_init_done, 0);
+ 	consys_hw_deinit();
+ 	if (g_drv_dev)
+ 		g_drv_dev = NULL;
+-
+-	return 0;
+ }
+ 
+ 
+@@ -700,7 +698,8 @@ int connv2_drv_init(void)
+ 	ratelimit_set_flags(&_rs, RATELIMIT_MSG_ON_RELEASE);
+ 
+ 
+-	iret = platform_driver_probe(&mtk_conninfra_dev_drv, mtk_conninfra_probe);
++	/* mainline port: fw_devlink may defer the probe, which _probe() cannot */
++	iret = platform_driver_register(&mtk_conninfra_dev_drv);
+ 	//iret = platform_driver_register(&mtk_conninfra_dev_drv);
+ 	if (iret) {
+ 		pr_err("Conninfra platform driver registered failed(%d)\n", iret);
+@@ -709,6 +708,11 @@ int connv2_drv_init(void)
+ 		while (atomic_read(&g_connv2_hw_init_done) == 0) {
+ 			osal_sleep_ms(50);
+ 			retry++;
++			if (retry > 1200) {
++				pr_err("conninfra probe did not complete\n");
++				platform_driver_unregister(&mtk_conninfra_dev_drv);
++				return -1;
++			}
+ 			if (__ratelimit(&_rs))
+ 				pr_info("g_connv2_hw_init_done = 0, retry = %d", retry);
+ 		}

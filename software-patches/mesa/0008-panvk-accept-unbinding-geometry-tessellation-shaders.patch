@@ -1,0 +1,33 @@
+From 23a1b347c51027c350e533af44a67657373b56d7 Mon Sep 17 00:00:00 2001
+From: cezanne <port@local>
+Date: Sun, 1 Nov 2026 05:02:47 +0100
+Subject: [PATCH 8/9] panvk: accept unbinding geometry / tessellation shaders
+
+With geometryShader claimed (PANVK_DEBUG=dxvk) shader object users bind
+NULL to every supported stage, which hit the unsupported stage assert.
+No shader for these stages compiles, so only unbinding happens.
+---
+ src/panfrost/vulkan/panvk_vX_shader.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index e498575..815df7a 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -2639,6 +2639,13 @@ panvk_cmd_bind_shader(struct panvk_cmd_buffer *cmd, const mesa_shader_stage stag
+          gfx_state_set_dirty(cmd, FS_PUSH_UNIFORMS);
+       }
+       break;
++   case MESA_SHADER_GEOMETRY:
++   case MESA_SHADER_TESS_CTRL:
++   case MESA_SHADER_TESS_EVAL:
++      /* PANVK_DEBUG=dxvk claims geometryShader: shader object users then
++       * unbind these stages; shaders for them never compile */
++      assert(!shader);
++      break;
+    default:
+       assert(!"Unsupported stage");
+       break;
+-- 
+2.56.0
+

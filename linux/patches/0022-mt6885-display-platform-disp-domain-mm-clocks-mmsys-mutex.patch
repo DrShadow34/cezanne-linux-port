@@ -1,0 +1,544 @@
+diff --git a/drivers/clk/mediatek/Makefile b/drivers/clk/mediatek/Makefile
+index fe22102cb..569e9706a 100644
+--- a/drivers/clk/mediatek/Makefile
++++ b/drivers/clk/mediatek/Makefile
+@@ -173,4 +173,4 @@ obj-$(CONFIG_COMMON_CLK_MT8365_VDEC) += clk-mt8365-vdec.o
+ obj-$(CONFIG_COMMON_CLK_MT8365_VENC) += clk-mt8365-venc.o
+ obj-$(CONFIG_COMMON_CLK_MT8516) += clk-mt8516-apmixedsys.o clk-mt8516.o
+ obj-$(CONFIG_COMMON_CLK_MT8516_AUDSYS) += clk-mt8516-aud.o
+-obj-$(CONFIG_COMMON_CLK_MT6885) += clk-mt6885.o clk-mt6885-cam.o
++obj-$(CONFIG_COMMON_CLK_MT6885) += clk-mt6885.o clk-mt6885-cam.o clk-mt6885-mm.o
+diff --git a/drivers/clk/mediatek/clk-mt6885-mm.c b/drivers/clk/mediatek/clk-mt6885-mm.c
+new file mode 100644
+index 000000000..9b511a6a6
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6885-mm.c
+@@ -0,0 +1,125 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MT6885 mmsys clock gates (mmsys_config 0x14116000), registered by the
++ * mtk-mmsys driver as the "clk-mt6885-mm" auxiliary platform device.
++ * Gate table from the BSP clk-mt6885.c (mmsys_config_clks); the SMI gates
++ * are dummies there (never gated by the BSP) and are held by the DISP power
++ * domain here.
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/platform_device.h>
++
++#include "clk-mtk.h"
++#include "clk-gate.h"
++
++#include <dt-bindings/clock/mt6885-clk.h>
++
++static const struct mtk_gate_regs mm0_cg_regs = {
++	.set_ofs = 0x104,
++	.clr_ofs = 0x108,
++	.sta_ofs = 0x100,
++};
++
++static const struct mtk_gate_regs mm1_cg_regs = {
++	.set_ofs = 0x114,
++	.clr_ofs = 0x118,
++	.sta_ofs = 0x110,
++};
++
++static const struct mtk_gate_regs mm2_cg_regs = {
++	.set_ofs = 0x1a4,
++	.clr_ofs = 0x1a8,
++	.sta_ofs = 0x1a0,
++};
++
++#define GATE_MM0(_id, _name, _parent, _shift)	\
++	GATE_MTK(_id, _name, _parent, &mm0_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++
++#define GATE_MM1(_id, _name, _parent, _shift)	\
++	GATE_MTK(_id, _name, _parent, &mm1_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++
++#define GATE_MM2(_id, _name, _parent, _shift)	\
++	GATE_MTK(_id, _name, _parent, &mm2_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++
++static const struct mtk_gate mm_clks[] = {
++	GATE_MM0(MM_DISP_RSZ0, "mm_disp_rsz0", "disp_sel", 0),
++	GATE_MM0(MM_DISP_RSZ1, "mm_disp_rsz1", "disp_sel", 1),
++	GATE_MM0(MM_DISP_OVL0, "mm_disp_ovl0", "disp_sel", 2),
++	GATE_MM0(MM_INLINEROT, "mm_inlinerot", "disp_sel", 3),
++	GATE_MM0(MM_MDP_TDSHP4, "mm_mdp_tdshp4", "disp_sel", 4),
++	GATE_MM0(MM_MDP_TDSHP5, "mm_mdp_tdshp5", "disp_sel", 5),
++	GATE_MM0(MM_MDP_AAL4, "mm_mdp_aal4", "disp_sel", 6),
++	GATE_MM0(MM_MDP_AAL5, "mm_mdp_aal5", "disp_sel", 7),
++	GATE_MM0(MM_MDP_HDR4, "mm_mdp_hdr4", "disp_sel", 8),
++	GATE_MM0(MM_MDP_HDR5, "mm_mdp_hdr5", "disp_sel", 9),
++	GATE_MM0(MM_MDP_RSZ4, "mm_mdp_rsz4", "disp_sel", 10),
++	GATE_MM0(MM_MDP_RSZ5, "mm_mdp_rsz5", "disp_sel", 11),
++	GATE_MM0(MM_MDP_RDMA4, "mm_mdp_rdma4", "disp_sel", 12),
++	GATE_MM0(MM_MDP_RDMA5, "mm_mdp_rdma5", "disp_sel", 13),
++	GATE_MM0(MM_DISP_FAKE_ENG0, "mm_disp_fake_eng0", "disp_sel", 14),
++	GATE_MM0(MM_DISP_FAKE_ENG1, "mm_disp_fake_eng1", "disp_sel", 15),
++	GATE_MM0(MM_DISP_OVL0_2L, "mm_disp_ovl0_2l", "disp_sel", 16),
++	GATE_MM0(MM_DISP_OVL1_2L, "mm_disp_ovl1_2l", "disp_sel", 17),
++	GATE_MM0(MM_DISP_OVL2_2L, "mm_disp_ovl2_2l", "disp_sel", 18),
++	GATE_MM0(MM_DISP_MUTEX0, "mm_disp_mutex0", "disp_sel", 19),
++	GATE_MM0(MM_DISP_OVL1, "mm_disp_ovl1", "disp_sel", 20),
++	GATE_MM0(MM_DISP_OVL3_2L, "mm_disp_ovl3_2l", "disp_sel", 21),
++	GATE_MM0(MM_DISP_CCORR0, "mm_disp_ccorr0", "disp_sel", 22),
++	GATE_MM0(MM_DISP_CCORR1, "mm_disp_ccorr1", "disp_sel", 23),
++	GATE_MM0(MM_DISP_COLOR0, "mm_disp_color0", "disp_sel", 24),
++	GATE_MM0(MM_DISP_COLOR1, "mm_disp_color1", "disp_sel", 25),
++	GATE_MM0(MM_DISP_POSTMASK0, "mm_disp_postmask0", "disp_sel", 26),
++	GATE_MM0(MM_DISP_POSTMASK1, "mm_disp_postmask1", "disp_sel", 27),
++	GATE_MM0(MM_DISP_DITHER0, "mm_disp_dither0", "disp_sel", 28),
++	GATE_MM0(MM_DISP_DITHER1, "mm_disp_dither1", "disp_sel", 29),
++	GATE_MM0(MM_DISP_DSI0, "mm_disp_dsi0", "disp_sel", 30),
++	GATE_MM0(MM_DISP_DSI1, "mm_disp_dsi1", "disp_sel", 31),
++	GATE_MM1(MM_DISP_GAMMA0, "mm_disp_gamma0", "disp_sel", 0),
++	GATE_MM1(MM_DISP_GAMMA1, "mm_disp_gamma1", "disp_sel", 1),
++	GATE_MM1(MM_DISP_AAL0, "mm_disp_aal0", "disp_sel", 2),
++	GATE_MM1(MM_DISP_AAL1, "mm_disp_aal1", "disp_sel", 3),
++	GATE_MM1(MM_DISP_WDMA0, "mm_disp_wdma0", "disp_sel", 4),
++	GATE_MM1(MM_DISP_WDMA1, "mm_disp_wdma1", "disp_sel", 5),
++	GATE_MM1(MM_DISP_RDMA0, "mm_disp_rdma0", "disp_sel", 8),
++	GATE_MM1(MM_DISP_RDMA1, "mm_disp_rdma1", "disp_sel", 9),
++	GATE_MM1(MM_DISP_RDMA4, "mm_disp_rdma4", "disp_sel", 10),
++	GATE_MM1(MM_DISP_RDMA5, "mm_disp_rdma5", "disp_sel", 11),
++	GATE_MM1(MM_DISP_DSC_WRAP, "mm_disp_dsc_wrap", "disp_sel", 12),
++	GATE_MM1(MM_DISP_DP_INTF, "mm_disp_dp_intf", "disp_sel", 13),
++	GATE_MM1(MM_DISP_MERGE0, "mm_disp_merge0", "disp_sel", 14),
++	GATE_MM1(MM_DISP_MERGE1, "mm_disp_merge1", "disp_sel", 15),
++	GATE_MM1(MM_SMI_COMMON, "mm_smi_common", "disp_sel", 19),
++	GATE_MM1(MM_SMI_GALS, "mm_smi_gals", "disp_sel", 23),
++	GATE_MM1(MM_SMI_INFRA, "mm_smi_infra", "disp_sel", 27),
++	GATE_MM1(MM_SMI_IOMMU, "mm_smi_iommu", "disp_sel", 31),
++	GATE_MM2(MM_DSI_DSI0, "mm_dsi_dsi0", "disp_sel", 0),
++	GATE_MM2(MM_DSI_DSI1, "mm_dsi_dsi1", "disp_sel", 8),
++	GATE_MM2(MM_DP_INTF, "mm_dp_intf", "dp_sel", 16),
++	GATE_MM2(MM_26MHZ, "mm_26mhz", "f26m_sel", 24),
++	GATE_MM2(MM_32KHZ, "mm_32khz", "clk32k", 25),
++};
++
++static const struct mtk_clk_desc mm_desc = {
++	.clks = mm_clks,
++	.num_clks = ARRAY_SIZE(mm_clks),
++};
++
++static const struct platform_device_id clk_mt6885_mm_id_table[] = {
++	{ .name = "clk-mt6885-mm", .driver_data = (kernel_ulong_t)&mm_desc },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(platform, clk_mt6885_mm_id_table);
++
++static struct platform_driver clk_mt6885_mm_drv = {
++	.probe = mtk_clk_pdev_probe,
++	.remove = mtk_clk_pdev_remove,
++	.driver = {
++		.name = "clk-mt6885-mm",
++	},
++	.id_table = clk_mt6885_mm_id_table,
++};
++module_platform_driver(clk_mt6885_mm_drv);
++
++MODULE_DESCRIPTION("MediaTek MT6885 MultiMedia clocks driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/pmdomain/mediatek/mt6885-pm-domains.h b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+index 598390759..054d99372 100644
+--- a/drivers/pmdomain/mediatek/mt6885-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+@@ -52,6 +52,14 @@
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWB_2ND	BIT(21)
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC	BIT(22)
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC_2ND	BIT(23)
++/* BSP spm_mtcmos_ctrl_dis(): DIS_PROT_STEP1_0, STEP2_0, STEP2_1, STEP2_2 */
++#define MT6885_TOP_AXI_PROT_EN_MM_DISP		(BIT(0) | BIT(6) | BIT(8) | BIT(10) | \
++						 BIT(12) | BIT(14) | BIT(16) | BIT(20) | \
++						 BIT(24) | BIT(26))
++#define MT6885_TOP_AXI_PROT_EN_DISP		BIT(6)
++#define MT6885_TOP_AXI_PROT_EN_MM_DISP_2ND	(BIT(1) | BIT(7) | BIT(9) | BIT(15) | \
++						 BIT(17) | BIT(21) | BIT(25) | BIT(27))
++#define MT6885_TOP_AXI_PROT_EN_VDNR_DISP	BIT(21)
+ 
+ static enum scpsys_bus_prot_block scpsys_bus_prot_blocks_mt6885[] = {
+ 	BUS_PROT_BLOCK_INFRA
+@@ -198,6 +206,24 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 	 * BSP does not wait for the protection acks after release (they stay
+ 	 * up), so neither may we.
+ 	 */
++	/*
++	 * Display (mmsys): lk leaves it on and scanning out; CAM sits behind
++	 * its SMI, so it is CAM's parent in the DT.
++	 */
++	[MT6885_POWER_DOMAIN_DISP] = {
++		.name = "disp",
++		.sta_mask = BIT(20),
++		.ctl_offs = 0x0350,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		/*
++		 * No bus protection yet: releasing the BSP DIS masks (they
++		 * overlap CAM's MM bits) while CAM is off hung the boot.
++		 * TODO: model them before the domain is ever powered off.
++		 */
++	},
+ 	[MT6885_POWER_DOMAIN_CAM] = {
+ 		.name = "cam",
+ 		.sta_mask = BIT(23),
+diff --git a/drivers/soc/mediatek/mt6885-mmsys.h b/drivers/soc/mediatek/mt6885-mmsys.h
+new file mode 100644
+index 000000000..a51322ebf
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6885-mmsys.h
+@@ -0,0 +1,129 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef __SOC_MEDIATEK_MT6885_MMSYS_H
++#define __SOC_MEDIATEK_MT6885_MMSYS_H
++
++/*
++ * MT6885 display routing, from the BSP mtk_drm_ddp.c
++ * (mtk_ddp_mout_en/sel_in/sout_sel_MT6885, mtk_ddp_insert_dsc_prim_MT6885).
++ * The BSP's "virtual" OVL0/RDMA0 stages are folded into the real links.
++ * Main path: OVL0_2L -> OVL0 -> RDMA0 -> COLOR0 -> CCORR0 -> AAL0 ->
++ * GAMMA0 -> POSTMASK0 -> DITHER0 -> [DSC_WRAP0 ->] DSI0 (the PQ blocks
++ * AAL0..DITHER0 are hard-wired).  lk routes CCORR0 through MDP_AAL4 (DRE);
++ * we go straight to AAL0 as the BSP does without DRE.
++ */
++#define MT6885_DISP_AAL0_SEL_IN			0x650
++#define MT6885_DISP_COLOR0_OUT_SEL_IN		0x658
++#define MT6885_DISP_CCORR0_SOUT_SEL		0xeb4
++#define MT6885_DISP_RDMA0_SEL_IN		0xf34
++#define MT6885_DISP_RDMA0_SOUT_SEL		0xf38
++#define MT6885_DISP_RDMA0_RSZ0_SEL_IN		0xf3c
++#define MT6885_DISP_RDMA0_RSZ0_SOUT_SEL		0xf40
++#define MT6885_DISP_DSC_WRAP_SOUT_SEL		0xf48
++#define MT6885_MMSYS_OVL_CON			0xf4c
++#define MT6885_DISP_DITHER0_MOUT_EN		0xf50
++#define MT6885_DSI0_SEL_IN			0xf54
++#define MT6885_DISP_OVL0_2L_OVL1_OVL1_2L_BGOUT_SEL	0xf68
++#define MT6885_DISP_OVL0_BLENDOUT_SOUT_SEL	0xf6c
++#define MT6885_DISP_TOVL0_OUT1_SEL_IN		0xf70
++#define MT6885_DISP_TOVL0_OUT1_MOUT_EN		0xf74
++#define MT6885_DISP_DSI0_DSC_WRAP_SOUT_SEL	0xf80
++#define MT6885_DISP_RDMA4_PQ0_MERGE0_SEL_IN	0xf88
++#define MT6885_DISP_PQ0_SOUT_SEL		0xff8
++
++#define MT6885_OVL_CON_OVL0_BLENDOUT		BIT(0)
++#define MT6885_OVL_CON_OVL0_2L_BGOUT		BIT(3)
++#define MT6885_BGOUT_SEL_FROM_OVL0_2L		0x1
++#define MT6885_OVL0_BLENDOUT_SOUT_TOVL0_OUT1	0x1
++#define MT6885_TOVL0_OUT1_SEL_IN_OVL0_BLENDOUT	0x1
++#define MT6885_TOVL0_OUT1_MOUT_RDMA0		BIT(0)
++#define MT6885_RDMA0_SEL_IN_TOVL0_OUT1		0x0
++#define MT6885_RDMA0_SOUT_RDMA0_RSZ0		0x0
++#define MT6885_RDMA0_RSZ0_SEL_IN_RDMA0		0x0
++#define MT6885_RDMA0_RSZ0_SOUT_COLOR0		0x1
++#define MT6885_COLOR0_OUT_SEL_IN_COLOR0		0x0
++#define MT6885_CCORR0_SOUT_AAL0			0x1
++#define MT6885_AAL0_SEL_IN_CCORR0		0x1
++#define MT6885_DITHER0_MOUT_DSI0		BIT(0)
++#define MT6885_DITHER0_MOUT_PQ0_SOUT		BIT(3)
++#define MT6885_DSI0_SEL_IN_DITHER0		0x1
++#define MT6885_DSI0_SEL_IN_DSC_WRAP		0x3
++#define MT6885_PQ0_SOUT_MERGE0_SEL		0x1
++#define MT6885_MERGE0_SEL_IN_PQ0		0x1
++#define MT6885_DSI0_DSC_WRAP_SOUT_DSC_WRAP0	0x1
++#define MT6885_DSC_WRAP_SOUT_DSI0		0x0
++
++#define MT6885_SEL_MASK				GENMASK(3, 0)
++
++/* BSP smi_reg.h MMSYS_SW0_RST_B */
++#define MT6885_MMSYS_SW0_RST_B			0x140
++
++static const struct mtk_mmsys_routes mmsys_mt6885_routing_table[] = {
++	MMSYS_ROUTE(OVL_2L, 0, OVL, 0,
++		    MT6885_MMSYS_OVL_CON, MT6885_OVL_CON_OVL0_2L_BGOUT,
++		    MT6885_OVL_CON_OVL0_2L_BGOUT),
++	MMSYS_ROUTE(OVL_2L, 0, OVL, 0,
++		    MT6885_DISP_OVL0_2L_OVL1_OVL1_2L_BGOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_BGOUT_SEL_FROM_OVL0_2L),
++	MMSYS_ROUTE(OVL, 0, RDMA, 0,
++		    MT6885_MMSYS_OVL_CON, MT6885_OVL_CON_OVL0_BLENDOUT,
++		    MT6885_OVL_CON_OVL0_BLENDOUT),
++	MMSYS_ROUTE(OVL, 0, RDMA, 0,
++		    MT6885_DISP_OVL0_BLENDOUT_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_OVL0_BLENDOUT_SOUT_TOVL0_OUT1),
++	MMSYS_ROUTE(OVL, 0, RDMA, 0,
++		    MT6885_DISP_TOVL0_OUT1_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_TOVL0_OUT1_SEL_IN_OVL0_BLENDOUT),
++	MMSYS_ROUTE(OVL, 0, RDMA, 0,
++		    MT6885_DISP_TOVL0_OUT1_MOUT_EN, MT6885_TOVL0_OUT1_MOUT_RDMA0,
++		    MT6885_TOVL0_OUT1_MOUT_RDMA0),
++	MMSYS_ROUTE(OVL, 0, RDMA, 0,
++		    MT6885_DISP_RDMA0_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_RDMA0_SEL_IN_TOVL0_OUT1),
++	MMSYS_ROUTE(RDMA, 0, COLOR, 0,
++		    MT6885_DISP_RDMA0_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_RDMA0_SOUT_RDMA0_RSZ0),
++	MMSYS_ROUTE(RDMA, 0, COLOR, 0,
++		    MT6885_DISP_RDMA0_RSZ0_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_RDMA0_RSZ0_SEL_IN_RDMA0),
++	MMSYS_ROUTE(RDMA, 0, COLOR, 0,
++		    MT6885_DISP_RDMA0_RSZ0_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_RDMA0_RSZ0_SOUT_COLOR0),
++	MMSYS_ROUTE(COLOR, 0, CCORR, 0,
++		    MT6885_DISP_COLOR0_OUT_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_COLOR0_OUT_SEL_IN_COLOR0),
++	MMSYS_ROUTE(CCORR, 0, AAL, 0,
++		    MT6885_DISP_CCORR0_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_CCORR0_SOUT_AAL0),
++	MMSYS_ROUTE(CCORR, 0, AAL, 0,
++		    MT6885_DISP_AAL0_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_AAL0_SEL_IN_CCORR0),
++	/* without DSC */
++	MMSYS_ROUTE(DITHER, 0, DSI, 0,
++		    MT6885_DISP_DITHER0_MOUT_EN, GENMASK(3, 0),
++		    MT6885_DITHER0_MOUT_DSI0),
++	MMSYS_ROUTE(DITHER, 0, DSI, 0,
++		    MT6885_DSI0_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_DSI0_SEL_IN_DITHER0),
++	/* with DSC: DITHER0 -> PQ0_SOUT -> MERGE0_SEL -> DSC_WRAP0 -> DSI0 */
++	MMSYS_ROUTE(DITHER, 0, DSC, 0,
++		    MT6885_DISP_DITHER0_MOUT_EN, GENMASK(3, 0),
++		    MT6885_DITHER0_MOUT_PQ0_SOUT),
++	MMSYS_ROUTE(DITHER, 0, DSC, 0,
++		    MT6885_DISP_PQ0_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_PQ0_SOUT_MERGE0_SEL),
++	MMSYS_ROUTE(DITHER, 0, DSC, 0,
++		    MT6885_DISP_RDMA4_PQ0_MERGE0_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_MERGE0_SEL_IN_PQ0),
++	MMSYS_ROUTE(DSC, 0, DSI, 0,
++		    MT6885_DISP_DSI0_DSC_WRAP_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_DSI0_DSC_WRAP_SOUT_DSC_WRAP0),
++	MMSYS_ROUTE(DSC, 0, DSI, 0,
++		    MT6885_DISP_DSC_WRAP_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_DSC_WRAP_SOUT_DSI0),
++	MMSYS_ROUTE(DSC, 0, DSI, 0,
++		    MT6885_DSI0_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_DSI0_SEL_IN_DSC_WRAP),
++};
++
++#endif /* __SOC_MEDIATEK_MT6885_MMSYS_H */
+diff --git a/drivers/soc/mediatek/mtk-dsi-cmd-kick.c b/drivers/soc/mediatek/mtk-dsi-cmd-kick.c
+index 20b7bb5c0..222b8ead9 100644
+--- a/drivers/soc/mediatek/mtk-dsi-cmd-kick.c
++++ b/drivers/soc/mediatek/mtk-dsi-cmd-kick.c
+@@ -320,6 +320,20 @@ static ssize_t resend_store(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_WO(resend);
+ 
++/*
++ * Shared with mtk-mmsys / mtk-mutex (DT nodes for the mediatek-drm port), so
++ * map without claiming the regions.
++ */
++static void __iomem *kick_map(struct platform_device *pdev, const char *name)
++{
++	struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
++
++	if (!res)
++		return IOMEM_ERR_PTR(-EINVAL);
++	return devm_ioremap(&pdev->dev, res->start, resource_size(res)) ?:
++	       IOMEM_ERR_PTR(-ENOMEM);
++}
++
+ static int dsi_cmd_kick_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -331,13 +345,13 @@ static int dsi_cmd_kick_probe(struct platform_device *pdev)
+ 	if (!k)
+ 		return -ENOMEM;
+ 
+-	k->mutex = devm_platform_ioremap_resource_byname(pdev, "mutex");
++	k->mutex = kick_map(pdev, "mutex");
+ 	if (IS_ERR(k->mutex))
+ 		return PTR_ERR(k->mutex);
+-	k->dsi = devm_platform_ioremap_resource_byname(pdev, "dsi");
++	k->dsi = kick_map(pdev, "dsi");
+ 	if (IS_ERR(k->dsi))
+ 		return PTR_ERR(k->dsi);
+-	k->mmsys = devm_platform_ioremap_resource_byname(pdev, "mmsys");
++	k->mmsys = kick_map(pdev, "mmsys");
+ 	if (IS_ERR(k->mmsys))
+ 		return PTR_ERR(k->mmsys);
+ 	of_property_read_u32(dev->of_node, "mediatek,mutex-id", &k->mutex_id);
+diff --git a/drivers/soc/mediatek/mtk-mmsys.c b/drivers/soc/mediatek/mtk-mmsys.c
+index 2f3e0778b..57210c46c 100644
+--- a/drivers/soc/mediatek/mtk-mmsys.c
++++ b/drivers/soc/mediatek/mtk-mmsys.c
+@@ -19,6 +19,7 @@
+ #include "mt8183-mmsys.h"
+ #include "mt8186-mmsys.h"
+ #include "mt8188-mmsys.h"
++#include "mt6885-mmsys.h"
+ #include "mt8192-mmsys.h"
+ #include "mt8195-mmsys.h"
+ #include "mt8365-mmsys.h"
+@@ -112,6 +113,14 @@ static const struct mtk_mmsys_driver_data mt8188_vppsys1_driver_data = {
+ 	.is_vppsys = true,
+ };
+ 
++static const struct mtk_mmsys_driver_data mt6885_mmsys_driver_data = {
++	.clk_driver = "clk-mt6885-mm",
++	.routes = mmsys_mt6885_routing_table,
++	.num_routes = ARRAY_SIZE(mmsys_mt6885_routing_table),
++	.sw0_rst_offset = MT6885_MMSYS_SW0_RST_B,
++	.num_resets = 32,
++};
++
+ static const struct mtk_mmsys_driver_data mt8192_mmsys_driver_data = {
+ 	.clk_driver = "clk-mt8192-mm",
+ 	.routes = mmsys_mt8192_routing_table,
+@@ -471,6 +480,7 @@ static const struct of_device_id of_match_mtk_mmsys[] = {
+ 	{ .compatible = "mediatek,mt8188-vdosys1", .data = &mt8188_vdosys1_driver_data },
+ 	{ .compatible = "mediatek,mt8188-vppsys0", .data = &mt8188_vppsys0_driver_data },
+ 	{ .compatible = "mediatek,mt8188-vppsys1", .data = &mt8188_vppsys1_driver_data },
++	{ .compatible = "mediatek,mt6885-mmsys", .data = &mt6885_mmsys_driver_data },
+ 	{ .compatible = "mediatek,mt8192-mmsys", .data = &mt8192_mmsys_driver_data },
+ 	/* "mediatek,mt8195-mmsys" compatible is deprecated */
+ 	{ .compatible = "mediatek,mt8195-mmsys", .data = &mt8195_vdosys0_driver_data },
+diff --git a/drivers/soc/mediatek/mtk-mutex.c b/drivers/soc/mediatek/mtk-mutex.c
+index eb5d381ff..6312d150d 100644
+--- a/drivers/soc/mediatek/mtk-mutex.c
++++ b/drivers/soc/mediatek/mtk-mutex.c
+@@ -554,6 +554,32 @@ static const u8 mt8188_mdp_mutex_table_mod[MUTEX_MOD_IDX_MAX] = {
+ 	[MUTEX_MOD_IDX_MDP_WROT3] = MT8195_MUTEX_MOD_MDP_WROT3,
+ };
+ 
++/* MT6885: BSP mtk_drm_ddp.c MT6885_MUTEX_MOD0_* (bit numbers) */
++static const u8 mt6885_mutex_mod[DDP_COMPONENT_ID_MAX] = {
++	[DDP_COMPONENT_OVL0] = 0,
++	[DDP_COMPONENT_OVL_2L0] = 1,
++	[DDP_COMPONENT_RDMA0] = 2,
++	[DDP_COMPONENT_WDMA0] = 3,
++	[DDP_COMPONENT_COLOR0] = 4,
++	[DDP_COMPONENT_CCORR] = 5,
++	[DDP_COMPONENT_AAL0] = 6,
++	[DDP_COMPONENT_GAMMA] = 7,
++	[DDP_COMPONENT_DITHER0] = 8,
++	[DDP_COMPONENT_PWM0] = 11,
++	[DDP_COMPONENT_OVL1] = 12,
++	[DDP_COMPONENT_OVL_2L1] = 13,
++	[DDP_COMPONENT_RDMA1] = 14,
++	[DDP_COMPONENT_WDMA1] = 15,
++	[DDP_COMPONENT_COLOR1] = 16,
++	[DDP_COMPONENT_AAL1] = 18,
++	[DDP_COMPONENT_DITHER1] = 20,
++	[DDP_COMPONENT_POSTMASK0] = 25,
++	[DDP_COMPONENT_MERGE0] = 27,
++	[DDP_COMPONENT_MERGE1] = 28,
++	[DDP_COMPONENT_DSC0] = 29,
++	[DDP_COMPONENT_DSC1] = 30,
++};
++
+ static const u8 mt8192_mutex_mod[DDP_COMPONENT_ID_MAX] = {
+ 	[DDP_COMPONENT_AAL0] = MT8192_MUTEX_MOD_DISP_AAL0,
+ 	[DDP_COMPONENT_CCORR] = MT8192_MUTEX_MOD_DISP_CCORR0,
+@@ -812,6 +838,14 @@ static const struct mtk_mutex_data mt8188_vpp_mutex_driver_data = {
+ 	.mutex_table_mod = mt8188_mdp_mutex_table_mod,
+ };
+ 
++static const struct mtk_mutex_data mt6885_mutex_driver_data = {
++	.mutex_mod = mt6885_mutex_mod,
++	.mutex_sof = mt8183_mutex_sof,
++	.mutex_mod_reg = MT8183_MUTEX0_MOD0,
++	.mutex_mod1_reg = MT8183_MUTEX0_MOD1,
++	.mutex_sof_reg = MT8183_MUTEX0_SOF0,
++};
++
+ static const struct mtk_mutex_data mt8192_mutex_driver_data = {
+ 	.mutex_mod = mt8192_mutex_mod,
+ 	.mutex_sof = mt8183_mutex_sof,
+@@ -1141,6 +1175,7 @@ static const struct of_device_id mutex_driver_dt_match[] = {
+ 	{ .compatible = "mediatek,mt8186-mdp3-mutex", .data = &mt8186_mdp_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt8188-disp-mutex", .data = &mt8188_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt8188-vpp-mutex",  .data = &mt8188_vpp_mutex_driver_data },
++	{ .compatible = "mediatek,mt6885-disp-mutex", .data = &mt6885_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt8192-disp-mutex", .data = &mt8192_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt8195-disp-mutex", .data = &mt8195_mutex_driver_data },
+ 	{ .compatible = "mediatek,mt8195-vpp-mutex",  .data = &mt8195_vpp_mutex_driver_data },
+diff --git a/include/dt-bindings/clock/mt6885-clk.h b/include/dt-bindings/clock/mt6885-clk.h
+index d7beb1d9e..cafb9a71d 100644
+--- a/include/dt-bindings/clock/mt6885-clk.h
++++ b/include/dt-bindings/clock/mt6885-clk.h
+@@ -369,4 +369,62 @@
+ #define CAMSYS_RAW_CAMTG	2
+ #define CAMSYS_RAW_NR_CLK	3
+ 
++/* mmsys_config (0x14116000), BSP clk-mt6885.c mmsys_config_clks */
++#define MM_DISP_RSZ0            0
++#define MM_DISP_RSZ1            1
++#define MM_DISP_OVL0            2
++#define MM_INLINEROT            3
++#define MM_MDP_TDSHP4           4
++#define MM_MDP_TDSHP5           5
++#define MM_MDP_AAL4             6
++#define MM_MDP_AAL5             7
++#define MM_MDP_HDR4             8
++#define MM_MDP_HDR5             9
++#define MM_MDP_RSZ4             10
++#define MM_MDP_RSZ5             11
++#define MM_MDP_RDMA4            12
++#define MM_MDP_RDMA5            13
++#define MM_DISP_FAKE_ENG0       14
++#define MM_DISP_FAKE_ENG1       15
++#define MM_DISP_OVL0_2L         16
++#define MM_DISP_OVL1_2L         17
++#define MM_DISP_OVL2_2L         18
++#define MM_DISP_MUTEX0          19
++#define MM_DISP_OVL1            20
++#define MM_DISP_OVL3_2L         21
++#define MM_DISP_CCORR0          22
++#define MM_DISP_CCORR1          23
++#define MM_DISP_COLOR0          24
++#define MM_DISP_COLOR1          25
++#define MM_DISP_POSTMASK0       26
++#define MM_DISP_POSTMASK1       27
++#define MM_DISP_DITHER0         28
++#define MM_DISP_DITHER1         29
++#define MM_DISP_DSI0            30
++#define MM_DISP_DSI1            31
++#define MM_DISP_GAMMA0          32
++#define MM_DISP_GAMMA1          33
++#define MM_DISP_AAL0            34
++#define MM_DISP_AAL1            35
++#define MM_DISP_WDMA0           36
++#define MM_DISP_WDMA1           37
++#define MM_DISP_RDMA0           38
++#define MM_DISP_RDMA1           39
++#define MM_DISP_RDMA4           40
++#define MM_DISP_RDMA5           41
++#define MM_DISP_DSC_WRAP        42
++#define MM_DISP_DP_INTF         43
++#define MM_DISP_MERGE0          44
++#define MM_DISP_MERGE1          45
++#define MM_SMI_COMMON           46
++#define MM_SMI_GALS             47
++#define MM_SMI_INFRA            48
++#define MM_SMI_IOMMU            49
++#define MM_DSI_DSI0             50
++#define MM_DSI_DSI1             51
++#define MM_DP_INTF              52
++#define MM_26MHZ                53
++#define MM_32KHZ                54
++#define MM_NR_CLK               55
++
+ #endif
+diff --git a/include/dt-bindings/power/mt6885-power.h b/include/dt-bindings/power/mt6885-power.h
+index 3c9afadc7..987db2aeb 100644
+--- a/include/dt-bindings/power/mt6885-power.h
++++ b/include/dt-bindings/power/mt6885-power.h
+@@ -14,9 +14,11 @@
+ #define MT6885_POWER_DOMAIN_MFG6	6	/* shader cores 7-8 */
+ #define MT6885_POWER_DOMAIN_AUDIO	7
+ #define MT6885_POWER_DOMAIN_CONN	8
+-#define MT6885_POWER_DOMAIN_CAM		9
+-#define MT6885_POWER_DOMAIN_CAM_RAWA	10
+-#define MT6885_POWER_DOMAIN_CAM_RAWB	11
+-#define MT6885_POWER_DOMAIN_CAM_RAWC	12
++/* parents need lower IDs than their children (probe cleanup order) */
++#define MT6885_POWER_DOMAIN_DISP	9
++#define MT6885_POWER_DOMAIN_CAM		10
++#define MT6885_POWER_DOMAIN_CAM_RAWA	11
++#define MT6885_POWER_DOMAIN_CAM_RAWB	12
++#define MT6885_POWER_DOMAIN_CAM_RAWC	13
+ 
+ #endif /* _DT_BINDINGS_POWER_MT6885_POWER_H */

@@ -1,0 +1,179 @@
+From 435922724f58dd14190466e58d4b78503d068450 Mon Sep 17 00:00:00 2001
+From: cezanne <port@local>
+Date: Sun, 1 Nov 2026 04:23:13 +0100
+Subject: [PATCH 5/9] panvk: PANVK_DEBUG=dxvk claims the features DXVK requires
+
+DXVK refuses a device without geometryShader, fillModeNonSolid,
+shaderClipDistance, shaderCullDistance and robustBufferAccess2. For
+testing the rest of the DXVK path on v9 before they exist, this debug
+flag claims them: geometry / tessellation shader compiles fail with
+VK_ERROR_FEATURE_NOT_PRESENT (instead of reaching UNREACHABLE), clip and
+cull distance outputs are dropped, polygon modes draw solid.
+---
+ src/panfrost/vulkan/panvk_instance.c          |  1 +
+ src/panfrost/vulkan/panvk_instance.h          |  1 +
+ .../vulkan/panvk_vX_physical_device.c         | 33 ++++++++++-------
+ src/panfrost/vulkan/panvk_vX_shader.c         | 37 +++++++++++++++++++
+ 4 files changed, 58 insertions(+), 14 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 102dc93..beefc97 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -53,6 +53,7 @@ static const struct debug_control panvk_debug_options[] = {
+    {"cached_before_coherent", PANVK_DEBUG_CACHED_BEFORE_COHERENT},
+    {"no_extended_va_range", PANVK_DEBUG_NO_EXTENDED_VA_RANGE},
+    {"hsr_prepass", PANVK_DEBUG_HSR_PREPASS},
++   {"dxvk", PANVK_DEBUG_DXVK},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/panfrost/vulkan/panvk_instance.h b/src/panfrost/vulkan/panvk_instance.h
+index 12a9386..1029d78 100644
+--- a/src/panfrost/vulkan/panvk_instance.h
++++ b/src/panfrost/vulkan/panvk_instance.h
+@@ -34,6 +34,7 @@ enum panvk_debug_flags {
+    PANVK_DEBUG_CACHED_BEFORE_COHERENT = 1 << 16,
+    PANVK_DEBUG_NO_EXTENDED_VA_RANGE = 1 << 17,
+    PANVK_DEBUG_HSR_PREPASS = 1 << 18,
++   PANVK_DEBUG_DXVK = 1 << 19,
+ };
+ 
+ extern uint64_t panvk_debug;
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index c515b3f..cc7a7c0 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -304,7 +304,11 @@ panvk_per_arch(get_physical_device_features)(
+       .fullDrawIndexUint32 = true,
+       .imageCubeArray = true,
+       .independentBlend = true,
+-      .geometryShader = false,
++      /* PANVK_DEBUG=dxvk: claimed so DXVK (which requires them) creates a
++       * device, for testing what else it needs. Not implemented: geometry
++       * shader pipelines fail to compile, non-solid fill draws solid,
++       * clip / cull distances are dropped. */
++      .geometryShader = PANVK_DEBUG(DXVK),
+       .tessellationShader = false,
+       .sampleRateShading = true,
+       .dualSrcBlend = true,
+@@ -313,7 +317,7 @@ panvk_per_arch(get_physical_device_features)(
+       .drawIndirectFirstInstance = true,
+       .depthClamp = true,
+       .depthBiasClamp = true,
+-      .fillModeNonSolid = false,
++      .fillModeNonSolid = PANVK_DEBUG(DXVK),
+       .depthBounds = false,
+       .wideLines = true,
+       .largePoints = true,
+@@ -344,8 +348,8 @@ panvk_per_arch(get_physical_device_features)(
+       .shaderSampledImageArrayDynamicIndexing = true,
+       .shaderStorageBufferArrayDynamicIndexing = true,
+       .shaderStorageImageArrayDynamicIndexing = true,
+-      .shaderClipDistance = false,
+-      .shaderCullDistance = false,
++      .shaderClipDistance = PANVK_DEBUG(DXVK),
++      .shaderCullDistance = PANVK_DEBUG(DXVK),
+       .shaderFloat64 = false,
+       .shaderInt64 = true,
+       .shaderInt16 = true,
+@@ -615,7 +619,7 @@ panvk_per_arch(get_physical_device_features)(
+       .pipelineExecutableInfo = true,
+ 
+       /* VK_KHR_robustness2 */
+-      .robustBufferAccess2 = PAN_ARCH >= 11,
++      .robustBufferAccess2 = PAN_ARCH >= 11 || PANVK_DEBUG(DXVK),
+       .robustImageAccess2 = false,
+       .nullDescriptor = PAN_ARCH >= 9,
+ 
+@@ -915,12 +919,13 @@ panvk_per_arch(get_physical_device_properties)(
+       .maxTessellationControlTotalOutputComponents = 0,
+       .maxTessellationEvaluationInputComponents = 0,
+       .maxTessellationEvaluationOutputComponents = 0,
+-      /* Geometry shaders not supported. */
+-      .maxGeometryShaderInvocations = 0,
+-      .maxGeometryInputComponents = 0,
+-      .maxGeometryOutputComponents = 0,
+-      .maxGeometryOutputVertices = 0,
+-      .maxGeometryTotalOutputComponents = 0,
++      /* Geometry shaders not supported (PANVK_DEBUG=dxvk: the minimums,
++       * pipelines with one fail to compile). */
++      .maxGeometryShaderInvocations = PANVK_DEBUG(DXVK) ? 32 : 0,
++      .maxGeometryInputComponents = PANVK_DEBUG(DXVK) ? 64 : 0,
++      .maxGeometryOutputComponents = PANVK_DEBUG(DXVK) ? 64 : 0,
++      .maxGeometryOutputVertices = PANVK_DEBUG(DXVK) ? 256 : 0,
++      .maxGeometryTotalOutputComponents = PANVK_DEBUG(DXVK) ? 1024 : 0,
+       /* 32 vec4 varyings. */
+       .maxFragmentInputComponents = 128,
+       /* 8 render targets. */
+@@ -996,9 +1001,9 @@ panvk_per_arch(get_physical_device_properties)(
+          PAN_ARCH >= 9 && device->kmod.dev->props.gpu_can_query_timestamp,
+       .timestampPeriod =
+          PAN_ARCH >= 9 ? panvk_get_gpu_system_timestamp_period(device) : 0,
+-      .maxClipDistances = 0,
+-      .maxCullDistances = 0,
+-      .maxCombinedClipAndCullDistances = 0,
++      .maxClipDistances = PANVK_DEBUG(DXVK) ? 8 : 0,
++      .maxCullDistances = PANVK_DEBUG(DXVK) ? 8 : 0,
++      .maxCombinedClipAndCullDistances = PANVK_DEBUG(DXVK) ? 8 : 0,
+       .discreteQueuePriorities = 2,
+       .pointSizeRange = {pointSizeRangeMin, pointSizeRangeMax},
+       .lineWidthRange = {0.0, 7.9921875},
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 7fc8206..4776264 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -887,6 +887,33 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
+    }
+ #endif
+ 
++   /* PANVK_DEBUG=dxvk claims shaderClipDistance / shaderCullDistance
++    * without implementing them: the distances are dropped */
++   if (PANVK_DEBUG(DXVK)) {
++      nir_variable_mode mode = stage == MESA_SHADER_FRAGMENT ?
++         nir_var_shader_in : nir_var_shader_out;
++      bool dropped = false;
++      nir_foreach_variable_with_modes(var, nir, mode) {
++         if (var->data.location == VARYING_SLOT_CLIP_DIST0 ||
++             var->data.location == VARYING_SLOT_CLIP_DIST1 ||
++             var->data.location == VARYING_SLOT_CULL_DIST0 ||
++             var->data.location == VARYING_SLOT_CULL_DIST1) {
++            var->data.mode = nir_var_shader_temp;
++            dropped = true;
++         }
++      }
++      if (dropped) {
++         nir_fixup_deref_modes(nir);
++         const uint64_t clip_cull =
++            VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1 |
++            VARYING_BIT_CULL_DIST0 | VARYING_BIT_CULL_DIST1;
++         nir->info.outputs_written &= ~clip_cull;
++         nir->info.inputs_read &= ~clip_cull;
++         nir->info.clip_distance_array_size = 0;
++         nir->info.cull_distance_array_size = 0;
++      }
++   }
++
+    const nir_opt_access_options access_options = {
+       .is_vulkan = true,
+    };
+@@ -1707,6 +1734,16 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
+ 
+    /* Vulkan runtime passes us shaders in stage order */
+    for (i = 0; i < shader_count; i++) {
++      /* only reachable with PANVK_DEBUG=dxvk, which claims geometryShader */
++      if (infos[i].stage == MESA_SHADER_GEOMETRY ||
++          infos[i].stage == MESA_SHADER_TESS_CTRL ||
++          infos[i].stage == MESA_SHADER_TESS_EVAL) {
++         mesa_loge("panvk: %s shaders are not implemented",
++                   mesa_shader_stage_name(infos[i].stage));
++         result = VK_ERROR_FEATURE_NOT_PRESENT;
++         goto err_cleanup;
++      }
++
+       const uint32_t *noperspective_varyings_ptr =
+          use_static_noperspective ? &noperspective_varyings : NULL;
+ 
+-- 
+2.56.0
+

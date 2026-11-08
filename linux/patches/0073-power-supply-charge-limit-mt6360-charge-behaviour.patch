@@ -1,0 +1,269 @@
+diff --git a/drivers/power/supply/mt6360_charger.c b/drivers/power/supply/mt6360_charger.c
+--- a/drivers/power/supply/mt6360_charger.c
++++ b/drivers/power/supply/mt6360_charger.c
+@@ -40,6 +40,7 @@
+ /* MT6360_PMU_CHG_CTRL2 */
+ #define MT6360_IINLMTSEL_SHFT	(2)
+ #define MT6360_IINLMTSEL_MASK	GENMASK(3, 2)
++#define MT6360_CHG_EN_MASK	BIT(0)
+ /* MT6360_PMU_CHG_CTRL3 */
+ #define MT6360_IAICR_SHFT	(2)
+ #define MT6360_IAICR_MASK	GENMASK(7, 2)
+@@ -443,6 +444,45 @@
+ 				  sel << MT6360_IEOC_SHFT);
+ }
+ 
++/*
++ * Charging on / off with the input left on (CHG_EN): inhibit-charge powers
++ * the system from VBUS without charging the battery (a charge limit), unlike
++ * online = 0 (force sleep: the battery takes the whole load).
++ */
++static int mt6360_charger_get_behaviour(struct mt6360_chg_info *mci,
++					union power_supply_propval *val)
++{
++	unsigned int regval;
++	int ret;
++
++	ret = regmap_read(mci->regmap, MT6360_PMU_CHG_CTRL2, &regval);
++	if (ret)
++		return ret;
++	val->intval = regval & MT6360_CHG_EN_MASK ?
++		      POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
++		      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++	return 0;
++}
++
++static int mt6360_charger_set_behaviour(struct mt6360_chg_info *mci,
++					const union power_supply_propval *val)
++{
++	unsigned int en;
++
++	switch (val->intval) {
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
++		en = MT6360_CHG_EN_MASK;
++		break;
++	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
++		en = 0;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return regmap_update_bits(mci->regmap, MT6360_PMU_CHG_CTRL2,
++				  MT6360_CHG_EN_MASK, en);
++}
++
+ static int mt6360_charger_get_property(struct power_supply *psy,
+ 				       enum power_supply_property psp,
+ 				       union power_supply_propval *val)
+@@ -487,6 +527,9 @@
+ 	case POWER_SUPPLY_PROP_USB_TYPE:
+ 		val->intval = mci->psy_usb_type;
+ 		break;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		ret = mt6360_charger_get_behaviour(mci, val);
++		break;
+ 	default:
+ 		ret = -ENODATA;
+ 	}
+@@ -522,6 +565,9 @@
+ 	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
+ 		ret = mt6360_charger_set_ieoc(mci, val);
+ 		break;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		ret = mt6360_charger_set_behaviour(mci, val);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+@@ -539,6 +585,7 @@
+ 	case POWER_SUPPLY_PROP_INPUT_VOLTAGE_LIMIT:
+ 	case POWER_SUPPLY_PROP_PRECHARGE_CURRENT:
+ 	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+ 		return 1;
+ 	default:
+ 		return 0;
+@@ -558,6 +605,7 @@
+ 	POWER_SUPPLY_PROP_PRECHARGE_CURRENT,
+ 	POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT,
+ 	POWER_SUPPLY_PROP_USB_TYPE,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+ };
+ 
+ static const struct power_supply_desc mt6360_charger_desc = {
+@@ -571,6 +619,8 @@
+ 				  BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+ 				  BIT(POWER_SUPPLY_USB_TYPE_DCP) |
+ 				  BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
++	.charge_behaviours	= BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++				  BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
+ };
+ 
+ static const struct regulator_ops mt6360_chg_otg_ops = {
+diff --git a/drivers/power/supply/mt6359-gauge.c b/drivers/power/supply/mt6359-gauge.c
+--- a/drivers/power/supply/mt6359-gauge.c
++++ b/drivers/power/supply/mt6359-gauge.c
+@@ -105,7 +105,10 @@
+ 	int temp;		/* 0.1 degrees C */
+ 	int capacity;
+ 	int status;
+-	bool chg_inhibit;
++	bool temp_inhibit;	/* outside the safe charging temperature */
++	bool limit_inhibit;	/* charged to the end threshold */
++	int thr_start;		/* charge_control_start_threshold, % */
++	int thr_end;		/* charge_control_end_threshold, % */
+ };
+ 
+ static int lerp(int x, int x0, int x1, int y0, int y1)
+@@ -234,28 +237,41 @@
+ 	return ret;
+ }
+ 
+-/* stop drawing from the charger outside the safe battery temperature */
+-static void gauge_charge_guard(struct mt6359_gauge *g, bool online)
++/*
++ * Charging off through the charger's charge_behaviour (inhibit-charge: the
++ * system stays on VBUS, the battery is not charged) outside the safe battery
++ * temperature, and from the charge limit (end threshold) until the level
++ * falls to the start threshold. Checked against the charger every update,
++ * so another writer (userspace setting online) cannot undo it.
++ */
++static void gauge_charge_guard(struct mt6359_gauge *g, int cap)
+ {
+ 	union power_supply_propval pv;
+-	bool inhibit = g->chg_inhibit;
++	int cur, want;
++	bool inhibit;
+ 
+-	if (!g->chg)
+-		return;
+ 	if (g->temp >= CHG_TEMP_HOT || g->temp < CHG_TEMP_COLD)
+-		inhibit = true;
++		g->temp_inhibit = true;
+ 	else if (g->temp <= CHG_TEMP_HOT_RESUME && g->temp >= CHG_TEMP_COLD_RESUME)
+-		inhibit = false;
+-	if (!online || inhibit == g->chg_inhibit)
++		g->temp_inhibit = false;
++	if (g->thr_end >= 100 || cap <= min(g->thr_start, g->thr_end - 1))
++		g->limit_inhibit = false;
++	else if (cap >= g->thr_end)
++		g->limit_inhibit = true;
++	inhibit = g->temp_inhibit || g->limit_inhibit;
++
++	if (gauge_charger_prop(g, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR, &cur))
++		return;
++	want = inhibit ? POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
++			 POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++	if (cur == want)
+ 		return;
+ 
+-	pv.intval = !inhibit;
+-	if (!power_supply_set_property(g->chg, POWER_SUPPLY_PROP_ONLINE, &pv)) {
+-		g->chg_inhibit = inhibit;
+-		dev_warn(g->dev, "battery at %d.%d C, charging %s\n",
+-			 g->temp / 10, abs(g->temp % 10),
+-			 inhibit ? "suspended" : "resumed");
+-	}
++	pv.intval = want;
++	if (!power_supply_set_property(g->chg, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR, &pv))
++		dev_info(g->dev, "charging %s: %d.%d C, %d %% (limit %d..%d %%)\n",
++			 inhibit ? "off" : "on", g->temp / 10, abs(g->temp % 10),
++			 cap, g->thr_start, g->thr_end);
+ }
+ 
+ /* returns true when capacity or status changed */
+@@ -297,7 +313,6 @@
+ 	g->car_last = car;
+ 
+ 	gauge_charger_prop(g, POWER_SUPPLY_PROP_ONLINE, &online);
+-	gauge_charge_guard(g, online);
+ 
+ 	/*
+ 	 * The charger's own "done" is not trusted for the charge level: on a
+@@ -309,6 +324,7 @@
+ 	cap = DIV_ROUND_CLOSEST_ULL(100 * max_t(s64, g->q - g->q_empty, 0),
+ 				    g->q_full - g->q_empty);
+ 	cap = min(cap, 100);
++	gauge_charge_guard(g, cap);
+ 
+ 	if (!online)
+ 		status = POWER_SUPPLY_STATUS_DISCHARGING;
+@@ -410,6 +426,12 @@
+ 	case POWER_SUPPLY_PROP_TEMP:
+ 		val->intval = g->temp;
+ 		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		val->intval = g->thr_start;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		val->intval = g->thr_end;
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+@@ -417,6 +439,39 @@
+ 	return ret;
+ }
+ 
++/* the charge limit: applied by the next update (gauge_charge_guard) */
++static int gauge_set_property(struct power_supply *psy,
++			      enum power_supply_property psp,
++			      const union power_supply_propval *val)
++{
++	struct mt6359_gauge *g = power_supply_get_drvdata(psy);
++
++	if (val->intval < 0 || val->intval > 100)
++		return -EINVAL;
++	mutex_lock(&g->lock);
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		g->thr_start = val->intval;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		g->thr_end = val->intval;
++		break;
++	default:
++		mutex_unlock(&g->lock);
++		return -EINVAL;
++	}
++	mutex_unlock(&g->lock);
++	mod_delayed_work(system_freezable_wq, &g->work, 0);
++	return 0;
++}
++
++static int gauge_property_is_writeable(struct power_supply *psy,
++				       enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
++	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
++}
++
+ static void gauge_external_power_changed(struct power_supply *psy)
+ {
+ 	struct mt6359_gauge *g = power_supply_get_drvdata(psy);
+@@ -439,6 +494,8 @@
+ 	POWER_SUPPLY_PROP_CHARGE_NOW,
+ 	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+ 	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+ };
+ 
+ static const struct power_supply_desc gauge_desc = {
+@@ -447,6 +504,8 @@
+ 	.properties = gauge_props,
+ 	.num_properties = ARRAY_SIZE(gauge_props),
+ 	.get_property = gauge_get_property,
++	.set_property = gauge_set_property,
++	.property_is_writeable = gauge_property_is_writeable,
+ 	.external_power_changed = gauge_external_power_changed,
+ };
+ 
+@@ -503,6 +562,7 @@
+ 	g->dev = dev;
+ 	g->capacity = -1;
+ 	mutex_init(&g->lock);
++	g->thr_end = 100;		/* no charge limit until one is set */
+ 
+ 	/* PMIC wrapper regmap, parent of the MT6397 MFD */
+ 	g->regmap = dev_get_regmap(dev->parent->parent, NULL);

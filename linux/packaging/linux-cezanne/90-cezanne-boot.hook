@@ -1,0 +1,10 @@
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = usr/lib/cezanne/boot.img
+
+[Action]
+Description = Writing the cezanne boot image to the boot slot...
+When = PostTransaction
+Exec = /usr/lib/cezanne/cezanne-flash-boot

@@ -1,0 +1,53 @@
+From: cezanne port
+Subject: [PATCH] va: encoder: free the pictures of imported dma-buf input
+
+gst_va_encode_picture_free() took the VA display from the raw (input)
+buffer and returned early without one. An input imported from another
+allocator's dma-buf (pipewiresrc in GNOME's screen recorder: DMA_DRM !
+vapostproc in passthrough ! vah264enc) has no VA display on its memory, so
+every picture leaked its input buffer, its reconstructed buffer and its
+coded buffer: the reconstructed pool ran dry after a few frames ("Failed
+to create the reconstruct picture") and the recording stopped. Fall back
+to the reconstructed buffer's display, which always comes from a VA pool.
+
+--- a/sys/va/gstvaencoder.c	2026-10-29 15:40:15.713302510 +0100
++++ b/sys/va/gstvaencoder.c	2026-10-29 15:40:15.732305566 +0100
+@@ -1064,6 +1064,20 @@
+   return NULL;
+ }
+ 
++/* The picture's display. An input imported from another allocator's dma-buf
++ * (pipewiresrc, for GNOME's screen recorder) has none: then the
++ * reconstructed buffer's, which always comes from a VA pool. */
++static GstVaDisplay *
++_picture_peek_display (GstVaEncodePicture * pic)
++{
++  GstVaDisplay *display = gst_va_buffer_peek_display (pic->raw_buffer);
++
++  if (!display && pic->reconstruct_buffer)
++    display = gst_va_buffer_peek_display (pic->reconstruct_buffer);
++
++  return display;
++}
++
+ static gboolean
+ _destroy_all_buffers (GstVaEncodePicture * pic)
+ {
+@@ -1072,7 +1086,7 @@
+   guint i;
+   gboolean ret = TRUE;
+ 
+-  display = gst_va_buffer_peek_display (pic->raw_buffer);
++  display = _picture_peek_display (pic);
+   if (!display)
+     return FALSE;
+ 
+@@ -1245,7 +1259,7 @@
+ 
+   _destroy_all_buffers (pic);
+ 
+-  display = gst_va_buffer_peek_display (pic->raw_buffer);
++  display = _picture_peek_display (pic);
+   if (!display)
+     return;
+ 

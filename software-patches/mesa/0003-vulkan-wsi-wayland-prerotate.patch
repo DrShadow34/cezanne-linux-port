@@ -1,0 +1,791 @@
+diff -ruN mesa-orig/src/vulkan/wsi/wsi_common.c mesa-26.2.5/src/vulkan/wsi/wsi_common.c
+--- mesa-orig/src/vulkan/wsi/wsi_common.c	2026-10-14 17:12:24.000000000 +0200
++++ mesa-26.2.5/src/vulkan/wsi/wsi_common.c	2026-10-24 19:42:08.233667183 +0200
+@@ -195,6 +195,26 @@
+    WSI_GET_CB(CmdPipelineBarrier);
+    WSI_GET_CB(CmdCopyImage);
+    WSI_GET_CB(CmdCopyImageToBuffer);
++   WSI_GET_CB(CmdBindPipeline);
++   WSI_GET_CB(CmdBindDescriptorSets);
++   WSI_GET_CB(CmdPushConstants);
++   WSI_GET_CB(CmdDispatch);
++   WSI_GET_CB(CreateShaderModule);
++   WSI_GET_CB(DestroyShaderModule);
++   WSI_GET_CB(CreateComputePipelines);
++   WSI_GET_CB(DestroyPipeline);
++   WSI_GET_CB(CreatePipelineLayout);
++   WSI_GET_CB(DestroyPipelineLayout);
++   WSI_GET_CB(CreateDescriptorSetLayout);
++   WSI_GET_CB(DestroyDescriptorSetLayout);
++   WSI_GET_CB(CreateDescriptorPool);
++   WSI_GET_CB(DestroyDescriptorPool);
++   WSI_GET_CB(AllocateDescriptorSets);
++   WSI_GET_CB(UpdateDescriptorSets);
++   WSI_GET_CB(CreateImageView);
++   WSI_GET_CB(DestroyImageView);
++   WSI_GET_CB(CreateSampler);
++   WSI_GET_CB(DestroySampler);
+    WSI_GET_CB(CmdResetQueryPool);
+    WSI_GET_CB(ResetQueryPoolEXT);
+    WSI_GET_CB(CmdWriteTimestamp);
+@@ -412,7 +432,7 @@
+    case WSI_IMAGE_TYPE_DRM: {
+       const struct wsi_drm_image_params *drm_params =
+          container_of(params, const struct wsi_drm_image_params, base);
+-      return wsi_drm_image_needs_buffer_blit(wsi, drm_params) ?
++      return drm_params->rotate || wsi_drm_image_needs_buffer_blit(wsi, drm_params) ?
+          WSI_SWAPCHAIN_BUFFER_BLIT : WSI_SWAPCHAIN_NO_BLIT;
+    }
+ #endif
+@@ -488,6 +508,109 @@
+ wsi_surface_capabilities_add_present_stages(const struct wsi_device *wsi_device,
+                                             VkPresentTimingSurfaceCapabilitiesEXT *present_timing);
+ 
++#include "wsi_rotate_spv.h"
++
++/* Pre-rotation pipeline: wsi_rotate.comp, one per swapchain. */
++static VkResult
++wsi_rotate_init(struct wsi_swapchain *chain)
++{
++   const struct wsi_device *wsi = chain->wsi;
++   VkResult result;
++
++   const VkShaderModuleCreateInfo module_info = {
++      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = sizeof(wsi_rotate_spv),
++      .pCode = wsi_rotate_spv,
++   };
++   result = wsi->CreateShaderModule(chain->device, &module_info, &chain->alloc,
++                                    &chain->rotate.module);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkSamplerCreateInfo sampler_info = {
++      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
++      .magFilter = VK_FILTER_NEAREST,
++      .minFilter = VK_FILTER_NEAREST,
++      .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
++      .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++   };
++   result = wsi->CreateSampler(chain->device, &sampler_info, &chain->alloc,
++                               &chain->rotate.sampler);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkDescriptorSetLayoutBinding bindings[] = {
++      {
++         .binding = 0,
++         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++         .descriptorCount = 1,
++         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++         .pImmutableSamplers = &chain->rotate.sampler,
++      },
++      {
++         .binding = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++         .descriptorCount = 1,
++         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++      },
++   };
++   const VkDescriptorSetLayoutCreateInfo set_layout_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++      .bindingCount = ARRAY_SIZE(bindings),
++      .pBindings = bindings,
++   };
++   result = wsi->CreateDescriptorSetLayout(chain->device, &set_layout_info,
++                                           &chain->alloc,
++                                           &chain->rotate.set_layout);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkPushConstantRange push_range = {
++      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
++      .size = 4 * sizeof(uint32_t),
++   };
++   const VkPipelineLayoutCreateInfo layout_info = {
++      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++      .setLayoutCount = 1,
++      .pSetLayouts = &chain->rotate.set_layout,
++      .pushConstantRangeCount = 1,
++      .pPushConstantRanges = &push_range,
++   };
++   result = wsi->CreatePipelineLayout(chain->device, &layout_info,
++                                      &chain->alloc, &chain->rotate.layout);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkComputePipelineCreateInfo pipeline_info = {
++      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++      .stage = {
++         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
++         .module = chain->rotate.module,
++         .pName = "main",
++      },
++      .layout = chain->rotate.layout,
++   };
++   return wsi->CreateComputePipelines(chain->device, VK_NULL_HANDLE, 1,
++                                      &pipeline_info, &chain->alloc,
++                                      &chain->rotate.pipeline);
++}
++
++static void
++wsi_rotate_finish(struct wsi_swapchain *chain)
++{
++   const struct wsi_device *wsi = chain->wsi;
++
++   wsi->DestroyPipeline(chain->device, chain->rotate.pipeline, &chain->alloc);
++   wsi->DestroyPipelineLayout(chain->device, chain->rotate.layout, &chain->alloc);
++   wsi->DestroyDescriptorSetLayout(chain->device, chain->rotate.set_layout,
++                                   &chain->alloc);
++   wsi->DestroySampler(chain->device, chain->rotate.sampler, &chain->alloc);
++   wsi->DestroyShaderModule(chain->device, chain->rotate.module, &chain->alloc);
++}
++
+ VkResult
+ wsi_swapchain_init(const struct wsi_device *wsi,
+                    struct wsi_swapchain *chain,
+@@ -508,6 +631,20 @@
+    chain->device = _device;
+    chain->alloc = *pAllocator;
+    chain->blit.type = get_blit_type(wsi, image_params, _device);
++#ifdef HAVE_LIBDRM
++   if (image_params->image_type == WSI_IMAGE_TYPE_DRM) {
++      chain->rotate.transform =
++         container_of(image_params, const struct wsi_drm_image_params,
++                      base)->rotate;
++   }
++#endif
++   if (chain->rotate.transform) {
++      result = wsi_rotate_init(chain);
++      if (result != VK_SUCCESS) {
++         wsi_rotate_finish(chain);
++         return result;
++      }
++   }
+    chain->present_wait_enabled =
+       device->enabled_features.presentWait ||
+       (pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR);
+@@ -661,6 +798,8 @@
+ wsi_swapchain_finish(struct wsi_swapchain *chain)
+ {
+    wsi_destroy_image_info(chain, &chain->image_info);
++   if (chain->rotate.transform)
++      wsi_rotate_finish(chain);
+ 
+    if (chain->fences) {
+       for (unsigned i = 0; i < chain->image_count; i++)
+@@ -1063,6 +1202,8 @@
+       vk_free(&chain->alloc, image->timestamp_cmd_buffers);
+    }
+ 
++   wsi->DestroyDescriptorPool(chain->device, image->rotate.pool, &chain->alloc);
++   wsi->DestroyImageView(chain->device, image->rotate.view, &chain->alloc);
+    wsi->FreeMemory(chain->device, image->memory, &chain->alloc);
+    wsi->DestroyImage(chain->device, image->image, &chain->alloc);
+    wsi->DestroyImage(chain->device, image->blit.image, &chain->alloc);
+@@ -3114,7 +3255,8 @@
+       .pNext = &buffer_external_info,
+       .flags = create_flags,
+       .size = info->linear_size,
+-      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++               (chain->rotate.transform ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0),
+       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    result = wsi->CreateBuffer(chain->device, &buffer_info,
+@@ -3404,6 +3546,165 @@
+                            2, img_mem_barriers);
+ }
+ 
++/* pre-rotation: rotate the image into the blit buffer (wsi_rotate.comp) */
++static VkResult
++wsi_rotate_init_image(const struct wsi_swapchain *chain,
++                      const struct wsi_image_info *info,
++                      struct wsi_image *image)
++{
++   const struct wsi_device *wsi = chain->wsi;
++   VkResult result;
++
++   const VkImageViewCreateInfo view_info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++      .image = image->image,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
++      .format = info->create.format,
++      .subresourceRange = {
++         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++         .levelCount = 1,
++         .layerCount = 1,
++      },
++   };
++   result = wsi->CreateImageView(chain->device, &view_info, &chain->alloc,
++                                 &image->rotate.view);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkDescriptorPoolSize pool_sizes[] = {
++      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
++      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 },
++   };
++   const VkDescriptorPoolCreateInfo pool_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
++      .maxSets = 1,
++      .poolSizeCount = ARRAY_SIZE(pool_sizes),
++      .pPoolSizes = pool_sizes,
++   };
++   result = wsi->CreateDescriptorPool(chain->device, &pool_info, &chain->alloc,
++                                      &image->rotate.pool);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkDescriptorSetAllocateInfo set_info = {
++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++      .descriptorPool = image->rotate.pool,
++      .descriptorSetCount = 1,
++      .pSetLayouts = &chain->rotate.set_layout,
++   };
++   result = wsi->AllocateDescriptorSets(chain->device, &set_info,
++                                        &image->rotate.set);
++   if (result != VK_SUCCESS)
++      return result;
++
++   const VkDescriptorImageInfo image_desc = {
++      .imageView = image->rotate.view,
++      .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++   };
++   const VkDescriptorBufferInfo buffer_desc = {
++      .buffer = image->blit.buffer,
++      .range = VK_WHOLE_SIZE,
++   };
++   const VkWriteDescriptorSet writes[] = {
++      {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstSet = image->rotate.set,
++         .dstBinding = 0,
++         .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
++         .pImageInfo = &image_desc,
++      },
++      {
++         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
++         .dstSet = image->rotate.set,
++         .dstBinding = 1,
++         .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
++         .pBufferInfo = &buffer_desc,
++      },
++   };
++   wsi->UpdateDescriptorSets(chain->device, ARRAY_SIZE(writes), writes, 0,
++                             NULL);
++   return VK_SUCCESS;
++}
++
++static void
++wsi_cmd_rotate_image_to_buffer(VkCommandBuffer cmd_buffer,
++                               const struct wsi_swapchain *chain,
++                               const struct wsi_image_info *info,
++                               struct wsi_image *image,
++                               uint32_t qfi)
++{
++   const struct wsi_device *wsi = chain->wsi;
++   const uint32_t w = info->create.extent.width;
++   const uint32_t h = info->create.extent.height;
++
++   VkImageMemoryBarrier img_mem_barrier = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++      .srcAccessMask = 0,
++      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
++      .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++      .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .image = image->image,
++      .subresourceRange = {
++         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++         .levelCount = 1,
++         .layerCount = 1,
++      },
++   };
++   wsi->CmdPipelineBarrier(cmd_buffer,
++                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                           0, 0, NULL, 0, NULL, 1, &img_mem_barrier);
++
++   const VkFormat format = info->create.format;
++   const uint32_t push[4] = {
++      w, h,
++      info->linear_stride / vk_format_get_blocksize(format),
++      (chain->rotate.transform == 1 /* WL_OUTPUT_TRANSFORM_90 */ ? 1 : 0) |
++      (format == VK_FORMAT_B8G8R8A8_UNORM ||
++       format == VK_FORMAT_B8G8R8A8_SRGB ? 2 : 0) |
++      (vk_format_is_srgb(format) ? 4 : 0),
++   };
++   wsi->CmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
++                        chain->rotate.pipeline);
++   wsi->CmdBindDescriptorSets(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
++                              chain->rotate.layout, 0, 1, &image->rotate.set,
++                              0, NULL);
++   wsi->CmdPushConstants(cmd_buffer, chain->rotate.layout,
++                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
++   /* one invocation per destination (h x w) pixel, 16x16 workgroups */
++   wsi->CmdDispatch(cmd_buffer, DIV_ROUND_UP(h, 16), DIV_ROUND_UP(w, 16), 1);
++
++   img_mem_barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
++   img_mem_barrier.dstAccessMask = 0;
++   img_mem_barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++   img_mem_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++
++   const VkBufferMemoryBarrier buf_mem_barrier = {
++      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++      .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++      .srcQueueFamilyIndex =
++         image->blit.to_foreign_queue ? qfi : VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = image->blit.to_foreign_queue
++                                ? VK_QUEUE_FAMILY_FOREIGN_EXT
++                                : VK_QUEUE_FAMILY_IGNORED,
++      .buffer = image->blit.buffer,
++      .offset = 0,
++      .size = VK_WHOLE_SIZE,
++   };
++   wsi->CmdPipelineBarrier(cmd_buffer,
++                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                           image->blit.to_foreign_queue
++                              ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
++                              : VK_PIPELINE_STAGE_HOST_BIT,
++                           0, 0, NULL, 1, &buf_mem_barrier,
++                           1, &img_mem_barrier);
++}
++
+ VkResult
+ wsi_finish_create_blit_context(const struct wsi_swapchain *chain,
+                                const struct wsi_image_info *info,
+@@ -3414,6 +3715,13 @@
+ 
+    int cmd_buffer_count =
+       chain->blit.queue != NULL ? 1 : wsi->queue_family_count;
++
++   if (chain->rotate.transform) {
++      result = wsi_rotate_init_image(chain, info, image);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
+    image->blit.cmd_buffers =
+       vk_zalloc(&chain->alloc,
+                 sizeof(VkCommandBuffer) * cmd_buffer_count, 8,
+@@ -3449,9 +3757,12 @@
+ 
+       switch (chain->blit.type) {
+       case WSI_SWAPCHAIN_BUFFER_BLIT: {
+-         wsi_cmd_blit_image_to_buffer(
+-            cmd_buffer, wsi, info, image,
+-            chain->blit.queue ? chain->blit.queue->queue_family_index : i);
++         const uint32_t qfi =
++            chain->blit.queue ? chain->blit.queue->queue_family_index : i;
++         if (chain->rotate.transform)
++            wsi_cmd_rotate_image_to_buffer(cmd_buffer, chain, info, image, qfi);
++         else
++            wsi_cmd_blit_image_to_buffer(cmd_buffer, wsi, info, image, qfi);
+          break;
+       }
+       case WSI_SWAPCHAIN_IMAGE_BLIT:
+@@ -3484,8 +3795,20 @@
+    info->usage2.usage |= VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR;
+    info->wsi.blit_src = true;
+ 
++   /* pre-rotation: the image is read by wsi_rotate.comp into a buffer of
++    * the transposed size */
++   const bool rotated = chain->rotate.transform != 0;
++   if (rotated) {
++      info->create.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
++      info->usage2.usage |= VK_IMAGE_USAGE_2_SAMPLED_BIT_KHR;
++   }
++   const uint32_t buf_width = rotated ? pCreateInfo->imageExtent.height :
++                                        pCreateInfo->imageExtent.width;
++   const uint32_t buf_height = rotated ? pCreateInfo->imageExtent.width :
++                                         pCreateInfo->imageExtent.height;
++
+    const uint32_t cpp = vk_format_get_blocksize(pCreateInfo->imageFormat);
+-   info->linear_stride = pCreateInfo->imageExtent.width * cpp;
++   info->linear_stride = buf_width * cpp;
+    info->linear_stride = align(info->linear_stride, stride_align);
+ 
+    /* Since we can pick the stride to be whatever we want, also align to the
+@@ -3495,8 +3818,7 @@
+    info->linear_stride = align(info->linear_stride,
+                                wsi->optimalBufferCopyRowPitchAlignment);
+ 
+-   info->linear_size = (uint64_t)info->linear_stride *
+-                       pCreateInfo->imageExtent.height;
++   info->linear_size = (uint64_t)info->linear_stride * buf_height;
+    info->linear_size = align64(info->linear_size, size_align);
+ 
+    info->finish_create = wsi_finish_create_blit_context;
+diff -ruN mesa-orig/src/vulkan/wsi/wsi_common.h mesa-26.2.5/src/vulkan/wsi/wsi_common.h
+--- mesa-orig/src/vulkan/wsi/wsi_common.h	2026-10-14 17:12:24.000000000 +0200
++++ mesa-26.2.5/src/vulkan/wsi/wsi_common.h	2026-10-24 19:40:55.458520254 +0200
+@@ -208,6 +208,26 @@
+    WSI_CB(CmdPipelineBarrier);
+    WSI_CB(CmdCopyImage);
+    WSI_CB(CmdCopyImageToBuffer);
++   WSI_CB(CmdBindPipeline);
++   WSI_CB(CmdBindDescriptorSets);
++   WSI_CB(CmdPushConstants);
++   WSI_CB(CmdDispatch);
++   WSI_CB(CreateShaderModule);
++   WSI_CB(DestroyShaderModule);
++   WSI_CB(CreateComputePipelines);
++   WSI_CB(DestroyPipeline);
++   WSI_CB(CreatePipelineLayout);
++   WSI_CB(DestroyPipelineLayout);
++   WSI_CB(CreateDescriptorSetLayout);
++   WSI_CB(DestroyDescriptorSetLayout);
++   WSI_CB(CreateDescriptorPool);
++   WSI_CB(DestroyDescriptorPool);
++   WSI_CB(AllocateDescriptorSets);
++   WSI_CB(UpdateDescriptorSets);
++   WSI_CB(CreateImageView);
++   WSI_CB(DestroyImageView);
++   WSI_CB(CreateSampler);
++   WSI_CB(DestroySampler);
+    WSI_CB(CmdResetQueryPool);
+    WSI_CB(ResetQueryPoolEXT);
+    WSI_CB(CmdWriteTimestamp);
+diff -ruN mesa-orig/src/vulkan/wsi/wsi_common_private.h mesa-26.2.5/src/vulkan/wsi/wsi_common_private.h
+--- mesa-orig/src/vulkan/wsi/wsi_common_private.h	2026-10-14 17:12:24.000000000 +0200
++++ mesa-26.2.5/src/vulkan/wsi/wsi_common_private.h	2026-10-24 19:40:55.459915585 +0200
+@@ -71,6 +71,10 @@
+    uint32_t num_modifier_lists;
+    const uint32_t *num_modifiers;
+    const uint64_t *const *modifiers;
++
++   /* Pre-rotation: present through a buffer blit that rotates the image by
++    * this wl_output transform (90 or 270), see wsi_rotate.comp. 0 when off. */
++   uint32_t rotate;
+ };
+ 
+ struct wsi_dxgi_image_params {
+@@ -172,6 +176,13 @@
+        */
+       bool to_foreign_queue;
+    } blit;
++
++   /* pre-rotation (wsi_swapchain::rotate) */
++   struct {
++      VkImageView view;
++      VkDescriptorPool pool;
++      VkDescriptorSet set;
++   } rotate;
+    /* Whether or not the image has been acquired
+     * on the CPU side via acquire_next_image.
+     */
+@@ -268,6 +279,17 @@
+       struct vk_queue *queue;
+    } blit;
+ 
++   /* Pre-rotation: the buffer blit rotates the image by this wl_output
++    * transform (90 or 270), 0 when off (see wsi_rotate.comp). */
++   struct {
++      uint32_t transform;
++      VkShaderModule module;
++      VkSampler sampler;
++      VkDescriptorSetLayout set_layout;
++      VkPipelineLayout layout;
++      VkPipeline pipeline;
++   } rotate;
++
+    struct {
+       mtx_t lock;
+       bool active;
+diff -ruN mesa-orig/src/vulkan/wsi/wsi_common_wayland.c mesa-26.2.5/src/vulkan/wsi/wsi_common_wayland.c
+--- mesa-orig/src/vulkan/wsi/wsi_common_wayland.c	2026-10-14 17:12:24.000000000 +0200
++++ mesa-26.2.5/src/vulkan/wsi/wsi_common_wayland.c	2026-10-24 20:05:27.961583873 +0200
+@@ -1482,6 +1482,94 @@
+ #define MESA_WL_FIXES_VERSION 1
+ #endif
+ 
++/*
++ * Pre-rotation (MESA_VK_WSI_PREROTATE): the transform of the only output, or
++ * -1. Queried over a connection of our own: wl_output objects bound on the
++ * application's connection would show up in its wl_surface.enter events.
++ */
++struct wsi_wl_output_query {
++   uint32_t count;
++   int32_t transform;
++};
++
++static void
++output_query_geometry(void *data, struct wl_output *output, int32_t x,
++                      int32_t y, int32_t physical_width,
++                      int32_t physical_height, int32_t subpixel,
++                      const char *make, const char *model, int32_t transform)
++{
++   struct wsi_wl_output_query *query = data;
++   query->transform = transform;
++}
++
++static void
++output_query_mode(void *data, struct wl_output *output, uint32_t flags,
++                  int32_t width, int32_t height, int32_t refresh)
++{
++}
++
++static void
++output_query_done(void *data, struct wl_output *output)
++{
++}
++
++static void
++output_query_scale(void *data, struct wl_output *output, int32_t factor)
++{
++}
++
++static const struct wl_output_listener output_query_listener = {
++   .geometry = output_query_geometry,
++   .mode = output_query_mode,
++   .done = output_query_done,
++   .scale = output_query_scale,
++};
++
++static void
++output_query_global(void *data, struct wl_registry *registry, uint32_t name,
++                    const char *interface, uint32_t version)
++{
++   struct wsi_wl_output_query *query = data;
++
++   if (strcmp(interface, wl_output_interface.name) != 0)
++      return;
++   if (query->count++ == 0) {
++      struct wl_output *output =
++         wl_registry_bind(registry, name, &wl_output_interface, 2);
++      wl_output_add_listener(output, &output_query_listener, query);
++   }
++}
++
++static void
++output_query_global_remove(void *data, struct wl_registry *registry,
++                           uint32_t name)
++{
++}
++
++static const struct wl_registry_listener output_query_registry_listener = {
++   .global = output_query_global,
++   .global_remove = output_query_global_remove,
++};
++
++static int32_t
++wsi_wl_single_output_transform(void)
++{
++   struct wsi_wl_output_query query = { .transform = -1 };
++   struct wl_display *dpy = wl_display_connect(NULL);
++   if (!dpy)
++      return -1;
++
++   struct wl_registry *registry = wl_display_get_registry(dpy);
++   wl_registry_add_listener(registry, &output_query_registry_listener, &query);
++   /* globals, then the output's geometry */
++   wl_display_roundtrip(dpy);
++   wl_display_roundtrip(dpy);
++   wl_display_disconnect(dpy);
++
++   return query.count == 1 ? query.transform : -1;
++}
++
++
+ static void
+ registry_handle_global(void *data, struct wl_registry *registry,
+                        uint32_t name, const char *interface, uint32_t version)
+@@ -3349,11 +3437,17 @@
+    }
+ 
+    assert(image_index < chain->base.image_count);
++   if (chain->base.rotate.transform) {
++      wl_surface_set_buffer_transform(wsi_wl_surface->wayland_surface.wrapper,
++                                      chain->base.rotate.transform);
++   }
+    wl_surface_attach(wsi_wl_surface->wayland_surface.wrapper,
+                      chain->images[image_index].wayland_buffer.buffer, 0, 0);
+ 
+    if (wl_surface_get_version(wsi_wl_surface->wayland_surface.wrapper) >= WL_SURFACE_DAMAGE_BUFFER_SINCE_VERSION) {
+-      if (damage && damage->pRectangles && damage->rectangleCount > 0) {
++      /* damage rects are in image space; rotated buffers get full damage */
++      if (damage && damage->pRectangles && damage->rectangleCount > 0 &&
++          !chain->base.rotate.transform) {
+          for (unsigned i = 0; i < damage->rectangleCount; i++) {
+             const VkRectLayerKHR *rect = &damage->pRectangles[i];
+             assert(rect->layer == 0);
+@@ -3610,10 +3704,13 @@
+                                         image->base.drm_modifier & 0xffffffff);
+       }
+ 
++      const bool rotated = chain->base.rotate.transform != 0;
+       struct wl_buffer *buffer =
+          zwp_linux_buffer_params_v1_create_immed(params,
+-                                                 chain->extent.width,
+-                                                 chain->extent.height,
++                                                 rotated ? chain->extent.height :
++                                                           chain->extent.width,
++                                                 rotated ? chain->extent.width :
++                                                           chain->extent.height,
+                                                  chain->drm_format,
+                                                  0);
+       zwp_linux_buffer_params_v1_destroy(params);
+@@ -3884,6 +3981,24 @@
+          .same_gpu = wsi_wl_surface->display->same_gpu,
+          .explicit_sync = wsi_wl_use_explicit_sync(wsi_wl_surface->display, wsi_device),
+       };
++
++      /* Pre-rotation (MESA_VK_WSI_PREROTATE, default on): on a single output rotated by
++       * 90/270 degrees, present buffers already rotated (by the buffer blit,
++       * wsi_rotate.comp) with that buffer transform, which lets the
++       * compositor scan them out directly instead of rotating every frame.
++       */
++      const VkFormat fmt = pCreateInfo->imageFormat;
++      const int32_t out_transform =
++         debug_get_bool_option("MESA_VK_WSI_PREROTATE", true) ?
++         wsi_wl_single_output_transform() : -1;
++      if ((out_transform == WL_OUTPUT_TRANSFORM_90 ||
++           out_transform == WL_OUTPUT_TRANSFORM_270) &&
++          wl_surface_get_version(wsi_wl_surface->wayland_surface.wrapper) >=
++             WL_SURFACE_SET_BUFFER_TRANSFORM_SINCE_VERSION &&
++          (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB ||
++           fmt == VK_FORMAT_R8G8B8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_SRGB) &&
++          pCreateInfo->imageArrayLayers == 1)
++         drm_image_params.rotate = out_transform;
+       /* Use explicit DRM format modifiers when both the server and the driver
+        * support them.
+        */
+diff -ruN mesa-orig/src/vulkan/wsi/wsi_rotate_spv.h mesa-26.2.5/src/vulkan/wsi/wsi_rotate_spv.h
+--- mesa-orig/src/vulkan/wsi/wsi_rotate_spv.h	1970-01-01 01:00:00.000000000 +0100
++++ mesa-26.2.5/src/vulkan/wsi/wsi_rotate_spv.h	1970-01-01 01:00:00.000000000 +0100
+@@ -0,0 +1,127 @@
++	// 1116.6.0
++	 #pragma once
++const uint32_t wsi_rotate_spv[] = {
++	0x07230203,0x00010300,0x0008000b,0x000000aa,0x00000000,0x00020011,0x00000001,0x0006000b,
++	0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
++	0x0006000f,0x00000005,0x00000004,0x6e69616d,0x00000000,0x00000027,0x00060010,0x00000004,
++	0x00000011,0x00000010,0x00000010,0x00000001,0x00030003,0x00000002,0x000001c2,0x00040005,
++	0x00000004,0x6e69616d,0x00000000,0x00060005,0x0000000a,0x6f636e65,0x735f6564,0x28626772,
++	0x003b3166,0x00030005,0x00000009,0x00000063,0x00030005,0x00000024,0x00000064,0x00080005,
++	0x00000027,0x475f6c67,0x61626f6c,0x766e496c,0x7461636f,0x496e6f69,0x00000044,0x00030005,
++	0x0000002e,0x00004350,0x00040006,0x0000002e,0x00000000,0x00000077,0x00040006,0x0000002e,
++	0x00000001,0x00000068,0x00050006,0x0000002e,0x00000002,0x69727473,0x00006564,0x00050006,
++	0x0000002e,0x00000003,0x67616c66,0x00000073,0x00030005,0x00000030,0x00006370,0x00030005,
++	0x00000047,0x00000073,0x00030005,0x0000006a,0x00000063,0x00030005,0x0000006e,0x00637273,
++	0x00040005,0x0000007a,0x61726170,0x0000006d,0x00040005,0x0000007e,0x61726170,0x0000006d,
++	0x00040005,0x00000082,0x61726170,0x0000006d,0x00030005,0x00000098,0x00747344,0x00040006,
++	0x00000098,0x00000000,0x00007870,0x00030005,0x0000009a,0x00000000,0x00040047,0x00000027,
++	0x0000000b,0x0000001c,0x00030047,0x0000002e,0x00000002,0x00050048,0x0000002e,0x00000000,
++	0x00000023,0x00000000,0x00050048,0x0000002e,0x00000001,0x00000023,0x00000004,0x00050048,
++	0x0000002e,0x00000002,0x00000023,0x00000008,0x00050048,0x0000002e,0x00000003,0x00000023,
++	0x0000000c,0x00040047,0x0000006e,0x00000021,0x00000000,0x00040047,0x0000006e,0x00000022,
++	0x00000000,0x00040047,0x00000097,0x00000006,0x00000004,0x00030047,0x00000098,0x00000002,
++	0x00040048,0x00000098,0x00000000,0x00000019,0x00050048,0x00000098,0x00000000,0x00000023,
++	0x00000000,0x00030047,0x0000009a,0x00000019,0x00040047,0x0000009a,0x00000021,0x00000001,
++	0x00040047,0x0000009a,0x00000022,0x00000000,0x00040047,0x000000a9,0x0000000b,0x00000019,
++	0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,
++	0x00040020,0x00000007,0x00000007,0x00000006,0x00040021,0x00000008,0x00000006,0x00000007,
++	0x0004002b,0x00000006,0x0000000d,0x3b4d2e1c,0x00020014,0x0000000e,0x0004002b,0x00000006,
++	0x00000014,0x414eb852,0x0004002b,0x00000006,0x00000017,0x3f870a3d,0x0004002b,0x00000006,
++	0x00000019,0x3ed55555,0x0004002b,0x00000006,0x0000001c,0x3d6147ae,0x00040015,0x00000021,
++	0x00000020,0x00000000,0x00040017,0x00000022,0x00000021,0x00000002,0x00040020,0x00000023,
++	0x00000007,0x00000022,0x00040017,0x00000025,0x00000021,0x00000003,0x00040020,0x00000026,
++	0x00000001,0x00000025,0x0004003b,0x00000026,0x00000027,0x00000001,0x0004002b,0x00000021,
++	0x0000002a,0x00000000,0x00040020,0x0000002b,0x00000007,0x00000021,0x0006001e,0x0000002e,
++	0x00000021,0x00000021,0x00000021,0x00000021,0x00040020,0x0000002f,0x00000009,0x0000002e,
++	0x0004003b,0x0000002f,0x00000030,0x00000009,0x00040015,0x00000031,0x00000020,0x00000001,
++	0x0004002b,0x00000031,0x00000032,0x00000001,0x00040020,0x00000033,0x00000009,0x00000021,
++	0x0004002b,0x00000021,0x0000003a,0x00000001,0x0004002b,0x00000031,0x0000003d,0x00000000,
++	0x00040017,0x00000045,0x00000031,0x00000002,0x00040020,0x00000046,0x00000007,0x00000045,
++	0x0004002b,0x00000031,0x00000048,0x00000003,0x00040017,0x00000068,0x00000006,0x00000004,
++	0x00040020,0x00000069,0x00000007,0x00000068,0x00090019,0x0000006b,0x00000006,0x00000001,
++	0x00000000,0x00000000,0x00000000,0x00000001,0x00000000,0x0003001b,0x0000006c,0x0000006b,
++	0x00040020,0x0000006d,0x00000000,0x0000006c,0x0004003b,0x0000006d,0x0000006e,0x00000000,
++	0x0004002b,0x00000021,0x00000075,0x00000004,0x0004002b,0x00000021,0x00000083,0x00000002,
++	0x00040017,0x00000087,0x00000006,0x00000003,0x0003001d,0x00000097,0x00000021,0x0003001e,
++	0x00000098,0x00000097,0x00040020,0x00000099,0x0000000c,0x00000098,0x0004003b,0x00000099,
++	0x0000009a,0x0000000c,0x0004002b,0x00000031,0x0000009d,0x00000002,0x00040020,0x000000a6,
++	0x0000000c,0x00000021,0x0004002b,0x00000021,0x000000a8,0x00000010,0x0006002c,0x00000025,
++	0x000000a9,0x000000a8,0x000000a8,0x0000003a,0x00050036,0x00000002,0x00000004,0x00000000,
++	0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000023,0x00000024,0x00000007,0x0004003b,
++	0x00000046,0x00000047,0x00000007,0x0004003b,0x00000046,0x0000004d,0x00000007,0x0004003b,
++	0x00000069,0x0000006a,0x00000007,0x0004003b,0x00000007,0x0000007a,0x00000007,0x0004003b,
++	0x00000007,0x0000007e,0x00000007,0x0004003b,0x00000007,0x00000082,0x00000007,0x0004003d,
++	0x00000025,0x00000028,0x00000027,0x0007004f,0x00000022,0x00000029,0x00000028,0x00000028,
++	0x00000000,0x00000001,0x0003003e,0x00000024,0x00000029,0x00050041,0x0000002b,0x0000002c,
++	0x00000024,0x0000002a,0x0004003d,0x00000021,0x0000002d,0x0000002c,0x00050041,0x00000033,
++	0x00000034,0x00000030,0x00000032,0x0004003d,0x00000021,0x00000035,0x00000034,0x000500ae,
++	0x0000000e,0x00000036,0x0000002d,0x00000035,0x000400a8,0x0000000e,0x00000037,0x00000036,
++	0x000300f7,0x00000039,0x00000000,0x000400fa,0x00000037,0x00000038,0x00000039,0x000200f8,
++	0x00000038,0x00050041,0x0000002b,0x0000003b,0x00000024,0x0000003a,0x0004003d,0x00000021,
++	0x0000003c,0x0000003b,0x00050041,0x00000033,0x0000003e,0x00000030,0x0000003d,0x0004003d,
++	0x00000021,0x0000003f,0x0000003e,0x000500ae,0x0000000e,0x00000040,0x0000003c,0x0000003f,
++	0x000200f9,0x00000039,0x000200f8,0x00000039,0x000700f5,0x0000000e,0x00000041,0x00000036,
++	0x00000005,0x00000040,0x00000038,0x000300f7,0x00000043,0x00000000,0x000400fa,0x00000041,
++	0x00000042,0x00000043,0x000200f8,0x00000042,0x000100fd,0x000200f8,0x00000043,0x00050041,
++	0x00000033,0x00000049,0x00000030,0x00000048,0x0004003d,0x00000021,0x0000004a,0x00000049,
++	0x000500c7,0x00000021,0x0000004b,0x0000004a,0x0000003a,0x000500ab,0x0000000e,0x0000004c,
++	0x0000004b,0x0000002a,0x000300f7,0x0000004f,0x00000000,0x000400fa,0x0000004c,0x0000004e,
++	0x0000005b,0x000200f8,0x0000004e,0x00050041,0x00000033,0x00000050,0x00000030,0x0000003d,
++	0x0004003d,0x00000021,0x00000051,0x00000050,0x00050082,0x00000021,0x00000052,0x00000051,
++	0x0000003a,0x00050041,0x0000002b,0x00000053,0x00000024,0x0000003a,0x0004003d,0x00000021,
++	0x00000054,0x00000053,0x00050082,0x00000021,0x00000055,0x00000052,0x00000054,0x0004007c,
++	0x00000031,0x00000056,0x00000055,0x00050041,0x0000002b,0x00000057,0x00000024,0x0000002a,
++	0x0004003d,0x00000021,0x00000058,0x00000057,0x0004007c,0x00000031,0x00000059,0x00000058,
++	0x00050050,0x00000045,0x0000005a,0x00000056,0x00000059,0x0003003e,0x0000004d,0x0000005a,
++	0x000200f9,0x0000004f,0x000200f8,0x0000005b,0x00050041,0x0000002b,0x0000005c,0x00000024,
++	0x0000003a,0x0004003d,0x00000021,0x0000005d,0x0000005c,0x0004007c,0x00000031,0x0000005e,
++	0x0000005d,0x00050041,0x00000033,0x0000005f,0x00000030,0x00000032,0x0004003d,0x00000021,
++	0x00000060,0x0000005f,0x00050082,0x00000021,0x00000061,0x00000060,0x0000003a,0x00050041,
++	0x0000002b,0x00000062,0x00000024,0x0000002a,0x0004003d,0x00000021,0x00000063,0x00000062,
++	0x00050082,0x00000021,0x00000064,0x00000061,0x00000063,0x0004007c,0x00000031,0x00000065,
++	0x00000064,0x00050050,0x00000045,0x00000066,0x0000005e,0x00000065,0x0003003e,0x0000004d,
++	0x00000066,0x000200f9,0x0000004f,0x000200f8,0x0000004f,0x0004003d,0x00000045,0x00000067,
++	0x0000004d,0x0003003e,0x00000047,0x00000067,0x0004003d,0x0000006c,0x0000006f,0x0000006e,
++	0x0004003d,0x00000045,0x00000070,0x00000047,0x00040064,0x0000006b,0x00000071,0x0000006f,
++	0x0007005f,0x00000068,0x00000072,0x00000071,0x00000070,0x00000002,0x0000003d,0x0003003e,
++	0x0000006a,0x00000072,0x00050041,0x00000033,0x00000073,0x00000030,0x00000048,0x0004003d,
++	0x00000021,0x00000074,0x00000073,0x000500c7,0x00000021,0x00000076,0x00000074,0x00000075,
++	0x000500ab,0x0000000e,0x00000077,0x00000076,0x0000002a,0x000300f7,0x00000079,0x00000000,
++	0x000400fa,0x00000077,0x00000078,0x00000079,0x000200f8,0x00000078,0x00050041,0x00000007,
++	0x0000007b,0x0000006a,0x0000002a,0x0004003d,0x00000006,0x0000007c,0x0000007b,0x0003003e,
++	0x0000007a,0x0000007c,0x00050039,0x00000006,0x0000007d,0x0000000a,0x0000007a,0x00050041,
++	0x00000007,0x0000007f,0x0000006a,0x0000003a,0x0004003d,0x00000006,0x00000080,0x0000007f,
++	0x0003003e,0x0000007e,0x00000080,0x00050039,0x00000006,0x00000081,0x0000000a,0x0000007e,
++	0x00050041,0x00000007,0x00000084,0x0000006a,0x00000083,0x0004003d,0x00000006,0x00000085,
++	0x00000084,0x0003003e,0x00000082,0x00000085,0x00050039,0x00000006,0x00000086,0x0000000a,
++	0x00000082,0x00060050,0x00000087,0x00000088,0x0000007d,0x00000081,0x00000086,0x00050041,
++	0x00000007,0x00000089,0x0000006a,0x0000002a,0x00050051,0x00000006,0x0000008a,0x00000088,
++	0x00000000,0x0003003e,0x00000089,0x0000008a,0x00050041,0x00000007,0x0000008b,0x0000006a,
++	0x0000003a,0x00050051,0x00000006,0x0000008c,0x00000088,0x00000001,0x0003003e,0x0000008b,
++	0x0000008c,0x00050041,0x00000007,0x0000008d,0x0000006a,0x00000083,0x00050051,0x00000006,
++	0x0000008e,0x00000088,0x00000002,0x0003003e,0x0000008d,0x0000008e,0x000200f9,0x00000079,
++	0x000200f8,0x00000079,0x00050041,0x00000033,0x0000008f,0x00000030,0x00000048,0x0004003d,
++	0x00000021,0x00000090,0x0000008f,0x000500c7,0x00000021,0x00000091,0x00000090,0x00000083,
++	0x000500ab,0x0000000e,0x00000092,0x00000091,0x0000002a,0x000300f7,0x00000094,0x00000000,
++	0x000400fa,0x00000092,0x00000093,0x00000094,0x000200f8,0x00000093,0x0004003d,0x00000068,
++	0x00000095,0x0000006a,0x0009004f,0x00000068,0x00000096,0x00000095,0x00000095,0x00000002,
++	0x00000001,0x00000000,0x00000003,0x0003003e,0x0000006a,0x00000096,0x000200f9,0x00000094,
++	0x000200f8,0x00000094,0x00050041,0x0000002b,0x0000009b,0x00000024,0x0000003a,0x0004003d,
++	0x00000021,0x0000009c,0x0000009b,0x00050041,0x00000033,0x0000009e,0x00000030,0x0000009d,
++	0x0004003d,0x00000021,0x0000009f,0x0000009e,0x00050084,0x00000021,0x000000a0,0x0000009c,
++	0x0000009f,0x00050041,0x0000002b,0x000000a1,0x00000024,0x0000002a,0x0004003d,0x00000021,
++	0x000000a2,0x000000a1,0x00050080,0x00000021,0x000000a3,0x000000a0,0x000000a2,0x0004003d,
++	0x00000068,0x000000a4,0x0000006a,0x0006000c,0x00000021,0x000000a5,0x00000001,0x00000037,
++	0x000000a4,0x00060041,0x000000a6,0x000000a7,0x0000009a,0x0000003d,0x000000a3,0x0003003e,
++	0x000000a7,0x000000a5,0x000100fd,0x00010038,0x00050036,0x00000006,0x0000000a,0x00000000,
++	0x00000008,0x00030037,0x00000007,0x00000009,0x000200f8,0x0000000b,0x0004003b,0x00000007,
++	0x00000010,0x00000007,0x0004003d,0x00000006,0x0000000c,0x00000009,0x000500bc,0x0000000e,
++	0x0000000f,0x0000000c,0x0000000d,0x000300f7,0x00000012,0x00000000,0x000400fa,0x0000000f,
++	0x00000011,0x00000016,0x000200f8,0x00000011,0x0004003d,0x00000006,0x00000013,0x00000009,
++	0x00050085,0x00000006,0x00000015,0x00000013,0x00000014,0x0003003e,0x00000010,0x00000015,
++	0x000200f9,0x00000012,0x000200f8,0x00000016,0x0004003d,0x00000006,0x00000018,0x00000009,
++	0x0007000c,0x00000006,0x0000001a,0x00000001,0x0000001a,0x00000018,0x00000019,0x00050085,
++	0x00000006,0x0000001b,0x00000017,0x0000001a,0x00050083,0x00000006,0x0000001d,0x0000001b,
++	0x0000001c,0x0003003e,0x00000010,0x0000001d,0x000200f9,0x00000012,0x000200f8,0x00000012,
++	0x0004003d,0x00000006,0x0000001e,0x00000010,0x000200fe,0x0000001e,0x00010038
++};

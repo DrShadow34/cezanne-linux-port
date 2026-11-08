@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.cezanne-notification-led"
+          path="/org/gnome/shell/extensions/cezanne-notification-led/">
+    <key name="notification-color" type="s">
+      <default>'#0000ff'</default>
+      <summary>Notification colour for apps without their own (#rrggbb)</summary>
+    </key>
+    <key name="app-colors" type="a{ss}">
+      <default>{}</default>
+      <summary>Notification colour per app (desktop ID without .desktop → #rrggbb)</summary>
+    </key>
+    <key name="vibrate" type="b">
+      <default>true</default>
+      <summary>Vibrate on new notifications (feedbackd)</summary>
+    </key>
+    <key name="battery-light" type="b">
+      <default>true</default>
+      <summary>Red while charging, green when charged on the charger</summary>
+    </key>
+    <key name="charged-percentage" type="i">
+      <range min="50" max="100"/>
+      <default>95</default>
+      <summary>Battery level shown as charged (green)</summary>
+    </key>
+  </schema>
+</schemalist>

@@ -1,0 +1,113 @@
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 87a822e5c..da29aa3fc 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -85,6 +85,11 @@
+ SYM_CODE_START(primary_entry)
+ 	bl	record_mmu_state
+ 	bl	preserve_boot_args
++#ifdef CONFIG_SERIAL_EARLYCON
++	/* cezanne bring-up: MMU still off, mark entry in the ramlog buffer */
++	adr	x0, .Lramlog_head_msg
++	bl	ramlog_mark_phys
++#endif
+ 
+ 	adrp	x1, early_init_stack
+ 	mov	sp, x1
+@@ -131,6 +136,27 @@ SYM_CODE_START(primary_entry)
+ SYM_CODE_END(primary_entry)
+ 
+ 	__INIT
++#ifdef CONFIG_SERIAL_EARLYCON
++/* append NUL-terminated x0 to the ramoops console buffer at 0x4d05f000 (MMU off) */
++SYM_CODE_START_LOCAL(ramlog_mark_phys)
++	mov_q	x1, 0x4d05f000
++	ldr	w2, [x1, #8]
++	add	x3, x1, #12
++	add	x3, x3, x2
++1:	ldrb	w4, [x0], #1
++	cbz	w4, 2f
++	strb	w4, [x3], #1
++	add	w2, w2, #1
++	b	1b
++2:	str	w2, [x1, #8]
++	dsb	sy
++	ret
++SYM_CODE_END(ramlog_mark_phys)
++.Lramlog_head_msg:
++	.asciz	"K: head.S primary_entry (MMU off)\n"
++	.balign	4
++#endif
++
+ SYM_CODE_START_LOCAL(record_mmu_state)
+ 	mrs	x19, CurrentEL
+ 	cmp	x19, #CurrentEL_EL2
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 29c6100f0..feeb67fac 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -27,6 +27,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/memblock.h>
+ #include <linux/of_fdt.h>
++#include <linux/libfdt.h>
+ #include <linux/efi.h>
+ #include <linux/psci.h>
+ #include <linux/sched/task.h>
+@@ -278,6 +279,21 @@ u64 cpu_logical_map(unsigned int cpu)
+ 	return __cpu_logical_map[cpu];
+ }
+ 
++/* cezanne bring-up: progress markers before any console exists */
++static void __init cezanne_ramlog_mark(const char *msg)
++{
++	u8 __iomem *b = early_ioremap(0x4d05f000, PAGE_SIZE * 16);
++	u32 size;
++
++	if (!b)
++		return;
++	size = readl(b + 8);
++	while (*msg && size < PAGE_SIZE * 16 - 13)
++		writeb(*msg++, b + 12 + size++);
++	writel(size, b + 8);
++	early_iounmap(b, PAGE_SIZE * 16);
++}
++
+ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ {
+ 	setup_initial_init_mm(_text, _etext, _edata, _end);
+@@ -288,15 +304,34 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 
+ 	early_fixmap_init();
+ 	early_ioremap_init();
++	cezanne_ramlog_mark("K: setup_arch, early_ioremap ready\n");
+ 
+ 	setup_machine_fdt(__fdt_pointer);
++	cezanne_ramlog_mark("K: setup_machine_fdt ok\n");
++	{
++		const void *fdt = initial_boot_params;
++		char buf[160];
++		int node = fdt ? fdt_path_offset(fdt, "/chosen") : -1, l = 0;
++		const char *ba = node >= 0 ? fdt_getprop(fdt, node, "bootargs", &l) : NULL;
++
++		snprintf(buf, sizeof(buf), "K: fdt@%px size=%u model=%s chosen=%d bootargs_len=%d\n",
++			 fdt, fdt ? fdt_totalsize(fdt) : 0,
++			 fdt ? (char *)of_get_flat_dt_prop(of_get_flat_dt_root(), "model", NULL) : "?",
++			 node, l);
++		cezanne_ramlog_mark(buf);
++		cezanne_ramlog_mark("K: cmdline: ");
++		cezanne_ramlog_mark(boot_command_line);
++		cezanne_ramlog_mark("\n");
++	}
+ 
+ 	/*
+ 	 * Initialise the static keys early as they may be enabled by the
+ 	 * cpufeature code and early parameters.
+ 	 */
+ 	jump_label_init();
++	cezanne_ramlog_mark("K: jump_label_init ok\n");
+ 	parse_early_param();
++	cezanne_ramlog_mark("K: parse_early_param ok\n");
+ 
+ 	dynamic_scs_init();
+ 

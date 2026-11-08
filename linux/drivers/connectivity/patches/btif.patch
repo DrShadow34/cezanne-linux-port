@@ -1,0 +1,260 @@
+diff --git a/Kbuild b/Kbuild
+new file mode 100644
+index 0000000..249e197
+--- /dev/null
++++ b/Kbuild
+@@ -0,0 +1,8 @@
++# MediaTek BTIF (AP <-> CONNSYS BT serial link) from the 4.14 BSP, built out of tree
++KO_PATH := $(M)
++ccflags-y += -I$(KO_PATH)/common/inc -I$(KO_PATH)/common/plat_inc
++ccflags-y += -include $(KO_PATH)/../compat/include/compat_mainline.h -I$(KO_PATH)/../compat/include
++ccflags-y += -D BTIF_DBG_SUPPORT=0
++ccflags-y += -include $(KO_PATH)/compat_btif.h
++obj-m += mtk_btif.o
++mtk_btif-y := common/mtk_btif.o common/mtk_btif_exp.o common/btif_dma_plat.o common/btif_plat.o
+diff --git a/Makefile b/Makefile
+deleted file mode 100644
+index 1871b16..0000000
+--- a/Makefile
++++ /dev/null
+@@ -1,38 +0,0 @@
+-#
+-# Copyright (C) 2015 MediaTek Inc.
+-#
+-# This program is free software: you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License version 2 as
+-# published by the Free Software Foundation.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-# GNU General Public License for more details.
+-#
+-
+-# BTIF driver for AD DIE
+-# If KERNELRELEASE is defined, we've been invoked from the
+-# kernel build system and can use its language.
+-ifneq ($(KERNELRELEASE),)
+-	#subdir-ccflags-y can be used in 2.6.34 in the future
+-	MTK_PLATFORM := $(subst ",,$(CONFIG_MTK_PLATFORM))
+-	subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/mt-plat/$(MTK_PLATFORM)/include
+-	subdir-ccflags-y += -I$(srctree)/arch/arm/mach-$(MTK_PLATFORM)/include/mach
+-	subdir-ccflags-y += -I$(srctree)/drivers/misc/mediatek/include/mt-plat
+-
+-    obj-y += common/
+-ifeq ($(CONFIG_MTK_ENG_BUILD), y)
+-	subdir-ccflags-y += -D BTIF_DBG_SUPPORT=1
+-else
+-	subdir-ccflags-y += -D BTIF_DBG_SUPPORT=0
+-endif
+-
+-# Otherwise we were called directly from the command
+-# line; invoke the kernel build system.
+-else
+-    KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+-    PWD  := $(shell pwd)
+-default:
+-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+-endif
+diff --git a/common/Makefile b/common/Makefile
+deleted file mode 100644
+index 61e9d4e..0000000
+--- a/common/Makefile
++++ /dev/null
+@@ -1,31 +0,0 @@
+-#
+-# Copyright (C) 2015 MediaTek Inc.
+-#
+-# This program is free software: you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License version 2 as
+-# published by the Free Software Foundation.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-# GNU General Public License for more details.
+-#
+-
+-# BTIF driver for AD DIE
+-# If KERNELRELEASE is defined, we've been invoked from the
+-# kernel build system and can use its language.
+-ifneq ($(KERNELRELEASE),)
+-	ccflags-y += -I$(src)/inc
+-	ccflags-y += -I$(src)/plat_inc
+-
+-	obj-y += btif.o
+-	btif-y	:= mtk_btif.o mtk_btif_exp.o btif_dma_plat.o btif_plat.o
+-
+-# Otherwise we were called directly from the command
+-# line; invoke the kernel build system.
+-else
+-    KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+-    PWD  := $(shell pwd)
+-default:
+-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+-endif
+diff --git a/common/inc/mtk_btif.h b/common/inc/mtk_btif.h
+index 8d961b9..6030ac4 100644
+--- a/common/inc/mtk_btif.h
++++ b/common/inc/mtk_btif.h
+@@ -391,4 +391,5 @@ int btif_rx_buf_has_pending_data(struct _mtk_btif_ *p_btif);
+ int btif_rx_dma_has_pending_data(struct _mtk_btif_ *p_btif);
+ int btif_tx_dma_has_pending_data(struct _mtk_btif_ *p_btif);
+ struct task_struct *btif_rx_thread_get(struct _mtk_btif_ *p_btif);
++bool _btif_is_tx_complete(struct _mtk_btif_ *p_btif);
+ #endif /*__MTK_BTIF_H_*/
+diff --git a/common/inc/mtk_btif_exp.h b/common/inc/mtk_btif_exp.h
+index 5e65483..a093e75 100644
+--- a/common/inc/mtk_btif_exp.h
++++ b/common/inc/mtk_btif_exp.h
+@@ -39,6 +39,7 @@ enum _ENUM_BTIF_DBG_ID_ {
+ 	BTIF_ENABLE_RT_LOG = BTIF_DUMP_BTIF_REG + 1,
+ 	BTIF_DISABLE_RT_LOG = BTIF_ENABLE_RT_LOG + 1,
+ 	BTIF_DUMP_BTIF_IRQ = BTIF_DISABLE_RT_LOG + 1,
++	BTIF_DUMP_DMA_VFIFO = BTIF_DUMP_BTIF_IRQ + 1,	/* newer BT driver; dumps regs here */
+ 	BTIF_DBG_MAX,
+ };
+ 
+@@ -244,6 +245,9 @@ int mtk_wcn_btif_loopback_ctrl(unsigned long u_id,
+  *        please see ENUM_BTIF_OP_ERROR_CODE
+  *****************************************************************************/
+ int mtk_wcn_btif_dbg_ctrl(unsigned long u_id, enum _ENUM_BTIF_DBG_ID_ flag);
++
++/* newer BT driver API: 1 when BTIF (and its TX DMA) sent everything */
++int mtk_btif_is_tx_complete(unsigned long u_id);
+ /*-----------End of Debug Purpose API declearation------------*/
+ 
+ /*****************************************************************************
+diff --git a/common/mtk_btif.c b/common/mtk_btif.c
+index 89d691f..bd721e7 100644
+--- a/common/mtk_btif.c
++++ b/common/mtk_btif.c
+@@ -47,7 +47,7 @@
+ 
+ /*-----------static function declearation----------------*/
+ static int mtk_btif_probe(struct platform_device *pdev);
+-static int mtk_btif_remove(struct platform_device *pdev);
++static void mtk_btif_remove(struct platform_device *pdev);
+ static int mtk_btif_suspend(struct platform_device *pdev, pm_message_t state);
+ static int mtk_btif_resume(struct platform_device *pdev);
+ static int mtk_btif_drv_resume(struct device *dev);
+@@ -141,7 +141,7 @@ static int _btif_vfifo_deinit(struct _mtk_btif_dma_ *p_dma);
+ static int _btif_vfifo_init(struct _mtk_btif_dma_ *p_dma);
+ #endif
+ 
+-static bool _btif_is_tx_complete(struct _mtk_btif_ *p_btif);
++bool _btif_is_tx_complete(struct _mtk_btif_ *p_btif);
+ static int _btif_init(struct _mtk_btif_ *p_btif);
+ static int _btif_lpbk_ctrl(struct _mtk_btif_ *p_btif, bool flag);
+ static int btif_rx_dma_mode_set(int en);
+@@ -270,13 +270,13 @@ static int mtk_btif_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static int mtk_btif_remove(struct platform_device *pdev)
++static void mtk_btif_remove(struct platform_device *pdev)
+ {
+ /*Chaozhong: ToDo: to be implement*/
+ 	BTIF_INFO_FUNC("DO BTIF REMOVE\n");
+ 	platform_set_drvdata(pdev, NULL);
+ 	g_btif[0].private_data = NULL;
+-	return 0;
++	return;
+ }
+ 
+ int _btif_suspend(struct _mtk_btif_ *p_btif)
+@@ -522,7 +522,7 @@ static int btif_chrdev_init(void)
+ 	}
+ 	BTIF_INFO_FUNC("add btif dev to kernel succeed\n");
+ 
+-	p_btif_class = class_create(THIS_MODULE, p_btif_dev_name);
++	p_btif_class = class_create(p_btif_dev_name);
+ 	if (IS_ERR(p_btif_class)) {
+ 		BTIF_ERR_FUNC("error happened when doing class_create\n");
+ 		unregister_chrdev_region(btif_dev, 1);
+@@ -2560,12 +2560,9 @@ static int _btif_rx_btm_init(struct _mtk_btif_ *p_btif)
+ #if ENABLE_BTIF_RX_THREAD_RT_SCHED
+ 		{
+ 			int i_ret = -1;
+-			int policy = SCHED_FIFO;
+-			struct sched_param param;
+-
+-			param.sched_priority = MAX_RT_PRIO - 20;
+-			i_ret = sched_setscheduler(p_btif->p_task, policy,
+-					&param);
++			/* sched_setscheduler() is not exported any more */
++			sched_set_fifo(p_btif->p_task);
++			i_ret = 0;
+ 			if (i_ret != 0)
+ 				BTIF_WARN_FUNC("set RT to workqueue failed\n");
+ 			else
+diff --git a/common/mtk_btif_exp.c b/common/mtk_btif_exp.c
+index 1e86523..b47bd3d 100644
+--- a/common/mtk_btif_exp.c
++++ b/common/mtk_btif_exp.c
+@@ -477,6 +477,7 @@ int mtk_wcn_btif_dbg_ctrl(unsigned long u_id, enum _ENUM_BTIF_DBG_ID_ flag)
+ 		}
+ 		break;
+ 	case BTIF_DUMP_BTIF_REG:
++	case BTIF_DUMP_DMA_VFIFO:
+ 		btif_dump_reg(p_btif, REG_ALL);
+ 		break;
+ 	case BTIF_DUMP_BTIF_IRQ:
+@@ -643,6 +644,7 @@ int btif_dbg_ctrl_no_id(enum _ENUM_BTIF_DBG_ID_ flag)
+ 		}
+ 		break;
+ 	case BTIF_DUMP_BTIF_REG:
++	case BTIF_DUMP_DMA_VFIFO:
+ 		btif_dump_reg(p_btif, REG_ALL);
+ 		break;
+ 	case BTIF_DUMP_BTIF_IRQ:
+@@ -857,3 +859,13 @@ struct task_struct *mtk_btif_exp_rx_thread_get(unsigned long u_id)
+ EXPORT_SYMBOL(mtk_btif_exp_rx_thread_get);
+ 
+ /************End of Function**********/
++
++int mtk_btif_is_tx_complete(unsigned long u_id)
++{
++	struct _mtk_btif_ *p_btif = btif_exp_srh_id(u_id);
++
++	if (p_btif == NULL)
++		return E_BTIF_INVAL_PARAM;
++	return _btif_is_tx_complete(p_btif) ? 1 : 0;
++}
++EXPORT_SYMBOL(mtk_btif_is_tx_complete);
+diff --git a/compat_btif.h b/compat_btif.h
+new file mode 100644
+index 0000000..dce5838
+--- /dev/null
++++ b/compat_btif.h
+@@ -0,0 +1,30 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* 4.14 -> mainline shims for the MediaTek BTIF driver (force-included) */
++#ifndef COMPAT_BTIF_H
++#define COMPAT_BTIF_H
++#include <linux/time64.h>
++#include <linux/timekeeping.h>
++#include <linux/dma-mapping.h>
++
++/* timestamps are only used for debug logs */
++struct timeval {
++	long tv_sec;
++	long tv_usec;
++};
++static inline void do_gettimeofday(struct timeval *tv)
++{
++	struct timespec64 ts;
++
++	ktime_get_real_ts64(&ts);
++	tv->tv_sec = ts.tv_sec;
++	tv->tv_usec = ts.tv_nsec / NSEC_PER_USEC;
++}
++#define timespec timespec64
++#define ktime_to_timespec ktime_to_timespec64
++
++#define dma_zalloc_coherent dma_alloc_coherent
++/* RX vFIFO is dma_alloc_coherent memory: no cache maintenance needed */
++#define __dma_unmap_area(p, len, dir) do { } while (0)
++/* TX copies into the coherent vFIFO; the flushed source buffer is never DMA-read */
++#define __dma_flush_area(p, len) do { } while (0)
++#endif

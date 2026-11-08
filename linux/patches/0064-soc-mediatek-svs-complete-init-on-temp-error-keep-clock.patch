@@ -1,0 +1,45 @@
+diff --git a/drivers/soc/mediatek/mtk-svs.c b/drivers/soc/mediatek/mtk-svs.c
+index d92ef13d5..237a784c7 100644
+--- a/drivers/soc/mediatek/mtk-svs.c
++++ b/drivers/soc/mediatek/mtk-svs.c
+@@ -1417,6 +1417,7 @@ static irqreturn_t svs_isr(int irq, void *data)
+ 	struct svs_bank *svsb = NULL;
+ 	unsigned long flags;
+ 	u32 idx, int_sts, svs_en;
++	bool init;
+ 
+ 	for (idx = 0; idx < svsp->bank_max; idx++) {
+ 		svsb = &svsp->banks[idx];
+@@ -1450,10 +1451,17 @@ static irqreturn_t svs_isr(int irq, void *data)
+ 		break;
+ 	}
+ 
++	/*
++	 * A failed zone temperature read turns the phase into an error (default
++	 * volts) here: complete the init anyway, the waiter would only time out
++	 * (5 s stuck in resume) and fail.
++	 */
++	init = svsb->phase == SVSB_PHASE_INIT01 ||
++	       svsb->phase == SVSB_PHASE_INIT02;
++
+ 	svs_adjust_pm_opp_volts(svsb);
+ 
+-	if (svsb->phase == SVSB_PHASE_INIT01 ||
+-	    svsb->phase == SVSB_PHASE_INIT02)
++	if (init)
+ 		complete(&svsb->init_completion);
+ 
+ 	return IRQ_HANDLED;
+@@ -1892,7 +1900,11 @@ static int svs_resume(struct device *dev)
+ 		reset_control_assert(svsp->rst));
+ 
+ out_of_resume:
+-	clk_disable_unprepare(svsp->main_clk);
++	/*
++	 * The PM core suspends the device again after a failed resume; keep
++	 * main_clk on for svs_suspend's disable. Dropping it here unbalanced
++	 * the clock shared with LVTS (gated under it at the next suspend).
++	 */
+ 	return ret;
+ }
+ 

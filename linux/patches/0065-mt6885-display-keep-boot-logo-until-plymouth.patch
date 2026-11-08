@@ -1,0 +1,174 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index c982e7130..e833e228e 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -1108,6 +1108,14 @@ static int mtk_dsi_encoder_init(struct drm_device *drm, struct mtk_dsi *dsi)
+ 		ret = PTR_ERR(dsi->connector);
+ 		goto err_cleanup_encoder;
+ 	}
++	/*
++	 * A DSI bridge connector is always connected. Starting out "unknown",
++	 * the fbdev client's first probe would see a status change, and the
++	 * hotplug event it fires makes fbdev commit its (black) framebuffer
++	 * even while fbcon defers its take-over: lk's boot logo went black
++	 * ~2 s before Plymouth drew.
++	 */
++	dsi->connector->status = connector_status_connected;
+ 
+ 	/* what userspace (mutter) needs to offer HDR on a panel with an HDR EDID */
+ 	if (dsi->driver_data->hdr) {
+@@ -1404,7 +1412,12 @@ static void mtk_dsi_cmdq(struct mtk_dsi *dsi, const struct mipi_dsi_msg *msg)
+ 	else
+ 		config = (msg->tx_len > 2) ? LONG_PACKET : SHORT_PACKET;
+ 
+-	if (!(msg->flags & MIPI_DSI_MSG_USE_LPM))
++	/*
++	 * HS needs the clock lane in HS, and in command mode it only goes HS in
++	 * the bridge enable, after the panel init in LP: an HS packet before
++	 * that never leaves (2 s timeout, the panel init failed). Send it in LP.
++	 */
++	if (!(msg->flags & MIPI_DSI_MSG_USE_LPM) && mtk_dsi_clk_hs_state(dsi))
+ 		config |= HSTX;
+ 
+ 	if (msg->tx_len > 2) {
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+index 6f4356e4d..8d13d90c2 100644
+--- a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+@@ -42,6 +42,7 @@ struct j10_panel {
+ 	struct gpio_desc *bias_gpio;
+ 	struct drm_dsc_config dsc;
+ 	bool powered;
++	bool lk_on;	/* until the first power-on: lk may have left it on (j10_power_on) */
+ 	bool high_refresh;
+ 	bool just_on;	/* powered on in this commit: init sent 0x60 */
+ 	/* HDR (PQ) output: high brightness mode at full level, the pipeline
+@@ -117,14 +118,17 @@ static void j10_set_refresh(struct mipi_dsi_multi_context *dsi_ctx, bool high)
+ 	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, cmd, sizeof(cmd));
+ }
+ 
+-static int j10_on(struct j10_panel *ctx)
++/* warm: the panel is on (lk's boot logo) and keeps showing its frame memory */
++static int j10_on(struct j10_panel *ctx, bool warm)
+ {
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+ 
+ 	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+ 
+-	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
+-	mipi_dsi_msleep(&dsi_ctx, 10);
++	if (!warm) {
++		mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
++		mipi_dsi_msleep(&dsi_ctx, 10);
++	}
+ 	/* TE on */
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_ON, 0x00);
+ 	/*
+@@ -221,11 +225,12 @@ static int j10_on(struct j10_panel *ctx)
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x13);
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+-	/* HBM off, backlight 0 until the backlight device sets it */
++	/* HBM off, backlight 0 until the backlight device sets it (warm: lk's) */
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+ 				     0x20, 0x00);
+-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
+-				     0x00, 0x00);
++	if (!warm)
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
++					     0x00, 0x00);
+ 
+ 	/* ACL off */
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+@@ -252,7 +257,8 @@ static int j10_on(struct j10_panel *ctx)
+ 				     0xd7, 0x00, 0xff, 0xff, 0xff);
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+ 
+-	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
++	if (!warm)
++		mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
+ 
+ 	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+ 	return dsi_ctx.accum_err;
+@@ -317,15 +323,31 @@ static void j10_color_apply(struct j10_panel *ctx)
+ 
+ static int j10_power_on(struct j10_panel *ctx)
+ {
++	bool warm = false;
++	u8 mode;
+ 	int ret;
+ 
+ 	ret = regulator_enable(ctx->vci);
+ 	if (ret)
+ 		return ret;
+ 	gpiod_set_value_cansleep(ctx->bias_gpio, 1);
+-	j10_reset(ctx);
++	/*
++	 * First power-on after boot: lk left the panel initialised, showing
++	 * its boot logo. A reset blanked it for ~0.2 s before the first frame
++	 * (Plymouth); awake and on (0x9c, as after our init), take it over
++	 * without one.
++	 */
++	if (ctx->lk_on) {
++		ctx->lk_on = false;
++		ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++		warm = !mipi_dsi_dcs_get_power_mode(ctx->dsi, &mode) && mode == 0x9c;
++		if (warm)
++			dev_info(&ctx->dsi->dev, "taking over the panel from lk\n");
++	}
++	if (!warm)
++		j10_reset(ctx);
+ 
+-	ret = j10_on(ctx);
++	ret = j10_on(ctx, warm);
+ 	if (ret < 0) {
+ 		dev_err(&ctx->dsi->dev, "panel init failed: %d\n", ret);
+ 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+@@ -686,8 +708,15 @@ static void j10_bridge_pre_enable(struct drm_bridge *bridge,
+ 
+ 	ctx->high_refresh = j10_high_refresh(bridge, state);
+ 	ctx->hdr = j10_hdr_pq(bridge, state);
++	/*
++	 * Under the lock: no backlight or sysfs DCS write between the init
++	 * commands (a brightness write from systemd-backlight during the OFC
++	 * sleep went out in HS and the init failed).
++	 */
++	mutex_lock(&ctx->lock);
+ 	if (!ctx->powered)
+ 		j10_power_on(ctx);
++	mutex_unlock(&ctx->lock);
+ }
+ 
+ static void j10_bridge_enable(struct drm_bridge *bridge,
+@@ -725,8 +754,10 @@ static void j10_bridge_post_disable(struct drm_bridge *bridge,
+ 	struct j10_panel *ctx = to_j10_panel(bridge);
+ 
+ 	/* in doze the panel keeps showing its frame memory */
++	mutex_lock(&ctx->lock);
+ 	if (ctx->powered && !ctx->doze && !j10_crtc_stays_on(bridge, state))
+ 		j10_power_off(ctx);
++	mutex_unlock(&ctx->lock);
+ }
+ 
+ static int j10_bridge_get_modes(struct drm_bridge *bridge,
+@@ -770,9 +801,10 @@ static int j10_bl_update_status(struct backlight_device *bl)
+ 	mutex_lock(&ctx->lock);
+ 	/*
+ 	 * HBM (sunlight boost, FOD spot, HDR) holds the panel at its peak; the
+-	 * level is applied when it ends (j10_hbm_apply).
++	 * level is applied when it ends (j10_hbm_apply). A panel that is off
++	 * gets it from the bridge enable (backlight_enable).
+ 	 */
+-	if (j10_hbm_wanted(ctx) == J10_HBM_OFF && !ctx->doze) {
++	if (ctx->powered && j10_hbm_wanted(ctx) == J10_HBM_OFF && !ctx->doze) {
+ 		dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+ 		j10_set_brightness(ctx, &dsi_ctx, brightness);
+ 	}
+@@ -1029,6 +1061,7 @@ static int j10_probe(struct mipi_dsi_device *dsi)
+ 		return dev_err_probe(dev, PTR_ERR(ctx->bias_gpio), "bias gpio\n");
+ 
+ 	ctx->dsi = dsi;
++	ctx->lk_on = true;
+ 	mipi_dsi_set_drvdata(dsi, ctx);
+ 	ret = devm_mutex_init(dev, &ctx->lock);
+ 	if (ret)

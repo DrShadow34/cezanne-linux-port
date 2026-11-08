@@ -1,0 +1,31 @@
+# Meson cross file for Mesa built on the phone (aarch64) for the x86 guest
+# root of FEX: clang / lld with the guest root as sysroot. Filled in by the
+# PKGBUILD: @TRIPLE@ @SYSROOT@ @LIBDIR@ @FAMILY@ @CPU@ @MARCH@. makepkg's
+# CFLAGS are the phone's (-march=armv8-a): unset for these builds, the x86
+# ones are here.
+[binaries]
+c = ['clang', '--target=@TRIPLE@', '--sysroot=@SYSROOT@']
+cpp = ['clang++', '--target=@TRIPLE@', '--sysroot=@SYSROOT@']
+c_ld = 'lld'
+cpp_ld = 'lld'
+ar = 'llvm-ar'
+nm = 'llvm-nm'
+strip = 'llvm-strip'
+objcopy = 'llvm-objcopy'
+pkg-config = 'pkg-config'
+
+[built-in options]
+c_args = ['-march=@MARCH@', '-O2', '-pipe', '-fno-plt', '-fstack-protector-strong']
+cpp_args = ['-march=@MARCH@', '-O2', '-pipe', '-fno-plt', '-fstack-protector-strong']
+c_link_args = ['-Wl,-O1', '-Wl,--as-needed', '-Wl,-z,relro', '-Wl,-z,now']
+cpp_link_args = ['-Wl,-O1', '-Wl,--as-needed', '-Wl,-z,relro', '-Wl,-z,now']
+
+[properties]
+sys_root = '@SYSROOT@'
+pkg_config_libdir = ['@SYSROOT@/usr/@LIBDIR@/pkgconfig', '@SYSROOT@/usr/share/pkgconfig']
+
+[host_machine]
+system = 'linux'
+cpu_family = '@FAMILY@'
+cpu = '@CPU@'
+endian = 'little'

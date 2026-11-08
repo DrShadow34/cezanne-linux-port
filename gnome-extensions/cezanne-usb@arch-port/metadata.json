@@ -1,0 +1,7 @@
+{
+  "uuid": "cezanne-usb@arch-port",
+  "name": "Cezanne USB",
+  "description": "Asks what a computer on the USB-C port is for: video stream (webcam), data storage (MTP), developer network or charge only (Redmi K30 Ultra port)",
+  "shell-version": ["51"],
+  "session-modes": ["user", "unlock-dialog"]
+}

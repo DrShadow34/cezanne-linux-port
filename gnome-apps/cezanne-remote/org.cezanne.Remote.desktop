@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Remote Control
+Comment=Control TVs and air conditioners with the IR blaster
+Exec=cezanne-remote
+Icon=org.cezanne.Remote
+Terminal=false
+Type=Application
+Categories=Utility;
+Keywords=IR;infrared;TV;remote;air;conditioner;AC;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

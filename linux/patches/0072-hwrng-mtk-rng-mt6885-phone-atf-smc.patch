@@ -1,0 +1,137 @@
+diff --git a/Documentation/devicetree/bindings/rng/mtk-rng.yaml b/Documentation/devicetree/bindings/rng/mtk-rng.yaml
+--- a/Documentation/devicetree/bindings/rng/mtk-rng.yaml
++++ b/Documentation/devicetree/bindings/rng/mtk-rng.yaml
+@@ -16,6 +16,7 @@ properties:
+   compatible:
+     oneOf:
+       - enum:
++          - mediatek,mt6885-rng
+           - mediatek,mt7623-rng
+           - mediatek,mt7981-rng
+       - items:
+@@ -50,7 +51,9 @@ allOf:
+       properties:
+         compatible:
+           contains:
+-            const: mediatek,mt7981-rng
++            enum:
++              - mediatek,mt6885-rng
++              - mediatek,mt7981-rng
+     then:
+       properties:
+         reg: false
+diff --git a/drivers/char/hw_random/mtk-rng.c b/drivers/char/hw_random/mtk-rng.c
+--- a/drivers/char/hw_random/mtk-rng.c
++++ b/drivers/char/hw_random/mtk-rng.c
+@@ -35,8 +35,13 @@
+ 
+ /* Driver feature flags */
+ #define MTK_RNG_SMC			BIT(0)
++/* the phone BSP's ATF call (MT6885): 16 bytes a call in a0..a3, no status */
++#define MTK_RNG_SMC_PHONE		BIT(1)
++#define MTK_RNG_SMC_ANY			(MTK_RNG_SMC | MTK_RNG_SMC_PHONE)
+ 
+ #define MTK_SIP_KERNEL_GET_RND		MTK_SIP_SMC_CMD(0x550)
++#define MTK_SIP_KERNEL_GET_RND_PHONE	MTK_SIP_SMC_CMD(0x26a)
++#define MTK_RNG_PHONE_MAGIC		0x74726e67	/* "trng" */
+ 
+ #define to_mtk_rng(p)	container_of(p, struct mtk_rng, rng)
+ 
+@@ -133,6 +138,57 @@ static int mtk_rng_read_smc(struct hwrng *rng, void *buf, size_t max,
+ 	return retval || !wait ? retval : -EIO;
+ }
+ 
++static void mtk_rng_smc_phone(u32 val[4])
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(MTK_SIP_KERNEL_GET_RND_PHONE, MTK_RNG_PHONE_MAGIC,
++		      0, 0, 0, 0, 0, 0, &res);
++	val[0] = res.a0;
++	val[1] = res.a1;
++	val[2] = res.a2;
++	val[3] = res.a3;
++}
++
++static int mtk_rng_read_smc_phone(struct hwrng *rng, void *buf, size_t max,
++				  bool wait)
++{
++	u32 val[4];
++	int retval = 0;
++
++	while (max >= sizeof(u32)) {
++		size_t n = min(max, sizeof(val)) & ~(sizeof(u32) - 1);
++
++		mtk_rng_smc_phone(val);
++		memcpy(buf, val, n);
++		buf += n;
++		max -= n;
++		retval += n;
++	}
++	memzero_explicit(val, sizeof(val));
++
++	return retval;
++}
++
++/*
++ * The call returns no status: firmware without it answers
++ * SMCCC_RET_NOT_SUPPORTED in a0 (the rest left as passed), so two calls
++ * must differ.
++ */
++static bool mtk_rng_smc_phone_works(void)
++{
++	u32 a[4], b[4];
++	bool ok;
++
++	mtk_rng_smc_phone(a);
++	mtk_rng_smc_phone(b);
++	ok = a[0] != (u32)SMCCC_RET_NOT_SUPPORTED && memcmp(a, b, sizeof(a));
++	memzero_explicit(a, sizeof(a));
++	memzero_explicit(b, sizeof(b));
++
++	return ok;
++}
++
+ static bool mtk_rng_hw_accessible(struct mtk_rng *priv)
+ {
+ 	u32 val;
+@@ -176,7 +232,7 @@ static int mtk_rng_probe(struct platform_device *pdev)
+ 	priv->rng.quality = 900;
+ 	priv->flags = (unsigned long)device_get_match_data(&pdev->dev);
+ 
+-	if (!(priv->flags & MTK_RNG_SMC)) {
++	if (!(priv->flags & MTK_RNG_SMC_ANY)) {
+ 		priv->clk = devm_clk_get(&pdev->dev, "rng");
+ 		if (IS_ERR(priv->clk)) {
+ 			ret = PTR_ERR(priv->clk);
+@@ -198,7 +254,12 @@ static int mtk_rng_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
+-	if (priv->flags & MTK_RNG_SMC) {
++	if (priv->flags & MTK_RNG_SMC_PHONE) {
++		if (!IS_ENABLED(CONFIG_HAVE_ARM_SMCCC) || !mtk_rng_smc_phone_works())
++			return dev_err_probe(&pdev->dev, -ENODEV,
++					     "no RNG call in the firmware\n");
++		priv->rng.read = mtk_rng_read_smc_phone;
++	} else if (priv->flags & MTK_RNG_SMC) {
+ 		if (!IS_ENABLED(CONFIG_HAVE_ARM_SMCCC))
+ 			return -ENODEV;
+ 		priv->rng.read = mtk_rng_read_smc;
+@@ -217,7 +278,7 @@ static int mtk_rng_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	if (!(priv->flags & MTK_RNG_SMC)) {
++	if (!(priv->flags & MTK_RNG_SMC_ANY)) {
+ 		dev_set_drvdata(&pdev->dev, priv);
+ 		pm_runtime_set_autosuspend_delay(&pdev->dev,
+ 						 RNG_AUTOSUSPEND_TIMEOUT);
+@@ -262,6 +323,7 @@ static const struct dev_pm_ops mtk_rng_pm_ops = {
+ #endif	/* CONFIG_PM */
+ 
+ static const struct of_device_id mtk_rng_match[] = {
++	{ .compatible = "mediatek,mt6885-rng", .data = (void *)MTK_RNG_SMC_PHONE },
+ 	{ .compatible = "mediatek,mt7623-rng" },
+ 	{ .compatible = "mediatek,mt7981-rng", .data = (void *)MTK_RNG_SMC },
+ 	{ .compatible = "mediatek,mt7986-rng" },

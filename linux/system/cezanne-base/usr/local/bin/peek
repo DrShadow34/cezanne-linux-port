@@ -1,0 +1,19 @@
+#!/usr/bin/python3
+# peek ADDR [COUNT]  /  peek -w ADDR VAL : 32-bit /dev/mem access
+import mmap, os, struct, sys
+args = sys.argv[1:]
+write = args and args[0] == '-w'
+if write: args = args[1:]
+addr = int(args[0], 0)
+page = addr & ~0xfff
+n = int(args[1], 0) if len(args) > 1 and not write else 1
+size = ((addr + 4 * n - page + 0xfff) & ~0xfff)
+fd = os.open('/dev/mem', os.O_RDWR | os.O_SYNC)
+m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=page)
+off = addr - page
+if write:
+    m[off:off+4] = struct.pack('<I', int(args[1], 0))
+    sys.exit(0)
+for i in range(n):
+    v = struct.unpack('<I', m[off+4*i:off+4*i+4])[0]
+    print('%08x: %08x' % (addr + 4*i, v))

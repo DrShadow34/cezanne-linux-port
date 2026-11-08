@@ -1,0 +1,124 @@
+From: arch-port
+Subject: [PATCH] xwayland: emulated modes on rotated, portrait outputs
+
+A phone panel is portrait unrotated (1080x2400) and rotated 90 degrees
+for landscape. The fake modes were landscape and filtered against the
+unrotated size, so hardly any survived (nothing wider than 1080), and an
+emulated mode was matched against windows and used as the viewport source
+in its unrotated orientation, so a game that set one got no scaling.
+Offer the fake modes in the orientation of the output's own mode, and
+rotate the emulated mode to the screen before matching windows to it and
+in the monitor rects the window manager sizes fullscreen windows to.
+---
+--- a/hw/xwayland/xwayland-output.c
++++ b/hw/xwayland/xwayland-output.c
+@@ -383,20 +383,27 @@
+     if (!xwl_screen_has_resolution_change_emulation(xwl_screen) && !xwl_screen->force_xrandr_emulation)
+         return rr_modes;
+ 
+-    /* Add fake modes */
++    /* Add fake modes, in the orientation of the output's own mode: a panel
++     * that is portrait unrotated (phones) gets them transposed, and its
++     * rotation turns them back into landscape for the clients */
+     for (i = 0; i < ARRAY_SIZE(xwl_output_fake_modes); i++) {
++        int32_t fake_width = xwl_output_fake_modes[i][0];
++        int32_t fake_height = xwl_output_fake_modes[i][1];
++
++        if (height > width) {
++            fake_width = xwl_output_fake_modes[i][1];
++            fake_height = xwl_output_fake_modes[i][0];
++        }
++
+         /* Skip actual output mode, already added */
+-        if (xwl_output_fake_modes[i][0] == width &&
+-            xwl_output_fake_modes[i][1] == height)
++        if (fake_width == width && fake_height == height)
+             continue;
+ 
+         /* Skip modes which are too big, avoid downscaling */
+-        if (xwl_output_fake_modes[i][0] > width ||
+-            xwl_output_fake_modes[i][1] > height)
++        if (fake_width > width || fake_height > height)
+             continue;
+ 
+-        rr_modes[*count] = xwayland_cvt(xwl_output_fake_modes[i][0],
+-                                        xwl_output_fake_modes[i][1],
++        rr_modes[*count] = xwayland_cvt(fake_width, fake_height,
+                                         xwl_output->refresh / 1000.0, 0, 0);
+         if (rr_modes[*count])
+             (*count)++;
+@@ -458,8 +465,15 @@
+ 
+         prop->rects[index][0] = xwl_output->x;
+         prop->rects[index][1] = xwl_output->y;
+-        prop->rects[index][2] = emulated_mode->width;
+-        prop->rects[index][3] = emulated_mode->height;
++        /* the window manager sizes fullscreen windows to these: screen
++         * orientation, as the emulated root size */
++        if (xwl_output->rotation & (RR_Rotate_0 | RR_Rotate_180)) {
++            prop->rects[index][2] = emulated_mode->width;
++            prop->rects[index][3] = emulated_mode->height;
++        } else {
++            prop->rects[index][2] = emulated_mode->height;
++            prop->rects[index][3] = emulated_mode->width;
++        }
+         index++;
+     }
+ 
+--- a/hw/xwayland/xwayland-window.c
++++ b/hw/xwayland/xwayland-window.c
+@@ -571,6 +571,21 @@
+     return TRUE;
+ }
+ 
++/* An emulated mode is an XRandR mode, oriented as the output's unrotated
++ * mode; windows are laid out on the rotated screen: its size there. */
++static void
++emulated_mode_rotate(struct xwl_output *xwl_output,
++                     struct xwl_emulated_mode *emulated_mode)
++{
++    int32_t width = emulated_mode->width;
++
++    if (xwl_output->rotation & (RR_Rotate_0 | RR_Rotate_180))
++        return;
++
++    emulated_mode->width = emulated_mode->height;
++    emulated_mode->height = width;
++}
++
+ static Bool
+ xwl_window_should_enable_viewport(struct xwl_window *xwl_window,
+                                   struct xwl_output **xwl_output_ret,
+@@ -605,16 +620,21 @@
+      * This path gets hit by most games / libs (e.g. SDL, SFML, OGRE)
+      */
+     xorg_list_for_each_entry(xwl_output, &xwl_screen->output_list, link) {
++        struct xwl_emulated_mode rotated;
++
+         emulated_mode = xwl_output_get_emulated_mode_for_client(xwl_output, owner);
+         if (!emulated_mode)
+             continue;
+ 
++        memcpy(&rotated, emulated_mode, sizeof(struct xwl_emulated_mode));
++        emulated_mode_rotate(xwl_output, &rotated);
++
+         if (drawable->x == xwl_output->x &&
+             drawable->y == xwl_output->y &&
+-            drawable->width  == emulated_mode->width &&
+-            drawable->height == emulated_mode->height) {
++            drawable->width  == rotated.width &&
++            drawable->height == rotated.height) {
+ 
+-            memcpy(emulated_mode_ret, emulated_mode, sizeof(struct xwl_emulated_mode));
++            memcpy(emulated_mode_ret, &rotated, sizeof(struct xwl_emulated_mode));
+             *xwl_output_ret = xwl_output;
+             return TRUE;
+         }
+@@ -633,6 +653,7 @@
+         drawable->height == xwl_screen_get_height(xwl_screen)) {
+ 
+         memcpy(emulated_mode_ret, emulated_mode, sizeof(struct xwl_emulated_mode));
++        emulated_mode_rotate(xwl_output, emulated_mode_ret);
+         *xwl_output_ret = xwl_output;
+         return TRUE;
+     }

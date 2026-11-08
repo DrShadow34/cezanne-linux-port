@@ -1,0 +1,5 @@
+# No SMBIOS on this phone: mt6885-dram-info prints the memory module
+# properties systemd's dmi_memory_id gives a PC (MEMORY_DEVICE_*), one
+# module per DRAM rank. Tools that read them from udev (Mission Center)
+# find them on this device instead of /sys/devices/virtual/dmi/id.
+ACTION!="remove", SUBSYSTEM=="platform", DRIVER=="cezanne-dram-info", IMPORT{file}="%S%p/memory_devices"

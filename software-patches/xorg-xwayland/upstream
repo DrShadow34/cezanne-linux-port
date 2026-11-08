@@ -1,0 +1,4 @@
+# Arch's xorg-xwayland with 20:9 modes for games (0001) that also work on
+# the rotated portrait panel (0002)
+UPSTREAM=xorg-xwayland
+SUFFIX=3

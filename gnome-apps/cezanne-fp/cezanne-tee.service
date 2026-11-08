@@ -1,0 +1,14 @@
+[Unit]
+Description=Microtrust TEE (cezanne): driver, file and RPMB service
+# the fingerprint TA and the TEE's other drivers run in it
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/modprobe goodix_fp
+ExecStartPre=/usr/bin/modprobe cezanne_teei
+ExecStart=/usr/bin/teei_daemon
+# the TEE cannot be booted twice: no restart, the next boot brings it back
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

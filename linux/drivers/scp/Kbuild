@@ -1,0 +1,4 @@
+# MT6885 SCP (tinysys) for mainline
+ccflags-y += -I$(M)/include -I$(M)
+obj-m += scp-cezanne.o
+scp-cezanne-y := scp_cezanne.o mtk-mbox.o mtk_tinysys_ipi.o

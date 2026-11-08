@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+# cezanne-fpd: fingerprint service for the cezanne (Redmi K30 Ultra). It
+# speaks fprintd's D-Bus API (net.reactivated.Fprint on the system bus), so
+# pam_fprintd, GDM's lock screen and GNOME Settings work unchanged, on the
+# Goodix GF3658 under-display sensor. The matching runs in the Goodix TA in
+# the Microtrust TEE (/dev/teei_fp; cezanne-tee.service boots the TEE and
+# serves its files and RPMB). Own code: the TA command sequences come from
+# traces of MIUI's HAL (mainline/fingerprint/ref, NOTES "Fingerprint").
+#
+# Verify: the spot shows a fingerprint icon (org.cezanne.Fod State 1 on the
+# system bus, drawn by the cezanne-fod Shell extension); a touch on it
+# (touchscreen evdev) switches to 2: the extension dims the screen, lights
+# the sensor disc and puts the panel in FOD HBM, which is the "UI ready" we
+# wait for (panel hbm = 2); then capture and match as MIUI's HAL does.
+#
+# The fingers enrolled under MIUI live in the TA's storage; their ids get
+# fprintd finger names in /var/lib/cezanne-fpd/prints.json. Enrollment and
+# deleting prints are not implemented yet.
+import fcntl
+import json
+import os
+import pwd
+import select
+import struct
+import sys
+import threading
+import time
+
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib  # noqa: E402
+
+TEE_DEV = '/dev/teei_fp'
+FP_DEV = '/dev/goodix_fp'
+HBM = '/sys/bus/mipi-dsi/devices/1400e000.dsi.0/hbm'
+STATE_DIR = os.environ.get('STATE_DIRECTORY', '/var/lib/cezanne-fpd')
+PRINTS = os.path.join(STATE_DIR, 'prints.json')
+
+CMD_FP_CMD = 0x5402		# _IO('T', 2)
+GF_IOC_INIT = 0x80016700	# _IOR('g', 0, u8)
+GF_IOC_RESET = 0x6702
+GF_IOC_ENABLE_IRQ = 0x6703
+GF_IOC_ENABLE_SPI_CLK = 0x40046705	# _IOW('g', 5, u32)
+GF_IOC_DISABLE_SPI_CLK = 0x6706
+GF_IOC_ENABLE_POWER = 0x6707
+GF_BUF_LEN = 0x96000
+
+# the spot, panel pixels = touchscreen units (MIUI's box (439,1732) 202 px)
+FOD_X, FOD_Y, FOD_R = 540, 1833, 101
+
+# TA results
+GF_OK, GF_NOT_MATCH = 0, 1008
+
+FINGERS = ('right-thumb', 'left-thumb', 'right-index-finger', 'left-index-finger',
+           'right-middle-finger', 'left-middle-finger', 'right-ring-finger',
+           'left-ring-finger', 'right-little-finger', 'left-little-finger')
+
+BUS_NAME = 'net.reactivated.Fprint'
+MANAGER_PATH = '/net/reactivated/Fprint/Manager'
+DEVICE_PATH = '/net/reactivated/Fprint/Device/0'
+FOD_PATH = '/org/cezanne/Fod'
+ERR = 'net.reactivated.Fprint.Error.'
+
+XML = '''<node>
+<interface name="net.reactivated.Fprint.Manager">
+  <method name="GetDevices"><arg type="ao" name="devices" direction="out"/></method>
+  <method name="GetDefaultDevice"><arg type="o" name="device" direction="out"/></method>
+</interface>
+<interface name="net.reactivated.Fprint.Device">
+  <method name="ListEnrolledFingers"><arg type="s" name="username" direction="in"/>
+    <arg type="as" name="enrolled_fingers" direction="out"/></method>
+  <method name="DeleteEnrolledFingers"><arg type="s" name="username" direction="in"/></method>
+  <method name="DeleteEnrolledFingers2"/>
+  <method name="DeleteEnrolledFinger"><arg type="s" name="finger_name" direction="in"/></method>
+  <method name="Claim"><arg type="s" name="username" direction="in"/></method>
+  <method name="Release"/>
+  <method name="VerifyStart"><arg type="s" name="finger_name" direction="in"/></method>
+  <method name="VerifyStop"/>
+  <signal name="VerifyFingerSelected"><arg type="s" name="finger_name"/></signal>
+  <signal name="VerifyStatus"><arg type="s" name="result"/><arg type="b" name="done"/></signal>
+  <method name="EnrollStart"><arg type="s" name="finger_name" direction="in"/></method>
+  <method name="EnrollStop"/>
+  <signal name="EnrollStatus"><arg type="s" name="result"/><arg type="b" name="done"/></signal>
+  <property name="name" type="s" access="read"/>
+  <property name="num-enroll-stages" type="i" access="read"/>
+  <property name="scan-type" type="s" access="read"/>
+  <property name="finger-present" type="b" access="read"/>
+  <property name="finger-needed" type="b" access="read"/>
+</interface>
+<interface name="org.cezanne.Fod">
+  <property name="State" type="u" access="read"/>
+</interface>
+</node>'''
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+class Ta:
+    """the Goodix TA: u32 status, u32, u32, u32 len, payload; every payload
+    starts with u8 reset flag, pad, u32 module, u32 command, i32 result"""
+    def __init__(self):
+        self.dev = os.open(FP_DEV, os.O_RDWR)
+        self.tee = os.open(TEE_DEV, os.O_RDWR)
+        self.buf = bytearray(GF_BUF_LEN)
+
+    def cmd(self, mod, sub, length, fields=()):
+        """send module/sub with a payload of `length` bytes, the given
+        (offset, u32) fields set; returns (code, reply payload)"""
+        p = bytearray(length)
+        struct.pack_into('<II', p, 4, mod, sub)
+        for off, v in fields:
+            struct.pack_into('<I', p, off, v & 0xffffffff)
+        b = self.buf
+        b[0:16 + length] = bytes(16 + length)
+        struct.pack_into('<I', b, 12, length)
+        b[16:16 + length] = p
+        # like MIUI's HAL: SPI clock on around each command
+        fcntl.ioctl(self.dev, GF_IOC_ENABLE_SPI_CLK, bytearray(struct.pack('<I', 1)))
+        try:
+            fcntl.ioctl(self.tee, CMD_FP_CMD, b, True)
+        finally:
+            fcntl.ioctl(self.dev, GF_IOC_DISABLE_SPI_CLK)
+        reply = bytes(b[16:16 + length])
+        status = struct.unpack_from('<i', b, 0)[0]
+        return (status or struct.unpack_from('<i', reply, 12)[0]), reply
+
+    def init(self):
+        """MIUI's mfp-daemon at start; returns the enrolled finger ids"""
+        fcntl.ioctl(self.dev, GF_IOC_ENABLE_POWER)
+        fcntl.ioctl(self.dev, GF_IOC_RESET)
+        for mod, sub, n in ((1012, 0, 0x1c), (1002, 9, 0x20), (1002, 0, 0x1c), (1002, 1, 0x2c)):
+            code, _ = self.cmd(mod, sub, n)
+            if code:
+                raise OSError('TA %d/%d: %d' % (mod, sub, code))
+        fcntl.ioctl(self.dev, GF_IOC_INIT, bytearray(1))
+        fcntl.ioctl(self.dev, GF_IOC_ENABLE_IRQ)
+        self.cmd(1013, 0, 0x24)		# DSP init: 1001 on MIUI too
+        # sensor init: Xiaomi's product id ("cezanne" = 4), panel id 8
+        code, _ = self.cmd(1002, 2, 0x1c0, ((0x1b8, 4), (0x1bc, 8)))
+        if code:
+            raise OSError('sensor init: %d' % code)
+        code, _ = self.cmd(1001, 0, 0x230, ((0x28, 1),))
+        if code:
+            raise OSError('algo init: %d' % code)
+        self.cmd(1002, 8, 0x1c)		# sleep
+        self.cmd(1000, 13, 0x1c)	# init finish
+        p = struct.pack_into
+        group = bytearray(0x120)
+        p('<II', group, 4, 1000, 0)
+        group[0x20:0x20 + 26] = b'/data/vendor/goodix/fpdata'
+        self._raw(group)		# setActiveGroup, group 0
+        return self.enumerate()
+
+    def _raw(self, payload):
+        b = self.buf
+        b[0:16 + len(payload)] = bytes(16 + len(payload))
+        struct.pack_into('<I', b, 12, len(payload))
+        b[16:16 + len(payload)] = payload
+        fcntl.ioctl(self.dev, GF_IOC_ENABLE_SPI_CLK, bytearray(struct.pack('<I', 1)))
+        try:
+            fcntl.ioctl(self.tee, CMD_FP_CMD, b, True)
+        finally:
+            fcntl.ioctl(self.dev, GF_IOC_DISABLE_SPI_CLK)
+
+    def enumerate(self):
+        code, r = self.cmd(1000, 7, 0x70)
+        if code:
+            raise OSError('enumerate: %d' % code)
+        n = min(struct.unpack_from('<I', r, 0x1c)[0], 5)
+        return [struct.unpack_from('<I', r, 0x48 + 4 * i)[0] for i in range(n)]
+
+    def verify_begin(self):
+        self.cmd(1000, 1, 0x28)			# authenticate
+        self.cmd(1000, 11, 0x24, ((0x20, 1),))	# screen on
+
+    def capture_match(self, x, y):
+        """one touch: up to three captures; returns (code, finger id)"""
+        self.cmd(1002, 9, 0x20)			# wakeup
+        self.cmd(1001, 20, 0x30)
+        code, fid = -1, 0
+        for i in range(3):
+            if i:
+                self.cmd(1001, 4, 0x378)
+            self.cmd(1002, 3, 0x48, ((0x20, 2), (0x28, 1), (0x3c, 1)))
+            # the TA reads the image here (~110 ms)
+            self.cmd(1002, 101, 0x50, ((0x20, 1), (0x2c, x), (0x30, y), (0x34, FOD_X),
+                                       (0x38, FOD_Y), (0x3c, 0x43844000), (0x40, FOD_R)))
+            code, r = self.cmd(1001, 2, 0xe8, ((0x24, 1), (0x58, 2), (0x88, 1),
+                                               (0x90, 0x00010001), (0x94, 0x14)))
+            if code == GF_OK:
+                fid = struct.unpack_from('<I', r, 0x30)[0]
+                break
+            if code == GF_NOT_MATCH:
+                break
+        self.cmd(1001, 4, 0x378)
+        self.cmd(1001, 20, 0x30, ((0x20, 1), (0x28, 1)))
+        self.cmd(1002, 8, 0x1c)			# sleep
+        if code == GF_OK:
+            self.cmd(1001, 21, 0x20, ((0x1c, fid),))
+        self.cmd(1001, 24, 0x1c)
+        return code, fid
+
+    def verify_end(self):
+        self.cmd(1000, 11, 0x24, ((0x1c, 1),))
+
+
+class Touch:
+    """finger down on the spot, from the touchscreen (shared, read only)"""
+    EV = struct.Struct('<qqHHi')
+
+    def __init__(self):
+        self.path = None
+        for e in sorted(os.listdir('/sys/class/input')):
+            try:
+                with open('/sys/class/input/%s/device/name' % e) as f:
+                    if e.startswith('event') and 'Goodix' in f.read():
+                        self.path = '/dev/input/' + e
+                        break
+            except OSError:
+                pass
+
+    def wait_down(self, stop):
+        """a new touch whose first report lies on the spot (1.5 radii);
+        None when stopped"""
+        fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            new = False
+            x = y = -1
+            while not stop.is_set():
+                if not select.select([fd], [], [], 0.2)[0]:
+                    continue
+                try:
+                    data = os.read(fd, self.EV.size * 64)
+                except BlockingIOError:
+                    continue
+                for off in range(0, len(data) - self.EV.size + 1, self.EV.size):
+                    _, _, typ, code, val = self.EV.unpack_from(data, off)
+                    if typ == 1 and code == 0x14a:		# BTN_TOUCH
+                        new = val == 1
+                    elif typ == 3 and code == 0x35:		# ABS_MT_POSITION_X
+                        x = val
+                    elif typ == 3 and code == 0x36:
+                        y = val
+                    elif typ == 0 and new:			# SYN_REPORT
+                        new = False
+                        if (x - FOD_X) ** 2 + (y - FOD_Y) ** 2 <= (1.5 * FOD_R) ** 2:
+                            return x, y
+            return None
+        finally:
+            os.close(fd)
+
+
+def hbm():
+    try:
+        with open(HBM) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+class Prints:
+    """fprintd finger names <-> TA finger ids, per user"""
+    def __init__(self, ta_ids):
+        try:
+            with open(PRINTS) as f:
+                self.users = json.load(f)
+        except (OSError, ValueError):
+            self.users = {}
+        known = {fid for fingers in self.users.values() for fid in fingers.values()}
+        new = [fid for fid in ta_ids if fid not in known]
+        if new:
+            # fingers enrolled under MIUI: the phone's (first) user's
+            user = self.default_user()
+            fingers = self.users.setdefault(user, {})
+            names = (n for n in FINGERS if n not in fingers)
+            for fid in new:
+                fingers[next(names)] = fid
+            self.save()
+            log('prints: %s gets %s' % (user, ', '.join('%s=%#x' % (n, f) for n, f in fingers.items())))
+        # forget ids the TA no longer has
+        for fingers in self.users.values():
+            for name in [n for n, f in fingers.items() if f not in ta_ids]:
+                del fingers[name]
+
+    @staticmethod
+    def default_user():
+        """the desktop's user: GDM's automatic login, else the first one"""
+        try:
+            with open('/etc/gdm/custom.conf') as f:
+                for line in f:
+                    key, _, val = line.strip().partition('=')
+                    if key == 'AutomaticLogin' and val:
+                        return val
+        except OSError:
+            pass
+        users = sorted((p.pw_uid, p.pw_name) for p in pwd.getpwall()
+                       if 1000 <= p.pw_uid < 60000 and p.pw_dir.startswith('/home/'))
+        return users[0][1] if users else 'root'
+
+    def save(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = PRINTS + '.new'
+        with open(tmp, 'w') as f:
+            json.dump(self.users, f, indent=1)
+        os.replace(tmp, PRINTS)
+
+    def fingers(self, user):
+        return self.users.get(user, {})
+
+
+class Service:
+    def __init__(self, ta, prints):
+        self.ta = ta
+        self.prints = prints
+        self.touch = Touch()
+        self.ta_lock = threading.Lock()
+        self.conn = None
+        self.claim = None		# (sender, username)
+        self.claim_watch = 0
+        self.stop = None		# threading.Event of the running verification
+        self.props = {'finger-present': False, 'finger-needed': False}
+        self.fod = 0
+
+    # ---- D-Bus plumbing ----
+    def export(self, conn):
+        self.conn = conn
+        node = Gio.DBusNodeInfo.new_for_xml(XML)
+        for path, iface in ((MANAGER_PATH, node.interfaces[0]),
+                            (DEVICE_PATH, node.interfaces[1]),
+                            (FOD_PATH, node.interfaces[2])):
+            conn.register_object(path, iface, self.method, self.get_prop, None)
+
+    def caller_uid(self, sender):
+        r = self.conn.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                                'org.freedesktop.DBus', 'GetConnectionUnixUser',
+                                GLib.Variant('(s)', (sender,)), GLib.VariantType('(u)'),
+                                Gio.DBusCallFlags.NONE, -1, None)
+        return r.unpack()[0]
+
+    def emit(self, path, iface, name, sig, args):
+        self.conn.emit_signal(None, path, iface, name, GLib.Variant(sig, args))
+
+    def set_prop(self, name, value):
+        if self.props[name] != value:
+            self.props[name] = value
+            self.emit(DEVICE_PATH, 'org.freedesktop.DBus.Properties', 'PropertiesChanged',
+                      '(sa{sv}as)', ('net.reactivated.Fprint.Device',
+                                     {name: GLib.Variant('b', value)}, []))
+
+    def set_fod(self, state):
+        if self.fod != state:
+            self.fod = state
+            self.emit(FOD_PATH, 'org.freedesktop.DBus.Properties', 'PropertiesChanged',
+                      '(sa{sv}as)', ('org.cezanne.Fod', {'State': GLib.Variant('u', state)}, []))
+
+    def get_prop(self, conn, sender, path, iface, prop):
+        if iface == 'org.cezanne.Fod':
+            return GLib.Variant('u', self.fod)
+        return {'name': GLib.Variant('s', 'Goodix GF3658 (under display)'),
+                'num-enroll-stages': GLib.Variant('i', 30),
+                'scan-type': GLib.Variant('s', 'press'),
+                'finger-present': GLib.Variant('b', self.props['finger-present']),
+                'finger-needed': GLib.Variant('b', self.props['finger-needed'])}.get(prop)
+
+    def method(self, conn, sender, path, iface, name, params, inv):
+        try:
+            ret = getattr(self, 'm_' + name)(sender, *params.unpack())
+            inv.return_value(ret)
+        except DBusError as e:
+            inv.return_dbus_error(ERR + e.name, e.msg)
+        except Exception as e:		# noqa: BLE001 (report, keep serving)
+            log('%s: %r' % (name, e))
+            inv.return_dbus_error(ERR + 'Internal', str(e))
+
+    # ---- Manager ----
+    def m_GetDevices(self, sender):
+        return GLib.Variant('(ao)', ([DEVICE_PATH],))
+
+    def m_GetDefaultDevice(self, sender):
+        return GLib.Variant('(o)', (DEVICE_PATH,))
+
+    # ---- Device ----
+    def user_for(self, sender, username):
+        uid = self.caller_uid(sender)
+        if not username:
+            username = pwd.getpwuid(uid).pw_name
+        if uid != 0 and pwd.getpwuid(uid).pw_name != username:
+            raise DBusError('PermissionDenied', 'not your fingerprints')
+        return username
+
+    def check_claim(self, sender):
+        if not self.claim or self.claim[0] != sender:
+            raise DBusError('ClaimDevice', 'device not claimed by you')
+
+    def m_ListEnrolledFingers(self, sender, username):
+        username = self.user_for(sender, username)
+        names = sorted(self.prints.fingers(username))
+        if not names:
+            raise DBusError('NoEnrolledPrints', 'no prints for %s' % username)
+        return GLib.Variant('(as)', (names,))
+
+    def m_Claim(self, sender, username):
+        username = self.user_for(sender, username)
+        if self.claim and self.caller_uid(sender) == 0:
+            # GDM restarts its fingerprint conversation (lock screen reset)
+            # before the old worker let go: the new one takes over
+            log('claim by %s replaces %s' % (sender, self.claim[0]))
+            self.release()
+        if self.claim:
+            raise DBusError('AlreadyInUse', 'device already claimed')
+        self.claim = (sender, username)
+        self.claim_watch = Gio.bus_watch_name_on_connection(
+            self.conn, sender, Gio.BusNameWatcherFlags.NONE, None,
+            lambda *a: self.release())
+        log('claimed by %s for %s' % (sender, username))
+        return None
+
+    def release(self):
+        self.stop_verify()
+        if self.claim_watch:
+            Gio.bus_unwatch_name(self.claim_watch)
+            self.claim_watch = 0
+        if self.claim:
+            log('released by %s' % self.claim[0])
+        self.claim = None
+
+    def m_Release(self, sender):
+        self.check_claim(sender)
+        self.release()
+        return None
+
+    def m_VerifyStart(self, sender, finger):
+        self.check_claim(sender)
+        if self.stop and not self.stop.is_set():
+            raise DBusError('AlreadyInUse', 'verification already running')
+        fingers = self.prints.fingers(self.claim[1])
+        if not fingers:
+            raise DBusError('NoEnrolledPrints', 'no prints for %s' % self.claim[1])
+        if finger in ('', 'any'):
+            ids, finger = set(fingers.values()), 'any'
+        elif finger in fingers:
+            ids = {fingers[finger]}
+        else:
+            raise DBusError('NoEnrolledPrints', 'no print for %s' % finger)
+        self.emit(DEVICE_PATH, 'net.reactivated.Fprint.Device', 'VerifyFingerSelected',
+                  '(s)', (finger,))
+        stop = self.stop = threading.Event()
+        threading.Thread(target=self.verify, args=(ids, stop), daemon=True).start()
+        return None
+
+    def stop_verify(self):
+        if self.stop:
+            self.stop.set()
+
+    def m_VerifyStop(self, sender):
+        self.check_claim(sender)
+        self.stop_verify()
+        return None
+
+    def m_EnrollStart(self, sender, finger):
+        self.check_claim(sender)
+        raise DBusError('Internal', 'enrollment is not supported yet')
+
+    def m_EnrollStop(self, sender):
+        self.check_claim(sender)
+        raise DBusError('NoActionInProgress', 'no enrollment running')
+
+    def m_DeleteEnrolledFingers(self, sender, username):
+        raise DBusError('PrintsNotDeleted', 'deleting prints is not supported yet')
+
+    def m_DeleteEnrolledFingers2(self, sender):
+        raise DBusError('PrintsNotDeleted', 'deleting prints is not supported yet')
+
+    def m_DeleteEnrolledFinger(self, sender, finger):
+        raise DBusError('PrintsNotDeleted', 'deleting prints is not supported yet')
+
+    # ---- verification (worker thread) ----
+    def status(self, result, done):
+        log('verify: %s%s' % (result, ' (done)' if done else ''))
+        GLib.idle_add(lambda: self.emit(DEVICE_PATH, 'net.reactivated.Fprint.Device',
+                                        'VerifyStatus', '(sb)', (result, done)) and False)
+
+    def ui(self, fod=None, **props):
+        def apply():
+            if fod is not None:
+                self.set_fod(fod)
+            for k, v in props.items():
+                self.set_prop(k.replace('_', '-'), v)
+            return False
+        GLib.idle_add(apply)
+
+    def verify(self, ids, stop):
+        with self.ta_lock:
+            self.ui(fod=1, finger_needed=True)
+            try:
+                self.ta.verify_begin()
+                while not stop.is_set():
+                    pos = self.touch.wait_down(stop)
+                    if pos is None:
+                        break
+                    self.ui(fod=2, finger_present=True)
+                    # the extension lights the spot, then puts the panel in
+                    # FOD HBM: our "UI ready" (MIUI captures ~200 ms after
+                    # the touch)
+                    t0 = time.monotonic()
+                    while hbm() != '2' and time.monotonic() - t0 < 0.8:
+                        time.sleep(0.01)
+                    if hbm() != '2':
+                        log('no FOD HBM from the shell, setting it')
+                        with open(HBM, 'w') as f:
+                            f.write('2')
+                    time.sleep(max(0.0, 0.2 - (time.monotonic() - t0)))
+                    code, fid = self.ta.capture_match(*pos)
+                    self.ui(fod=1, finger_present=False)
+                    log('touch at %d,%d: TA %d, finger %#x' % (pos[0], pos[1], code, fid))
+                    if code == GF_OK and fid in ids:
+                        self.status('verify-match', True)
+                        break
+                    if code in (GF_OK, GF_NOT_MATCH):
+                        self.status('verify-no-match', True)
+                        break
+                    # not live / bad image: try again with the next touch
+                    self.status('verify-retry-scan', False)
+            except OSError as e:
+                log('verify: %s' % e)
+                self.status('verify-unknown-error', True)
+            finally:
+                try:
+                    self.ta.verify_end()
+                except OSError:
+                    pass
+                self.ui(fod=0, finger_needed=False, finger_present=False)
+                stop.set()
+
+
+class DBusError(Exception):
+    def __init__(self, name, msg):
+        super().__init__(msg)
+        self.name = name
+        self.msg = msg
+
+
+def main():
+    # the TEE boots in the background (cezanne-tee.service): retry the TA
+    ta = None
+    for _ in range(60):
+        try:
+            ta = Ta()
+            ids = ta.init()
+            break
+        except OSError as e:
+            log('TA not ready: %s' % e)
+            ta = None
+            time.sleep(1)
+    if not ta:
+        sys.exit('no fingerprint TA')
+    log('TA ready, %d enrolled finger(s): %s' % (len(ids), ', '.join('%#x' % i for i in ids)))
+    svc = Service(ta, Prints(ids))
+    loop = GLib.MainLoop()
+    Gio.bus_own_name(Gio.BusType.SYSTEM, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                     lambda conn, name: svc.export(conn),
+                     lambda conn, name: log('serving %s' % name),
+                     lambda conn, name: (log('lost %s' % name), loop.quit()))
+    loop.run()
+
+
+main()

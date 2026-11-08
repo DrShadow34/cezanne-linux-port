@@ -1,0 +1,36 @@
+#version 450
+/*
+ * Vulkan WSI pre-rotation: copies the w x h swapchain image, rotated by 90
+ * degrees, into the h x w linear buffer presented with a buffer transform
+ * (so the compositor can scan it out on a rotated output). One invocation per
+ * destination pixel, written as packed 8-bit RGBA in the image's byte order.
+ */
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, std430) writeonly buffer Dst { uint px[]; };
+layout(push_constant) uniform PC {
+   uint w, h;      /* source extent */
+   uint stride;    /* destination row pitch in pixels */
+   uint flags;     /* 1: buffer transform 90 (else 270), 2: BGRA, 4: sRGB */
+} pc;
+
+float encode_srgb(float c)
+{
+   return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+void main()
+{
+   uvec2 d = gl_GlobalInvocationID.xy;
+   if (d.x >= pc.h || d.y >= pc.w)
+      return;
+
+   ivec2 s = (pc.flags & 1u) != 0u ? ivec2(pc.w - 1u - d.y, d.x)
+                                   : ivec2(d.y, pc.h - 1u - d.x);
+   vec4 c = texelFetch(src, s, 0);
+   if ((pc.flags & 4u) != 0u)
+      c.rgb = vec3(encode_srgb(c.r), encode_srgb(c.g), encode_srgb(c.b));
+   if ((pc.flags & 2u) != 0u)
+      c = c.bgra;
+   px[d.y * pc.stride + d.x] = packUnorm4x8(c);
+}

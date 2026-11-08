@@ -1,0 +1,13 @@
+#!/bin/sh
+# Apply the vibrator's LRA oscillator trim (AW8697) when its driver binds;
+# calibrate once (~110 ms buzz) if none is saved. Run from udev
+# (65-cezanne-haptics.rules) with the device's sysfs path. Recalibrate:
+# delete the file and rebind, or write 1 to calibrate and save trim by hand.
+DEV=/sys$1
+SAVE=/var/lib/cezanne-haptics/trim
+if [ -s "$SAVE" ]; then
+	cat "$SAVE" > "$DEV/trim"
+elif echo 1 > "$DEV/calibrate"; then
+	mkdir -p "${SAVE%/*}"
+	cat "$DEV/trim" > "$SAVE"
+fi

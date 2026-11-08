@@ -1,0 +1,2 @@
+# SCP sensor hub proximity: raw 1 = near, 0 = far (scp-iio)
+SUBSYSTEM=="iio", ATTR{name}=="proximity", ENV{PROXIMITY_NEAR_LEVEL}="1"

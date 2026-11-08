@@ -1,0 +1,28 @@
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+index 9eefee660..5398e2689 100644
+--- a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+@@ -28,6 +28,7 @@
+ #include <video/mipi_display.h>
+ 
+ #define J10_MAX_BRIGHTNESS	2047
++#define J10_TE_SCANLINE		1800
+ 
+ struct j10_panel {
+ 	struct drm_bridge bridge;
+@@ -73,6 +74,15 @@ static int j10_on(struct j10_panel *ctx)
+ 	mipi_dsi_msleep(&dsi_ctx, 10);
+ 	/* TE on */
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_ON, 0x00);
++	/*
++	 * TE at scanline 1800 instead of the start of blanking: a frame takes
++	 * ~7.6 ms over the link (4 x 820 Mbps, measured) and the panel scans
++	 * in 8.2 ms at 120 Hz, so from the blanking the transfer is only
++	 * ~0.5 ms ahead of the new scan; a fetch stall under memory load would
++	 * let the scan pass it. Starting 2 ms early keeps it well ahead of the
++	 * new scan and still behind the old one.
++	 */
++	mipi_dsi_dcs_set_tear_scanline_multi(&dsi_ctx, J10_TE_SCANLINE);
+ 
+ 	/* PPS */
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x9d, 0x01);

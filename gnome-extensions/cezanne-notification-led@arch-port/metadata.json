@@ -1,0 +1,14 @@
+{
+  "uuid": "cezanne-notification-led@arch-port",
+  "name": "Cezanne Notification Light",
+  "description": "Routes notifications and charging to feedbackd: vibrates on new notifications; the pop-up camera's light fades for unread ones (colour per app), red while charging, green when charged.",
+  "shell-version": [
+    "51"
+  ],
+  "version": 2,
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ],
+  "settings-schema": "org.gnome.shell.extensions.cezanne-notification-led"
+}

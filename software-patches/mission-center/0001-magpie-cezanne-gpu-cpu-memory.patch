@@ -1,0 +1,1664 @@
+diff --color -ruN a/subprojects/magpie/platform-linux/build.rs b/subprojects/magpie/platform-linux/build.rs
+--- a/subprojects/magpie/platform-linux/build.rs	2026-10-28 21:19:07.384827492 +0100
++++ b/subprojects/magpie/platform-linux/build.rs	2026-10-28 21:19:42.826786215 +0100
+@@ -1,272 +1,14 @@
+ /* build.rs
+  *
+- * Copyright 2025 Mission Center Developers
+- *
+- * This program is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ * Copyright 2024 Mission Center Developers
+  *
+  * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * cezanne port: GPU data comes from libcezanne-top (package cezanne-top)
++ * instead of nvtop sources downloaded and compiled here.
+  */
+-use std::collections::HashMap;
+-use std::io::Read;
+-use std::sync::OnceLock;
+-
+-use serde::{Deserialize, Serialize};
+-
+-fn find_program(name: &str) -> Option<String> {
+-    let path = if let Ok(path) = std::env::var("PATH") {
+-        path
+-    } else {
+-        "".into()
+-    };
+-    for path in path.split(':') {
+-        let program_path = format!("{}/{}", path, name);
+-        if std::path::Path::new(&program_path).exists() {
+-            return Some(program_path);
+-        }
+-    }
+-
+-    None
+-}
+-
+-fn download_file(
+-    url: &str,
+-    path: &str,
+-    checksum: Option<&str>,
+-) -> Result<String, Box<dyn std::error::Error>> {
+-    use std::io::Write;
+-
+-    std::fs::create_dir_all(path)?;
+-
+-    let file_name = url.split('/').next_back().unwrap();
+-    let output_path = format!("{}/{}", path, file_name);
+-
+-    if std::path::Path::new(&output_path).exists() {
+-        return Ok(output_path);
+-    }
+-
+-    let mut response = ureq::get(url).call()?;
+-
+-    if response.status() != 200 {
+-        return Err(format!(
+-            "Failed to download {}. HTTP status code {}",
+-            url,
+-            response.status(),
+-        )
+-        .into());
+-    }
+-
+-    let mut content = Vec::new();
+-    response.body_mut().as_reader().read_to_end(&mut content)?;
+-
+-    let mut sha256 = cargo_util::Sha256::new();
+-    sha256.update(&content);
+-
+-    if let Some(expected_checksum) = checksum {
+-        let actual_checksum = sha256.finish_hex();
+-        if actual_checksum != expected_checksum {
+-            return Err(format!(
+-                "Checksum validation failed! Expected: {} Actual: {}",
+-                expected_checksum, actual_checksum,
+-            )
+-            .into());
+-        }
+-    }
+-
+-    let mut file = std::fs::File::create(&output_path)?;
+-    file.write_all(content.as_slice())?;
+-    file.flush()?;
+-
+-    println!("cargo:rerun-if-changed={}", output_path);
+-
+-    Ok(output_path)
+-}
+-
+-fn patch_program() -> &'static str {
+-    static PATCH_EXECUTABLE: OnceLock<String> = OnceLock::new();
+-
+-    PATCH_EXECUTABLE
+-        .get_or_init(|| match std::env::var("MC_PATCH_BINARY") {
+-            Ok(p) => {
+-                if std::path::Path::new(&p).exists() {
+-                    p
+-                } else {
+-                    eprintln!("{} does not exist", p);
+-                    std::process::exit(1);
+-                }
+-            }
+-            Err(_) => find_program("patch").unwrap_or_else(|| {
+-                eprintln!("`patch` not found");
+-                std::process::exit(1);
+-            }),
+-        })
+-        .as_str()
+-}
+-
+-fn prepare_third_party_sources(
+-) -> Result<HashMap<String, std::path::PathBuf>, Box<dyn std::error::Error>> {
+-    let third_party_path = std::path::PathBuf::from(&format!(
+-        "{}/3rdparty",
+-        std::env::var("CARGO_MANIFEST_DIR")?
+-    ));
+-    let mut out_dir = std::env::var("OUT_DIR")?;
+-    out_dir.push_str("/../../native");
+-    std::fs::create_dir_all(&out_dir)?;
+-    let out_dir = std::path::PathBuf::from(out_dir).canonicalize()?;
+-
+-    let mut result = HashMap::new();
+-
+-    for dir in std::fs::read_dir(&third_party_path)?.filter_map(|d| d.ok()) {
+-        if !dir.file_type()?.is_dir() {
+-            continue;
+-        }
+-
+-        for entry in std::fs::read_dir(dir.path())?.filter_map(|e| e.ok()) {
+-            let file_name = entry.file_name();
+-            let entry_name = file_name.to_string_lossy();
+-            if entry_name.ends_with(".json") {
+-                let mut package: Package =
+-                    serde_json::from_str(&std::fs::read_to_string(entry.path())?)?;
+-
+-                let extracted_path = out_dir.join(&package.directory);
+-                result.insert(std::mem::take(&mut package.name), extracted_path.clone());
+-                if extracted_path.exists() {
+-                    break;
+-                }
+-
+-                let output_path = download_file(
+-                    &package.source_url,
+-                    &format!("{}", out_dir.display()),
+-                    Some(&package.source_hash),
+-                )?;
+-
+-                let mut archive = std::fs::File::open(&output_path)?;
+-                let tar = flate2::read::GzDecoder::new(&mut archive);
+-                let mut archive = tar::Archive::new(tar);
+-                archive.unpack(&out_dir)?;
+-
+-                for patch in package.patches.iter().map(|p| p.as_str()) {
+-                    let mut cmd = std::process::Command::new(patch_program());
+-                    cmd.args(["-p1", "-i", &format!("{}/{}", dir.path().display(), patch)]);
+-                    cmd.current_dir(&extracted_path);
+-                    cmd.stdout(std::process::Stdio::inherit())
+-                        .stderr(std::process::Stdio::inherit());
+-                    cmd.spawn()?.wait()?;
+-                }
+-
+-                break;
+-            }
+-        }
+-    }
+-
+-    Ok(result)
+-}
+-
+-#[derive(Serialize, Deserialize)]
+-struct Package {
+-    #[serde(rename = "package-name")]
+-    name: String,
+-    directory: String,
+-    #[serde(rename = "source-url")]
+-    source_url: String,
+-    #[serde(rename = "source-hash")]
+-    source_hash: String,
+-    patches: Vec<String>,
+-}
+-
+-fn build_nvtop(src_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+-    let _ = pkg_config::Config::new().probe("gbm")?;
+-
+-    let libdrm = pkg_config::Config::new()
+-        .atleast_version("2.4.67")
+-        .probe("libdrm")?;
+-
+-    // Work around some linkers being stupid and requiring a certain order for libraries
+-    libdrm.link_paths.iter().for_each(|p| {
+-        println!("cargo:rustc-link-search=native={}", p.display());
+-    });
+-    libdrm.libs.iter().for_each(|a| {
+-        println!("cargo:rustc-link-arg=-l{}", a);
+-    });
+-
+-    let libudev = pkg_config::Config::new()
+-        .atleast_version("204")
+-        .probe("libudev")?;
+-
+-    // Work around some linkers being stupid and requiring a certain order for libraries
+-    libudev.link_paths.iter().for_each(|p| {
+-        println!("cargo:rustc-link-search=native={}", p.display());
+-    });
+-    libudev.libs.iter().for_each(|a| {
+-        println!("cargo:rustc-link-arg=-l{}", a);
+-    });
+-
+-    let mut build_def = cc::Build::new();
+-    build_def
+-        .define("USING_LIBUDEV", None)
+-        .define("_GNU_SOURCE", None)
+-        .include(src_dir.join("src"))
+-        .include(src_dir.join("include"))
+-        .includes(&libdrm.include_paths)
+-        .includes(&libudev.include_paths)
+-        .files([
+-            src_dir.join("src/get_process_info_linux.c"),
+-            src_dir.join("src/extract_gpuinfo.c"),
+-            src_dir.join("src/extract_processinfo_fdinfo.c"),
+-            src_dir.join("src/info_messages_linux.c"),
+-            src_dir.join("src/device_discovery_linux.c"),
+-            src_dir.join("src/extract_gpuinfo_ascend.c"),
+-            src_dir.join("src/extract_gpuinfo_ixml.c"),
+-            src_dir.join("src/extract_gpuinfo_metax.c"),
+-            src_dir.join("src/extract_gpuinfo_tenstorrent.c"),
+-            src_dir.join("src/extract_gpuinfo_tpu.c"),
+-            src_dir.join("src/extract_npuinfo_rockchip.c"),
+-            src_dir.join("src/extract_gpuinfo_amdgpu.c"),
+-            src_dir.join("src/extract_gpuinfo_amdgpu_utils.c"),
+-            src_dir.join("src/extract_gpuinfo_intel.c"),
+-            src_dir.join("src/extract_gpuinfo_intel_i915.c"),
+-            src_dir.join("src/extract_gpuinfo_intel_xe.c"),
+-            src_dir.join("src/extract_gpuinfo_mali_common.c"),
+-            src_dir.join("src/extract_gpuinfo_msm.c"),
+-            src_dir.join("src/extract_gpuinfo_msm_utils.c"),
+-            src_dir.join("src/extract_gpuinfo_nvidia.c"),
+-            src_dir.join("src/extract_gpuinfo_panfrost.c"),
+-            src_dir.join("src/extract_gpuinfo_panfrost_utils.c"),
+-            src_dir.join("src/extract_gpuinfo_panthor.c"),
+-            src_dir.join("src/extract_gpuinfo_panthor_utils.c"),
+-            src_dir.join("src/extract_gpuinfo_radeon.c"),
+-            src_dir.join("src/extract_gpuinfo_v3d.c"),
+-            src_dir.join("src/extract_gpuinfo_v3d_utils.c"),
+-            src_dir.join("src/time.c"),
+-        ]);
+-    build_def.flag("-Wno-unused-function");
+-    build_def.flag("-Wno-unused-variable");
+-    build_def.flag("-Wno-return-type");
+-    build_def.flag("-Wno-pointer-sign");
+-
+-    build_def.flag_if_supported("-fno-reorder-blocks-and-partition");
+-
+-    build_def.compile("nvtop");
+-
+-    Ok(())
+-}
+ 
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
+-    let dirs = prepare_third_party_sources()?;
+-    build_nvtop(
+-        dirs.get("nvtop")
+-            .expect("NVTOP sources were not properly prepared"),
+-    )?;
+-
++    pkg_config::Config::new().probe("cezanne-top")?;
+     Ok(())
+ }
+diff --color -ruN a/subprojects/magpie/platform-linux/src/cpu/cpu.rs b/subprojects/magpie/platform-linux/src/cpu/cpu.rs
+--- a/subprojects/magpie/platform-linux/src/cpu/cpu.rs	2026-10-28 21:29:15.327993074 +0100
++++ b/subprojects/magpie/platform-linux/src/cpu/cpu.rs	2026-10-28 21:29:15.856775187 +0100
+@@ -28,6 +28,17 @@
+ pub fn name() -> &'static str {
+     static NAME: OnceLock<String> = OnceLock::new();
+     NAME.get_or_init(|| {
++        // cezanne port: sysinfo names arm64 cores by part ("Cortex-A55");
++        // the kernel's "model name" (the SoC, patch 0047) wins when present
++        if let Some(name) = std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|info| {
++            info.lines().find_map(|line| {
++                let (key, value) = line.split_once(':')?;
++                (key.trim() == "model name").then(|| value.trim().to_owned())
++            })
++        }) {
++            return name;
++        }
++
+         let s = System::new_with_specifics(
+             RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
+         );
+diff --color -ruN a/subprojects/magpie/platform-linux/src/gpus/ctop.rs b/subprojects/magpie/platform-linux/src/gpus/ctop.rs
+--- a/subprojects/magpie/platform-linux/src/gpus/ctop.rs	1970-01-01 01:00:00.000000000 +0100
++++ b/subprojects/magpie/platform-linux/src/gpus/ctop.rs	2026-10-28 21:19:42.823799412 +0100
+@@ -0,0 +1,97 @@
++/* src/gpus/ctop.rs
++ *
++ * FFI to libcezanne-top (ctop.h of the cezanne port's cezanne-top package):
++ * GPU render load, clocks, temperature and memory from DRM fdinfo /
++ * devfreq / thermal zones, hardware decoder / encoder load from the vcodec
++ * sysfs attributes. Replaces nvtop, which knows neither platform (non-PCI)
++ * GPUs as Mission Center expects them nor V4L2 codec engines.
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++use std::ffi::{c_char, CStr};
++
++pub const CTOP_MAX_ENGINES: usize = 4;
++
++pub const CTOP_TEMP: u32 = 1 << 0;
++pub const CTOP_CLOCK: u32 = 1 << 1;
++pub const CTOP_CLOCK_MAX: u32 = 1 << 2;
++pub const CTOP_MEMORY: u32 = 1 << 3;
++pub const CTOP_UTIL: u32 = 1 << 4;
++pub const CTOP_DECODE: u32 = 1 << 5;
++pub const CTOP_ENCODE: u32 = 1 << 6;
++
++#[repr(C)]
++pub struct CtopProc {
++    pub pid: i32,
++    pub comm: [c_char; 16],
++    pub valid: u32,
++    pub memory: u64,
++    pub util: f32,
++    pub decode: f32,
++    pub encode: f32,
++}
++
++#[repr(C)]
++pub struct CtopGpu {
++    pub id: [c_char; 32],
++    pub name: [c_char; 64],
++    pub driver: [c_char; 16],
++    pub render_node: [c_char; 32],
++    pub vendor_id: u32,
++    pub device_id: u32,
++    pub valid: u32,
++    pub temp_mc: i32,
++    pub clock_mhz: u32,
++    pub clock_max_mhz: u32,
++    pub memory_used: u64,
++    pub memory_total: u64,
++    pub util: f32,
++    pub engines: u32,
++    pub engine_name: [[c_char; 16]; CTOP_MAX_ENGINES],
++    pub engine_util: [f32; CTOP_MAX_ENGINES],
++    pub decode: f32,
++    pub encode: f32,
++    pub nproc: u32,
++    pub proc_: *const CtopProc,
++}
++
++#[repr(C)]
++pub struct Ctop {
++    _private: [u8; 0],
++}
++
++extern "C" {
++    pub fn ctop_open() -> *mut Ctop;
++    pub fn ctop_refresh(c: *mut Ctop) -> i32;
++    pub fn ctop_count(c: *const Ctop) -> u32;
++    pub fn ctop_gpu(c: *const Ctop, i: u32) -> *const CtopGpu;
++    pub fn ctop_close(c: *mut Ctop);
++}
++
++/// The library handle; magpie only uses it behind the GpusHandler mutex.
++pub struct Handle(pub *mut Ctop);
++
++unsafe impl Send for Handle {}
++unsafe impl Sync for Handle {}
++
++impl Drop for Handle {
++    fn drop(&mut self) {
++        unsafe { ctop_close(self.0) }
++    }
++}
++
++pub fn string(s: &[c_char]) -> String {
++    unsafe { CStr::from_ptr(s.as_ptr()) }
++        .to_string_lossy()
++        .to_string()
++}
++
++impl CtopGpu {
++    pub fn processes(&self) -> &[CtopProc] {
++        if self.proc_.is_null() || self.nproc == 0 {
++            return &[];
++        }
++        unsafe { std::slice::from_raw_parts(self.proc_, self.nproc as usize) }
++    }
++}
+diff --color -ruN a/subprojects/magpie/platform-linux/src/gpus/gl_info.rs b/subprojects/magpie/platform-linux/src/gpus/gl_info.rs
+--- a/subprojects/magpie/platform-linux/src/gpus/gl_info.rs	2026-10-28 21:19:07.386314597 +0100
++++ b/subprojects/magpie/platform-linux/src/gpus/gl_info.rs	2026-10-28 21:19:54.817138391 +0100
+@@ -109,7 +109,8 @@
+ }
+ 
+ pub unsafe fn supported_opengl_version(pci_id: &str) -> Option<(OpenGLVariant, ApiVersion)> {
+-    const DRI_PATH_LEN: usize = "/dev/dri/by-path/pci-".len() + 16 + "card".len();
++    // cezanne port: platform GPUs ("platform-13000000.gpu-card") as well
++    const DRI_PATH_LEN: usize = "/dev/dri/by-path/platform-".len() + 16 + "-card".len();
+ 
+     let egl = egl()?;
+ 
+@@ -153,6 +154,15 @@
+ 
+             std::fs::OpenOptions::new()
+                 .read(true)
++                .write(true)
++                .open(dri_path)
++        })
++        .or({
++            dri_path.clear();
++            let _ = write!(&mut dri_path, "/dev/dri/by-path/platform-{pci_id}-card");
++
++            std::fs::OpenOptions::new()
++                .read(true)
+                 .write(true)
+                 .open(dri_path)
+         }) {
+diff --color -ruN a/subprojects/magpie/platform-linux/src/gpus/mod.rs b/subprojects/magpie/platform-linux/src/gpus/mod.rs
+--- a/subprojects/magpie/platform-linux/src/gpus/mod.rs	2026-10-28 21:19:07.386362382 +0100
++++ b/subprojects/magpie/platform-linux/src/gpus/mod.rs	2026-10-28 21:34:38.311231752 +0100
+@@ -18,31 +18,37 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
++// cezanne port: GPU data from libcezanne-top instead of nvtop (see ctop.rs).
++// GPUs are keyed by their device name ("13000000.gpu"), not a PCI address;
++// the GPU shares system RAM, so its memory is reported as shared memory.
++
+ use std::collections::HashMap;
+-use std::ops::DerefMut;
+-use std::sync::RwLock;
+-use std::sync::{Arc, OnceLock};
+ 
+ use magpie_platform::gpus::{Gpu, Process, ProcessKind};
+ 
+-use crate::gpu_info_valid;
+-
+-use nvtop::{
+-    GpuInfoDynamicInfoValid, GpuInfoProcessInfoValid, GpuInfoStaticInfoValid, GpuProcessType,
+-};
+ use run_forked::run_forked;
+ 
++mod ctop;
+ mod gl_info;
+-#[allow(unused)]
+-mod nvtop;
+ mod run_forked;
+-mod util;
+ mod vulkan_info;
+ 
+ pub struct GpuCache {
+-    gpu_list: Arc<RwLock<nvtop::ListHead>>,
++    ctop: ctop::Handle,
+     gpus: HashMap<String, Gpu>,
+-    proc_refresh_counter: u8,
++}
++
++fn flag<T>(valid: u32, bit: u32, value: T) -> Option<T> {
++    if valid & bit != 0 {
++        Some(value)
++    } else {
++        None
++    }
++}
++
++// the UI prints loads as "{}%": whole percent, as nvtop reported them
++fn percent(valid: u32, bit: u32, value: f32) -> Option<f32> {
++    flag(valid, bit, value.round())
+ }
+ 
+ impl magpie_platform::gpus::GpuCache for GpuCache {
+@@ -50,98 +56,32 @@
+     where
+         Self: Sized,
+     {
+-        static GPU_LIST: OnceLock<(usize, Arc<RwLock<nvtop::ListHead>>)> = OnceLock::new();
+-
+-        let (gpu_count, gpu_list) = GPU_LIST
+-            .get_or_init(|| {
+-                unsafe {
+-                    nvtop::init_extract_gpuinfo_intel();
+-                    nvtop::init_extract_gpuinfo_amdgpu();
+-                    nvtop::init_extract_gpuinfo_nvidia();
+-                    nvtop::init_extract_gpuinfo_v3d();
+-                    nvtop::init_extract_gpuinfo_msm();
+-                    nvtop::init_extract_gpuinfo_panfrost();
+-                    nvtop::init_extract_gpuinfo_panthor();
+-                }
+-
+-                let gpu_list = Arc::new(RwLock::new(nvtop::ListHead {
+-                    next: std::ptr::null_mut(),
+-                    prev: std::ptr::null_mut(),
+-                }));
+-                {
+-                    let mut gl = gpu_list.write().unwrap();
+-                    gl.next = gl.deref_mut();
+-                    gl.prev = gl.deref_mut();
+-                }
+-
+-                let gpu_count = {
+-                    let mut gpu_list = gpu_list.write().unwrap();
+-                    let gpu_list = gpu_list.deref_mut();
+-
+-                    let mut gpu_count: u32 = 0;
+-                    let nvt_result =
+-                        unsafe { nvtop::gpuinfo_init_info_extraction(&mut gpu_count, gpu_list) };
+-                    if nvt_result == 0 {
+-                        log::error!("Unable to initialize GPU info extraction");
+-                        gpu_count = 0;
+-                    }
+-
+-                    let nvt_result = unsafe { nvtop::gpuinfo_populate_static_infos(gpu_list) };
+-                    if nvt_result == 0 {
+-                        log::error!("Unable to populate static GPU info");
+-                    }
+-
+-                    gpu_count
+-                };
+-
+-                (gpu_count as usize, gpu_list)
+-            })
+-            .clone();
+-
+-        let mut gpus = HashMap::with_capacity(gpu_count);
+-
+-        {
+-            let mut gpu_list = gpu_list.write().unwrap();
+-            let gpu_list = gpu_list.deref_mut();
+-
+-            let mut device = gpu_list.next;
+-            while device != gpu_list {
+-                let dev = unsafe { &*(device as *const nvtop::GpuInfo) };
+-                device = unsafe { (*device).next };
+-
+-                let Some(pci_id) = util::pci_id(dev) else {
+-                    continue;
+-                };
+-
+-                let Some((vendor_id, device_id)) =
+-                    util::ven_dev_ids(&pci_id, &mut String::with_capacity(1024))
+-                else {
+-                    continue;
+-                };
++        let ctop = ctop::Handle(unsafe { ctop::ctop_open() });
++        if ctop.0.is_null() {
++            log::error!("Unable to initialize GPU info extraction (libcezanne-top)");
++        } else {
++            // loads need two samples: this is the first
++            unsafe { ctop::ctop_refresh(ctop.0) };
++        }
+ 
+-                let device_name =
+-                    if gpu_info_valid!(dev.static_info, GpuInfoStaticInfoValid::DeviceNameValid) {
+-                        Some(
+-                            unsafe {
+-                                std::ffi::CStr::from_ptr(dev.static_info.device_name.as_ptr())
+-                            }
+-                            .to_string_lossy()
+-                            .to_string(),
+-                        )
+-                    } else {
+-                        None
+-                    };
+-
+-                let gpu = Gpu {
+-                    id: pci_id.to_string(),
+-                    vendor_id,
+-                    device_id,
+-                    device_name,
+-                    encode_decode_shared: dev.static_info.encode_decode_shared,
+-                    ..Default::default()
+-                };
+-                gpus.insert(pci_id.to_string(), gpu);
+-            }
++        let count = if ctop.0.is_null() {
++            0
++        } else {
++            unsafe { ctop::ctop_count(ctop.0) }
++        };
++        let mut gpus = HashMap::with_capacity(count as usize);
++        for i in 0..count {
++            let dev = unsafe { &*ctop::ctop_gpu(ctop.0, i) };
++            let id = ctop::string(&dev.id);
++            let gpu = Gpu {
++                id: id.clone(),
++                vendor_id: dev.vendor_id,
++                device_id: dev.device_id,
++                device_name: Some(ctop::string(&dev.name)),
++                encode_decode_shared: false,
++                ..Default::default()
++            };
++            gpus.insert(id, gpu);
+         }
+ 
+         let vulkan_versions = unsafe {
+@@ -160,9 +100,9 @@
+             HashMap::new()
+         });
+ 
+-        for (pci_id, gpu) in &mut gpus {
++        for (id, gpu) in &mut gpus {
+             if let Some((variant, version)) = unsafe {
+-                run_forked(|| Ok(gl_info::supported_opengl_version(pci_id))).unwrap_or_else(|e| {
++                run_forked(|| Ok(gl_info::supported_opengl_version(id))).unwrap_or_else(|e| {
+                     log::warn!("Failed to get OpenGL information: {}", e);
+                     None
+                 })
+@@ -177,244 +117,48 @@
+             }
+         }
+ 
+-        Self {
+-            gpu_list,
+-            gpus,
+-            proc_refresh_counter: 2, // Start at 2 so that the first increment will refresh processes
+-        }
++        Self { ctop, gpus }
+     }
+ 
+     fn refresh(&mut self) {
+-        let mut gpu_list = self.gpu_list.write().unwrap();
+-        let gpu_list = gpu_list.deref_mut();
+-
+-        let result = unsafe { nvtop::gpuinfo_refresh_dynamic_info(gpu_list) };
+-        if result == 0 {
+-            log::error!("Unable to refresh dynamic GPU info");
++        if self.ctop.0.is_null() {
+             return;
+         }
+-
+-        // Refreshing processes is very expensive, so refresh them only every 3rd time
+-        self.proc_refresh_counter = (self.proc_refresh_counter + 1) % 3;
+-        if self.proc_refresh_counter == 0 {
+-            let result = unsafe { nvtop::gpuinfo_refresh_processes(gpu_list) };
+-            if result == 0 {
+-                log::warn!("Unable to refresh GPU processes");
+-            }
+-        }
+-
+-        let result = unsafe { nvtop::gpuinfo_utilisation_rate(gpu_list) };
+-        if result == 0 {
+-            log::warn!("Unable to refresh utilization rate");
+-        }
+-
+-        let result = unsafe { nvtop::gpuinfo_fix_dynamic_info_from_process_info(gpu_list) };
+-        if result == 0 {
+-            log::warn!("Unable to fix dynamic GPU info from process info");
++        if unsafe { ctop::ctop_refresh(self.ctop.0) } != 0 {
++            log::error!("Unable to refresh dynamic GPU info");
++            return;
+         }
+ 
+-        let mut device: *mut nvtop::ListHead = gpu_list.next;
+-        while device != gpu_list {
+-            let dev = unsafe { &*(device as *const nvtop::GpuInfo) };
+-            device = unsafe { (*device).next };
+-
+-            let Some(pci_id) = util::pci_id(dev) else {
++        for i in 0..unsafe { ctop::ctop_count(self.ctop.0) } {
++            let dev = unsafe { &*ctop::ctop_gpu(self.ctop.0, i) };
++            let id = ctop::string(&dev.id);
++            let Some(gpu) = self.gpus.get_mut(&id) else {
++                log::warn!("Unable to find gpu `{}` in cache", id);
+                 continue;
+             };
++            let v = dev.valid;
+ 
+-            let gpu = match self.gpus.get_mut(pci_id.as_str()) {
+-                Some(gpu) => gpu,
+-                None => {
+-                    log::warn!("Unable to find gpu `{}` in cache", pci_id);
+-                    continue;
+-                }
+-            };
+-
+-            gpu.temperature_c =
+-                if gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::GpuTempValid) {
+-                    Some(dev.dynamic_info.gpu_temp as f32)
+-                } else {
+-                    None
+-                };
+-            gpu.fan_speed_percent =
+-                if gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::FanSpeedValid) {
+-                    Some(dev.dynamic_info.fan_speed as f32)
+-                } else {
+-                    None
+-                };
+-            gpu.utilization_percent =
+-                if gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::GpuUtilRateValid) {
+-                    Some(dev.dynamic_info.gpu_util_rate as f32)
+-                } else {
+-                    None
+-                };
+-            gpu.power_draw_watts =
+-                if gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::PowerDrawValid) {
+-                    Some(dev.dynamic_info.power_draw as f32 / 1000.)
+-                } else {
+-                    None
+-                };
+-            gpu.max_power_draw_watts =
+-                if gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::PowerDrawMaxValid) {
+-                    Some(dev.dynamic_info.power_draw_max as f32 / 1000.)
+-                } else {
+-                    None
+-                };
+-            gpu.clock_speed_mhz = if gpu_info_valid!(
+-                dev.dynamic_info,
+-                GpuInfoDynamicInfoValid::GpuClockSpeedValid
+-            ) {
+-                Some(dev.dynamic_info.gpu_clock_speed)
+-            } else {
+-                None
+-            };
+-            gpu.max_clock_speed_mhz = if gpu_info_valid!(
+-                dev.dynamic_info,
+-                GpuInfoDynamicInfoValid::GpuClockSpeedMaxValid
+-            ) {
+-                Some(dev.dynamic_info.gpu_clock_speed_max)
+-            } else {
+-                None
+-            };
+-            gpu.memory_speed_mhz = if gpu_info_valid!(
+-                dev.dynamic_info,
+-                GpuInfoDynamicInfoValid::MemClockSpeedValid
+-            ) {
+-                Some(dev.dynamic_info.mem_clock_speed)
+-            } else {
+-                None
+-            };
+-            gpu.max_memory_speed_mhz = if gpu_info_valid!(
+-                dev.dynamic_info,
+-                GpuInfoDynamicInfoValid::MemClockSpeedMaxValid
+-            ) {
+-                Some(dev.dynamic_info.mem_clock_speed_max)
+-            } else {
+-                None
+-            };
+-            gpu.total_memory =
+-                if gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::TotalMemoryValid) {
+-                    Some(dev.dynamic_info.total_memory)
+-                } else {
+-                    None
+-                };
+-            gpu.used_memory =
+-                if gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::UsedMemoryValid) {
+-                    Some(dev.dynamic_info.used_memory)
+-                } else {
+-                    None
+-                };
+-            gpu.total_shared_memory = util::shared_mem_total(&pci_id, &mut String::new());
+-            gpu.used_shared_memory = util::shared_mem_used(&pci_id, &mut String::new());
+-            gpu.encoder_percent = {
+-                // FIXME: Concession, if the value is 0, we assume it might be valid even if the
+-                //        validity check fails.
+-                //        This is needed because these values are not set to valid until the first
+-                //        time the encoding function of the GPU is used
+-
+-                let valid =
+-                    gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::EncoderRateValid);
+-
+-                if valid || dev.dynamic_info.encoder_rate == 0 {
+-                    Some(dev.dynamic_info.encoder_rate as f32)
+-                } else {
+-                    None
+-                }
+-            };
+-            gpu.decoder_percent = {
+-                // FIXME: Concession, if the value is 0, we assume it might be valid even if the
+-                //        validity check fails.
+-                //        This is needed because these values are not set to valid until the first
+-                //        time the decoding function of the GPU is used
+-
+-                let valid =
+-                    gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::DecoderRateValid);
+-
+-                if valid || dev.dynamic_info.decoder_rate == 0 {
+-                    Some(dev.dynamic_info.decoder_rate as f32)
+-                } else {
+-                    None
+-                }
+-            };
+-            gpu.pcie_gen =
+-                if gpu_info_valid!(dev.dynamic_info, GpuInfoDynamicInfoValid::PcieLinkGenValid) {
+-                    Some(dev.dynamic_info.pcie_link_gen)
+-                } else {
+-                    util::pcie_speed(&pci_id, &mut String::new())
+-                };
+-
+-            gpu.pcie_lanes = if gpu_info_valid!(
+-                dev.dynamic_info,
+-                GpuInfoDynamicInfoValid::PcieLinkWidthValid
+-            ) {
+-                Some(dev.dynamic_info.pcie_link_width)
+-            } else {
+-                util::pcie_width(&pci_id, &mut String::new())
+-            };
+-
+-            gpu.max_pcie_gen = util::max_pcie_speed(&pci_id, &mut String::new());
+-            gpu.max_pcie_lanes = util::max_pcie_width(&pci_id, &mut String::new());
+-
+-            if let Some(max_pcie_gen) = gpu.max_pcie_gen {
+-                if let Some(pcie_gen) = gpu.pcie_gen {
+-                    if let Some(max_pcie_lanes) = gpu.max_pcie_lanes {
+-                        if let Some(pcie_lanes) = gpu.pcie_lanes {
+-                            if max_pcie_gen < pcie_gen || max_pcie_lanes < pcie_lanes {
+-                                gpu.max_pcie_gen = None;
+-                                gpu.max_pcie_lanes = None;
+-                            }
+-                        }
+-                    }
+-                }
+-            }
++            gpu.temperature_c = flag(v, ctop::CTOP_TEMP, dev.temp_mc as f32 / 1000.);
++            gpu.utilization_percent = percent(v, ctop::CTOP_UTIL, dev.util);
++            gpu.clock_speed_mhz = flag(v, ctop::CTOP_CLOCK, dev.clock_mhz);
++            gpu.max_clock_speed_mhz = flag(v, ctop::CTOP_CLOCK_MAX, dev.clock_max_mhz);
++            gpu.total_shared_memory = flag(v, ctop::CTOP_MEMORY, dev.memory_total);
++            gpu.used_shared_memory = flag(v, ctop::CTOP_MEMORY, dev.memory_used);
++            // an engine without a driver yet idles at 0% (the UI lays out
++            // both or neither)
++            gpu.decoder_percent = Some(dev.decode.round());
++            gpu.encoder_percent = Some(dev.encode.round());
+ 
+             gpu.processes.clear();
+-            for i in 0..dev.processes_count as usize {
+-                let nvtop_proc = unsafe { &*dev.processes.add(i) };
+-
++            for p in dev.processes() {
+                 let process = Process {
+-                    kind: match nvtop_proc.r#type {
+-                        GpuProcessType::Graphical => Some(ProcessKind::Graphical as i32),
+-                        GpuProcessType::Compute => Some(ProcessKind::Compute as i32),
+-                        GpuProcessType::GraphicalCompute => {
+-                            Some(ProcessKind::GraphicalCompute as i32)
+-                        }
+-                        _ => None,
+-                    },
+-                    memory_usage_bytes: if gpu_info_valid!(
+-                        nvtop_proc,
+-                        GpuInfoProcessInfoValid::GpuMemoryUsageValid
+-                    ) {
+-                        Some(nvtop_proc.gpu_memory_usage)
+-                    } else {
+-                        None
+-                    },
+-                    gpu_usage_percent: if gpu_info_valid!(
+-                        nvtop_proc,
+-                        GpuInfoProcessInfoValid::GpuUsageValid
+-                    ) {
+-                        Some(nvtop_proc.gpu_usage as f32)
+-                    } else {
+-                        None
+-                    },
+-                    encode_usage_percent: if gpu_info_valid!(
+-                        nvtop_proc,
+-                        GpuInfoProcessInfoValid::EncodeUsageValid
+-                    ) {
+-                        Some(nvtop_proc.encode_usage as f32)
+-                    } else {
+-                        None
+-                    },
+-                    decode_usage_percent: if gpu_info_valid!(
+-                        nvtop_proc,
+-                        GpuInfoProcessInfoValid::DecodeUsageValid
+-                    ) {
+-                        Some(nvtop_proc.decode_usage as f32)
+-                    } else {
+-                        None
+-                    },
++                    kind: flag(p.valid, ctop::CTOP_UTIL | ctop::CTOP_MEMORY, ProcessKind::Graphical as i32),
++                    memory_usage_bytes: flag(p.valid, ctop::CTOP_MEMORY, p.memory),
++                    gpu_usage_percent: percent(p.valid, ctop::CTOP_UTIL, p.util),
++                    encode_usage_percent: percent(p.valid, ctop::CTOP_ENCODE, p.encode),
++                    decode_usage_percent: percent(p.valid, ctop::CTOP_DECODE, p.decode),
+                 };
+-                gpu.processes.insert(nvtop_proc.pid as u32, process);
++                gpu.processes.insert(p.pid as u32, process);
+             }
+         }
+     }
+diff --color -ruN a/subprojects/magpie/platform-linux/src/gpus/nvtop.rs b/subprojects/magpie/platform-linux/src/gpus/nvtop.rs
+--- a/subprojects/magpie/platform-linux/src/gpus/nvtop.rs	2026-10-28 21:19:07.386396530 +0100
++++ b/subprojects/magpie/platform-linux/src/gpus/nvtop.rs	1970-01-01 01:00:00.000000000 +0100
+@@ -1,262 +0,0 @@
+-/* src/gpus/nvtop.rs
+- *
+- * Copyright 2025 Mission Center Developers
+- *
+- * This program is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+- *
+- * SPDX-License-Identifier: GPL-3.0-or-later
+- */
+-
+-use nix::libc::{c_char, c_ulong, c_ulonglong};
+-
+-#[macro_export]
+-macro_rules! gpu_info_valid {
+-    ($info: expr, $field: expr) => {{
+-        let field = $field as usize;
+-        ((($info).valid)[field / 8] & (1 << (field % 8))) != 0
+-    }};
+-}
+-
+-const MAX_DEVICE_NAME: usize = 128;
+-const PDEV_LEN: usize = 16;
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub struct ListHead {
+-    pub next: *mut ListHead,
+-    pub prev: *mut ListHead,
+-}
+-
+-// TODO: This is a requirement for Arc<RwLock<ListHead>> to work
+-//       But I don't understand why it's needed since access to the ListHead always happens via
+-//       RwLock::write() or RwLock::read() which should ensure that the ListHead is only mutated
+-//       by one thread at a time.
+-unsafe impl Send for ListHead {}
+-unsafe impl Sync for ListHead {}
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub struct GpuVendor {
+-    pub list: ListHead,
+-
+-    pub init: Option<fn() -> u8>,
+-    pub shutdown: Option<fn()>,
+-
+-    pub last_error_string: Option<extern "C" fn() -> *const i8>,
+-
+-    pub get_device_handles: Option<extern "C" fn(devices: *mut ListHead, count: *mut u32) -> u8>,
+-
+-    pub populate_static_info: Option<extern "C" fn(gpu_info: *mut GpuInfo)>,
+-    pub refresh_dynamic_info: Option<extern "C" fn(gpu_info: *mut GpuInfo)>,
+-    pub refresh_utilisation_rate: Option<extern "C" fn(gpu_info: *mut GpuInfo)>,
+-
+-    pub refresh_running_processes: Option<extern "C" fn(gpu_info: *mut GpuInfo)>,
+-
+-    pub name: *mut i8,
+-}
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub enum GpuInfoStaticInfoValid {
+-    DeviceNameValid = 0,
+-    MaxPcieGenValid,
+-    MaxPcieLinkWidthValid,
+-    TemperatureShutdownThresholdValid,
+-    TemperatureSlowdownThresholdValid,
+-    NumberSharedCoresValid,
+-    L2CacheSizeValid,
+-    NumberExecEnginesValid,
+-    NumberEnginesValid,
+-    StaticInfoCount,
+-}
+-
+-const GPU_INFO_STATIC_INFO_COUNT: usize = GpuInfoStaticInfoValid::StaticInfoCount as usize;
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub struct GpuInfoStaticInfo {
+-    pub device_name: [c_char; MAX_DEVICE_NAME],
+-    pub max_pcie_gen: u32,
+-    pub max_pcie_link_width: u32,
+-    pub temperature_shutdown_threshold: u32,
+-    pub temperature_slowdown_threshold: u32,
+-    pub n_shared_cores: u32,
+-    pub l2cache_size: u32,
+-    pub n_exec_engines: u32,
+-    pub engine_count: u32,
+-    pub integrated_graphics: bool,
+-    pub encode_decode_shared: bool,
+-    pub valid: [u8; GPU_INFO_STATIC_INFO_COUNT.div_ceil(u8::BITS as _)],
+-}
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub enum GpuInfoDynamicInfoValid {
+-    GpuClockSpeedValid = 0,
+-    GpuClockSpeedMaxValid,
+-    MemClockSpeedValid,
+-    MemClockSpeedMaxValid,
+-    GpuUtilRateValid,
+-    MemUtilRateValid,
+-    EncoderRateValid,
+-    DecoderRateValid,
+-    TotalMemoryValid,
+-    FreeMemoryValid,
+-    UsedMemoryValid,
+-    PcieLinkGenValid,
+-    PcieLinkWidthValid,
+-    PcieRxValid,
+-    PcieTxValid,
+-    FanSpeedValid,
+-    FanRpmValid,
+-    GpuTempValid,
+-    PowerDrawValid,
+-    PowerDrawMaxValid,
+-    EffectiveLoadRateValid,
+-    MultiInstanceModeValid,
+-    DynamicInfoCount,
+-}
+-
+-const GPU_INFO_DYNAMIC_INFO_COUNT: usize = GpuInfoDynamicInfoValid::DynamicInfoCount as usize;
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub struct GpuInfoDynamicInfo {
+-    pub gpu_clock_speed: u32,
+-    pub gpu_clock_speed_max: u32,
+-    pub mem_clock_speed: u32,
+-    pub mem_clock_speed_max: u32,
+-    pub gpu_util_rate: u32,
+-    pub mem_util_rate: u32,
+-    pub effective_load_rate: u32,
+-    pub encoder_rate: u32,
+-    pub decoder_rate: u32,
+-    pub total_memory: u64,
+-    pub free_memory: u64,
+-    pub used_memory: u64,
+-    pub pcie_link_gen: u32,
+-    pub pcie_link_width: u32,
+-    pub pcie_rx: u32,
+-    pub pcie_tx: u32,
+-    pub fan_speed: u32,
+-    pub fan_rpm: u32,
+-    pub gpu_temp: u32,
+-    pub power_draw: u32,
+-    pub power_draw_max: u32,
+-    pub multi_instance_mode: bool,
+-    pub valid: [u8; GPU_INFO_DYNAMIC_INFO_COUNT.div_ceil(u8::BITS as _)],
+-}
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub enum GpuProcessType {
+-    Unknown = 0,
+-    Graphical = 1,
+-    Compute = 2,
+-    GraphicalCompute = 3,
+-    Count,
+-}
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub enum GpuInfoProcessInfoValid {
+-    CmdlineValid,
+-    UserNameValid,
+-    GfxEngineUsedValid,
+-    ComputeEngineUsedValid,
+-    EncEngineUsedValid,
+-    DecEngineUsedValid,
+-    GpuUsageValid,
+-    EncodeUsageValid,
+-    DecodeUsageValid,
+-    GpuMemoryUsageValid,
+-    GpuMemoryPercentageValid,
+-    CpuUsageValid,
+-    CpuMemoryVirtValid,
+-    CpuMemoryResValid,
+-    GpuCyclesValid,
+-    SampleDeltaValid,
+-    ProcessValidInfoCount,
+-}
+-
+-const GPU_PROCESS_INFO_VALID_INFO_COUNT: usize =
+-    GpuInfoProcessInfoValid::ProcessValidInfoCount as usize;
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub struct GpuProcess {
+-    pub r#type: GpuProcessType,
+-    pub pid: i32,
+-    pub cmdline: *mut c_char,
+-    pub user_name: *mut c_char,
+-    pub sample_delta: u64, // Time spent between two successive samples
+-    pub gfx_engine_used: u64,
+-    pub compute_engine_used: u64,
+-    pub enc_engine_used: u64,
+-    pub dec_engine_used: u64,
+-    pub gpu_cycles: u64, // Number of GPU cycles spent in the GPU gfx engine
+-    pub gpu_usage: u32,
+-    pub encode_usage: u32,
+-    pub decode_usage: u32,
+-    pub gpu_memory_usage: c_ulonglong,
+-    pub gpu_memory_percentage: u32,
+-
+-    pub cpu_usage: u32,
+-    pub cpu_memory_virt: c_ulong,
+-    pub cpu_memory_res: c_ulong,
+-    pub valid: [u8; GPU_PROCESS_INFO_VALID_INFO_COUNT.div_ceil(u8::BITS as _)],
+-}
+-
+-#[repr(C)]
+-#[derive(Debug, Copy, Clone)]
+-pub struct GpuInfo {
+-    pub list: ListHead,
+-    pub vendor: *mut GpuVendor,
+-    pub static_info: GpuInfoStaticInfo,
+-    pub dynamic_info: GpuInfoDynamicInfo,
+-    pub processes_count: u32,
+-    pub processes: *mut GpuProcess,
+-    pub processes_array_size: u32,
+-    pub pdev: [c_char; PDEV_LEN],
+-}
+-
+-extern "C" {
+-    pub fn gpuinfo_init_info_extraction(
+-        monitored_dev_count: *mut u32,
+-        devices: *mut ListHead,
+-    ) -> u8;
+-
+-    pub fn gpuinfo_shutdown_info_extraction(devices: *mut ListHead) -> u8;
+-
+-    pub fn init_extract_gpuinfo_amdgpu();
+-    pub fn init_extract_gpuinfo_ascend();
+-    pub fn init_extract_gpuinfo_intel();
+-    pub fn init_extract_gpuinfo_ixml();
+-    pub fn init_extract_gpuinfo_metax();
+-    pub fn init_extract_gpuinfo_msm();
+-    pub fn init_extract_gpuinfo_nvidia();
+-    pub fn init_extract_gpuinfo_panfrost();
+-    pub fn init_extract_gpuinfo_panthor();
+-    pub fn init_extract_gpuinfo_radeon();
+-    pub fn init_extract_gpuinfo_tenstorrent();
+-    pub fn init_extract_gpuinfo_tpu();
+-    pub fn init_extract_gpuinfo_v3d();
+-    pub fn init_extract_gpuinfo_rknpu();
+-
+-    pub fn gpuinfo_populate_static_infos(devices: *mut ListHead) -> u8;
+-    pub fn gpuinfo_refresh_dynamic_info(devices: *mut ListHead) -> u8;
+-    pub fn gpuinfo_refresh_processes(devices: *mut ListHead) -> u8;
+-    pub fn gpuinfo_utilisation_rate(devices: *mut ListHead) -> u8;
+-    pub fn gpuinfo_fix_dynamic_info_from_process_info(devices: *mut ListHead) -> u8;
+-}
+diff --color -ruN a/subprojects/magpie/platform-linux/src/gpus/util.rs b/subprojects/magpie/platform-linux/src/gpus/util.rs
+--- a/subprojects/magpie/platform-linux/src/gpus/util.rs	2026-10-28 21:19:07.386453436 +0100
++++ b/subprojects/magpie/platform-linux/src/gpus/util.rs	1970-01-01 01:00:00.000000000 +0100
+@@ -1,462 +0,0 @@
+-/* src/gpus/util.rs
+- *
+- * Copyright 2025 Mission Center Developers
+- *
+- * This program is free software: you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation, either version 3 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+- *
+- * SPDX-License-Identifier: GPL-3.0-or-later
+- */
+-
+-use std::fmt::Write;
+-use std::io::Read;
+-
+-use arrayvec::ArrayString;
+-
+-use super::nvtop;
+-
+-pub fn pci_id(gpu: &nvtop::GpuInfo) -> Option<ArrayString<16>> {
+-    let pdev = unsafe { std::ffi::CStr::from_ptr(gpu.pdev.as_ptr()) };
+-    let pdev = match pdev.to_str() {
+-        Ok(pd) => pd,
+-        Err(_) => {
+-            log::warn!("Unable to convert PCI ID to string: {:?}", pdev);
+-            return None;
+-        }
+-    };
+-    let pci_id = match ArrayString::<16>::from(pdev) {
+-        Ok(id) => id,
+-        Err(_) => {
+-            log::warn!("PCI ID exceeds 16 characters: {}", pdev);
+-            return None;
+-        }
+-    };
+-
+-    Some(pci_id)
+-}
+-
+-pub fn shared_mem_used(pci_id: &ArrayString<16>, buffer: &mut String) -> Option<u64> {
+-    const SYS_PATH_CAP: usize = "/sys/bus/pci/devices/".len() + 16 + "/mem_info_gtt_used".len();
+-
+-    let mut path = ArrayString::<SYS_PATH_CAP>::new();
+-    let _ = write!(&mut path, "/sys/bus/pci/devices/{pci_id}/mem_info_gtt_used");
+-
+-    let mut file = match std::fs::OpenOptions::new()
+-        .read(true)
+-        .open(path)
+-        .or({
+-            let mut pci_id_lower = *pci_id;
+-            for c in unsafe { pci_id_lower.as_bytes_mut() } {
+-                c.make_ascii_lowercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_lower}/mem_info_gtt_used"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        })
+-        .or({
+-            let mut pci_id_upper = *pci_id;
+-            for c in unsafe { pci_id_upper.as_bytes_mut() } {
+-                c.make_ascii_uppercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_upper}/mem_info_gtt_used"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        }) {
+-        Ok(f) => f,
+-        Err(e) => {
+-            log::debug!("Failed to open {}: {}", path, e);
+-            return None;
+-        }
+-    };
+-
+-    file.read_to_string(buffer)
+-        .ok()
+-        .and_then(|_| buffer.trim().parse::<u64>().ok())
+-}
+-
+-pub fn shared_mem_total(pci_id: &ArrayString<16>, buffer: &mut String) -> Option<u64> {
+-    const SYS_PATH_CAP: usize = "/sys/bus/pci/devices/".len() + 16 + "/mem_info_gtt_total".len();
+-
+-    let mut path = ArrayString::<SYS_PATH_CAP>::new();
+-    let _ = write!(
+-        &mut path,
+-        "/sys/bus/pci/devices/{pci_id}/mem_info_gtt_total"
+-    );
+-
+-    let mut file = match std::fs::OpenOptions::new()
+-        .read(true)
+-        .open(path)
+-        .or({
+-            let mut pci_id_lower = *pci_id;
+-            for c in unsafe { pci_id_lower.as_bytes_mut() } {
+-                c.make_ascii_lowercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_lower}/mem_info_gtt_total"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        })
+-        .or({
+-            let mut pci_id_upper = *pci_id;
+-            for c in unsafe { pci_id_upper.as_bytes_mut() } {
+-                c.make_ascii_uppercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_upper}/mem_info_gtt_total"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        }) {
+-        Ok(f) => f,
+-        Err(e) => {
+-            log::debug!("Failed to open {}: {}", path, e);
+-            return None;
+-        }
+-    };
+-
+-    file.read_to_string(buffer)
+-        .ok()
+-        .and_then(|_| buffer.trim().parse::<u64>().ok())
+-}
+-
+-pub fn pcie_speed(pci_id: &ArrayString<16>, buffer: &mut String) -> Option<u32> {
+-    const SYS_PATH_CAP: usize = "/sys/bus/pci/devices/".len() + 16 + "/current_link_speed".len();
+-
+-    let mut path = ArrayString::<SYS_PATH_CAP>::new();
+-    let _ = write!(
+-        &mut path,
+-        "/sys/bus/pci/devices/{pci_id}/current_link_speed"
+-    );
+-
+-    let mut file = match std::fs::OpenOptions::new()
+-        .read(true)
+-        .open(path)
+-        .or({
+-            let mut pci_id_lower = *pci_id;
+-            for c in unsafe { pci_id_lower.as_bytes_mut() } {
+-                c.make_ascii_lowercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_lower}/current_link_speed"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        })
+-        .or({
+-            let mut pci_id_upper = *pci_id;
+-            for c in unsafe { pci_id_upper.as_bytes_mut() } {
+-                c.make_ascii_uppercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_upper}/current_link_speed"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        }) {
+-        Ok(f) => f,
+-        Err(e) => {
+-            log::debug!("Failed to open {}: {}", path, e);
+-            return None;
+-        }
+-    };
+-
+-    file.read_to_string(buffer).ok().and_then(|_| {
+-        let content = buffer.trim();
+-        if content.ends_with(" GT/s PCIe") {
+-            let last_line = content.lines().last().unwrap();
+-            let number = last_line.split_whitespace().next().unwrap();
+-            if let Some(number) = Some(number) {
+-                match number {
+-                    "2.5" => Some(1),
+-                    "5.0" => Some(2),
+-                    "8.0" => Some(3),
+-                    "16.0" => Some(4),
+-                    "32.0" => Some(5),
+-                    "64.0" => Some(6),
+-                    _ => None,
+-                }
+-            } else {
+-                None
+-            }
+-        } else {
+-            None
+-        }
+-    })
+-}
+-
+-pub fn max_pcie_speed(pci_id: &ArrayString<16>, buffer: &mut String) -> Option<u32> {
+-    const SYS_PATH_CAP: usize = "/sys/bus/pci/devices/".len() + 16 + "/max_link_speed".len();
+-
+-    let mut path = ArrayString::<SYS_PATH_CAP>::new();
+-    let _ = write!(&mut path, "/sys/bus/pci/devices/{pci_id}/max_link_speed");
+-
+-    let mut file = match std::fs::OpenOptions::new()
+-        .read(true)
+-        .open(path)
+-        .or({
+-            let mut pci_id_lower = *pci_id;
+-            for c in unsafe { pci_id_lower.as_bytes_mut() } {
+-                c.make_ascii_lowercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_lower}/max_link_speed"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        })
+-        .or({
+-            let mut pci_id_upper = *pci_id;
+-            for c in unsafe { pci_id_upper.as_bytes_mut() } {
+-                c.make_ascii_uppercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_upper}/max_link_speed"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        }) {
+-        Ok(f) => f,
+-        Err(e) => {
+-            log::debug!("Failed to open {}: {}", path, e);
+-            return None;
+-        }
+-    };
+-
+-    file.read_to_string(buffer).ok().and_then(|_| {
+-        let content = buffer.trim();
+-        if content.ends_with(" GT/s PCIe") {
+-            let last_line = content.lines().last().unwrap();
+-            let number = last_line.split_whitespace().next().unwrap();
+-            if let Some(number) = Some(number) {
+-                match number {
+-                    "2.5" => Some(1),
+-                    "5.0" => Some(2),
+-                    "8.0" => Some(3),
+-                    "16.0" => Some(4),
+-                    "32.0" => Some(5),
+-                    "64.0" => Some(6),
+-                    _ => None,
+-                }
+-            } else {
+-                None
+-            }
+-        } else {
+-            None
+-        }
+-    })
+-}
+-
+-pub fn pcie_width(pci_id: &ArrayString<16>, buffer: &mut String) -> Option<u32> {
+-    const SYS_PATH_CAP: usize = "/sys/bus/pci/devices/".len() + 16 + "/current_link_width".len();
+-
+-    let mut path = ArrayString::<SYS_PATH_CAP>::new();
+-    let _ = write!(
+-        &mut path,
+-        "/sys/bus/pci/devices/{pci_id}/current_link_width"
+-    );
+-
+-    let mut file = match std::fs::OpenOptions::new()
+-        .read(true)
+-        .open(path)
+-        .or({
+-            let mut pci_id_lower = *pci_id;
+-            for c in unsafe { pci_id_lower.as_bytes_mut() } {
+-                c.make_ascii_lowercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_lower}/current_link_width"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        })
+-        .or({
+-            let mut pci_id_upper = *pci_id;
+-            for c in unsafe { pci_id_upper.as_bytes_mut() } {
+-                c.make_ascii_uppercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_upper}/current_link_width"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        }) {
+-        Ok(f) => f,
+-        Err(e) => {
+-            log::debug!("Failed to open {}: {}", path, e);
+-            return None;
+-        }
+-    };
+-
+-    file.read_to_string(buffer)
+-        .ok()
+-        .and_then(|_| buffer.lines().last().unwrap().trim().parse::<u32>().ok())
+-}
+-
+-pub fn max_pcie_width(pci_id: &ArrayString<16>, buffer: &mut String) -> Option<u32> {
+-    const SYS_PATH_CAP: usize = "/sys/bus/pci/devices/".len() + 16 + "/max_link_width".len();
+-
+-    let mut path = ArrayString::<SYS_PATH_CAP>::new();
+-    let _ = write!(&mut path, "/sys/bus/pci/devices/{pci_id}/max_link_width");
+-
+-    let mut file = match std::fs::OpenOptions::new()
+-        .read(true)
+-        .open(path)
+-        .or({
+-            let mut pci_id_lower = *pci_id;
+-            for c in unsafe { pci_id_lower.as_bytes_mut() } {
+-                c.make_ascii_lowercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_lower}/max_link_width"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        })
+-        .or({
+-            let mut pci_id_upper = *pci_id;
+-            for c in unsafe { pci_id_upper.as_bytes_mut() } {
+-                c.make_ascii_uppercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(
+-                &mut path,
+-                "/sys/bus/pci/devices/{pci_id_upper}/max_link_width"
+-            );
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        }) {
+-        Ok(f) => f,
+-        Err(e) => {
+-            log::debug!("Failed to open {}: {}", path, e);
+-            return None;
+-        }
+-    };
+-
+-    file.read_to_string(buffer)
+-        .ok()
+-        .and_then(|_| buffer.lines().last().unwrap().trim().parse::<u32>().ok())
+-}
+-
+-pub fn ven_dev_ids(pci_id: &ArrayString<16>, buffer: &mut String) -> Option<(u32, u32)> {
+-    const SYS_PATH_CAP: usize = "/sys/bus/pci/devices/".len() + 16 + "/uevent".len();
+-
+-    let mut path = ArrayString::<SYS_PATH_CAP>::new();
+-    let _ = write!(&mut path, "/sys/bus/pci/devices/{pci_id}/uevent");
+-    let mut uevent_file = match std::fs::OpenOptions::new()
+-        .read(true)
+-        .open(path)
+-        .or({
+-            let mut pci_id_lower = *pci_id;
+-            for c in unsafe { pci_id_lower.as_bytes_mut() } {
+-                c.make_ascii_lowercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(&mut path, "/sys/bus/pci/devices/{pci_id_lower}/uevent");
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        })
+-        .or({
+-            let mut pci_id_upper = *pci_id;
+-            for c in unsafe { pci_id_upper.as_bytes_mut() } {
+-                c.make_ascii_uppercase();
+-            }
+-
+-            path.clear();
+-            let _ = write!(&mut path, "/sys/bus/pci/devices/{pci_id_upper}/uevent");
+-
+-            std::fs::OpenOptions::new().read(true).open(path)
+-        }) {
+-        Ok(f) => f,
+-        Err(e) => {
+-            log::error!("Unable to open `{path}` file for device `{pci_id}`: {e}");
+-            return None;
+-        }
+-    };
+-
+-    buffer.clear();
+-    match uevent_file.read_to_string(buffer) {
+-        Ok(_) => {
+-            let mut vendor_id = None;
+-            let mut device_id = None;
+-
+-            for line in buffer.lines().map(|l| l.trim()) {
+-                if let Some(line) = line.strip_prefix("PCI_ID=") {
+-                    let mut ids = line.split(':');
+-                    vendor_id = ids
+-                        .next()
+-                        .and_then(|id| u16::from_str_radix(id, 16).ok())
+-                        .map(|id| id as u32);
+-                    device_id = ids
+-                        .next()
+-                        .and_then(|id| u16::from_str_radix(id, 16).ok())
+-                        .map(|id| id as u32);
+-                    break;
+-                }
+-            }
+-
+-            match (vendor_id, device_id) {
+-                (Some(v), Some(d)) => Some((v, d)),
+-                _ => {
+-                    log::error!(
+-                        "Unable to parse vendor and device IDs from `uevent` file content for device {pci_id}",
+-                    );
+-                    None
+-                }
+-            }
+-        }
+-        Err(_) => {
+-            log::error!("Unable to read `uevent` file content for device {pci_id}");
+-            None
+-        }
+-    }
+-}
+diff --color -ruN a/subprojects/magpie/platform-linux/src/memory.rs b/subprojects/magpie/platform-linux/src/memory.rs
+--- a/subprojects/magpie/platform-linux/src/memory.rs	2026-10-28 21:29:15.094991315 +0100
++++ b/subprojects/magpie/platform-linux/src/memory.rs	2026-10-28 21:29:15.856593543 +0100
+@@ -219,13 +219,32 @@
+     update_zfs_arc_usage(memory);
+ }
+ 
++// cezanne port: phones have no SMBIOS; the kernel's mt6885-dram-info device
++// carries the same MEMORY_DEVICE_* udev properties (one module per rank)
++fn memory_info_device() -> String {
++    const DMI: &str = "/sys/devices/virtual/dmi/id";
++    if std::path::Path::new(DMI).exists() {
++        return DMI.to_owned();
++    }
++    std::fs::read_dir("/sys/bus/platform/drivers/cezanne-dram-info")
++        .ok()
++        .and_then(|mut entries| {
++            entries.find_map(|e| {
++                let path = std::fs::canonicalize(e.ok()?.path()).ok()?;
++                path.join("memory_devices").exists().then_some(path)
++            })
++        })
++        .map(|p| p.to_string_lossy().into_owned())
++        .unwrap_or_else(|| DMI.to_owned())
++}
++
+ pub fn read_memory_device_info(devices: &mut Vec<MemoryDevice>) -> u64 {
+     let mut cmd = Command::new("udevadm");
+     cmd.arg("info")
+         .arg("-q")
+         .arg("property")
+         .arg("-p")
+-        .arg("/sys/devices/virtual/dmi/id");
++        .arg(memory_info_device());
+     cmd.env_remove("LD_PRELOAD");
+ 
+     let cmd_output = match cmd.output() {

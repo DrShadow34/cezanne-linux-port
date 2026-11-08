@@ -1,0 +1,21 @@
+#!/bin/sh
+# Re-initialise the MT6360 Type-C/PD controller when it has lost its setup.
+#
+# After the PD hard reset at boot (plugged into a PC) the TCPC came back
+# with every register at its default: ALERT_MASK 0, so no interrupt ever
+# reached tcpci and no later attach was seen (a charger plugged in later
+# stayed at 5 V / 500 mA, no PD).  A replug normally keeps the mask; this
+# checks it every few seconds and rebinds the driver when it reads 0.
+DEV=mt6360-tcpc.8.auto
+DRV=/sys/bus/platform/drivers/mt6360-tcpc
+while :; do
+	sleep 5
+	[ -e "$DRV/$DEV" ] || continue
+	mask=$(i2cget -f -y 1 0x4e 0x12 2>/dev/null) || continue
+	if [ "$mask" = 0x00 ]; then
+		echo "TCPC alert mask lost (fault $(i2cget -f -y 1 0x4e 0x1f)), re-initialising"
+		echo $DEV > $DRV/unbind
+		sleep 1
+		echo $DEV > $DRV/bind
+	fi
+done

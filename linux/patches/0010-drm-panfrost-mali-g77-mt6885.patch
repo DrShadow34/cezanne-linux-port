@@ -1,0 +1,474 @@
+diff --git a/drivers/gpu/drm/panfrost/panfrost_devfreq.c b/drivers/gpu/drm/panfrost/panfrost_devfreq.c
+index b51c30778..74b31c777 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_devfreq.c
++++ b/drivers/gpu/drm/panfrost/panfrost_devfreq.c
+@@ -13,6 +13,31 @@
+ #include "panfrost_device.h"
+ #include "panfrost_devfreq.h"
+ 
++/* simple_ondemand thresholds, also writable at runtime (one GPU) */
++static unsigned int panfrost_upthreshold = 45;
++static unsigned int panfrost_downdifferential = 5;
++static struct devfreq_simple_ondemand_data *panfrost_gov_data;
++
++static int panfrost_gov_param_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = param_set_uint(val, kp);
++
++	if (ret || !panfrost_gov_data)
++		return ret;
++	WRITE_ONCE(panfrost_gov_data->upthreshold, panfrost_upthreshold);
++	WRITE_ONCE(panfrost_gov_data->downdifferential, panfrost_downdifferential);
++	return 0;
++}
++
++static const struct kernel_param_ops panfrost_gov_param_ops = {
++	.set = panfrost_gov_param_set,
++	.get = param_get_uint,
++};
++module_param_cb(upthreshold, &panfrost_gov_param_ops, &panfrost_upthreshold, 0644);
++MODULE_PARM_DESC(upthreshold, "GPU devfreq: busy %% above which the GPU goes to its top OPP");
++module_param_cb(downdifferential, &panfrost_gov_param_ops, &panfrost_downdifferential, 0644);
++MODULE_PARM_DESC(downdifferential, "GPU devfreq: hysteresis %% below upthreshold");
++
+ static void panfrost_devfreq_update_utilization(struct panfrost_devfreq *pfdevfreq)
+ {
+ 	ktime_t now, last;
+@@ -200,10 +225,12 @@ int panfrost_devfreq_init(struct panfrost_device *pfdev)
+ 
+ 	/*
+ 	 * Setup default thresholds for the simple_ondemand governor.
+-	 * The values are chosen based on experiments.
++	 * The values are chosen based on experiments; module parameters
++	 * upthreshold / downdifferential (live).
+ 	 */
+-	pfdevfreq->gov_data.upthreshold = 45;
+-	pfdevfreq->gov_data.downdifferential = 5;
++	pfdevfreq->gov_data.upthreshold = panfrost_upthreshold;
++	pfdevfreq->gov_data.downdifferential = panfrost_downdifferential;
++	panfrost_gov_data = &pfdevfreq->gov_data;
+ 
+ 	devfreq = devm_devfreq_add_device(dev, &panfrost_devfreq_profile,
+ 					  DEVFREQ_GOV_SIMPLE_ONDEMAND,
+@@ -227,6 +254,8 @@ void panfrost_devfreq_fini(struct panfrost_device *pfdev)
+ {
+ 	struct panfrost_devfreq *pfdevfreq = &pfdev->pfdevfreq;
+ 
++	if (panfrost_gov_data == &pfdevfreq->gov_data)
++		panfrost_gov_data = NULL;
+ 	if (pfdevfreq->cooling) {
+ 		devfreq_cooling_unregister(pfdevfreq->cooling);
+ 		pfdevfreq->cooling = NULL;
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.c b/drivers/gpu/drm/panfrost/panfrost_device.c
+index d0a23c51b..63e50d82c 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.c
++++ b/drivers/gpu/drm/panfrost/panfrost_device.c
+@@ -223,6 +223,7 @@ int panfrost_device_init(struct panfrost_device *pfdev)
+ 	spin_lock_init(&pfdev->as_lock);
+ 
+ 	spin_lock_init(&pfdev->cycle_counter.lock);
++	mutex_init(&pfdev->timestamp_hold.lock);
+ 
+ #ifdef CONFIG_DEBUG_FS
+ 	mutex_init(&pfdev->debugfs.gems_lock);
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.h b/drivers/gpu/drm/panfrost/panfrost_device.h
+index 1fe1554f2..25c849354 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.h
++++ b/drivers/gpu/drm/panfrost/panfrost_device.h
+@@ -115,6 +115,21 @@ struct panfrost_compatible {
+ 
+ 	/* GPU configuration quirks */
+ 	u8 gpu_quirks;
++
++	/*
++	 * GPU_TIMESTAMP runs at arch timer rate << timestamp_shift (MT6885: 26
++	 * MHz). There it also only counts while the cycle counter is enabled
++	 * and resets with the GPU power (BSP mali_kbase_time.c), so it isn't
++	 * a wall clock; there is no TIMESTAMP_OFFSET register on v9 to fix it.
++	 */
++	u8 timestamp_shift;
++
++	/*
++	 * Keep the GPU powered and the cycle counter (hence GPU_TIMESTAMP)
++	 * running while any client uses timestamps, so they are monotonic
++	 * and comparable across submits.
++	 */
++	bool timestamp_hold;
+ };
+ 
+ /**
+@@ -179,6 +194,11 @@ struct panfrost_device {
+ 		spinlock_t lock;
+ 	} cycle_counter;
+ 
++	struct {
++		struct mutex lock;
++		unsigned int users;
++	} timestamp_hold;
++
+ #ifdef CONFIG_DEBUG_FS
+ 	struct panfrost_device_debugfs debugfs;
+ #endif
+@@ -191,6 +211,8 @@ struct panfrost_mmu {
+ 	struct io_pgtable_ops *pgtbl_ops;
+ 	struct drm_mm mm;
+ 	spinlock_t mm_lock;
++	/* VA above 4G exists (64-bit page tables), used for heaps only */
++	bool high_va;
+ 	int as;
+ 	atomic_t as_count;
+ 	struct list_head list;
+@@ -214,6 +236,8 @@ struct panfrost_file_priv {
+ 	struct panfrost_mmu *mmu;
+ 
+ 	struct panfrost_engine_usage engine_usage;
++
++	bool timestamp_hold;
+ };
+ 
+ static inline bool panfrost_high_prio_allowed(struct drm_file *file)
+diff --git a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+index 36cc2e67a..d4d0cf5e5 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/pagemap.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+@@ -50,6 +51,55 @@ static int panfrost_ioctl_query_timestamp(struct panfrost_device *pfdev,
+ 	return 0;
+ }
+ 
++/*
++ * First timestamp use of a client on a GPU whose timestamp stops with the
++ * cycle counter and resets with power (timestamp_hold): keep both on until
++ * the client closes.
++ */
++static int panfrost_timestamp_hold(struct panfrost_device *pfdev,
++				   struct panfrost_file_priv *priv)
++{
++	int ret = 0;
++
++	if (!pfdev->comp->timestamp_hold || READ_ONCE(priv->timestamp_hold))
++		return 0;
++
++	mutex_lock(&pfdev->timestamp_hold.lock);
++	if (priv->timestamp_hold)
++		goto out;
++
++	ret = pm_runtime_resume_and_get(pfdev->base.dev);
++	if (ret)
++		goto out;
++
++	pfdev->timestamp_hold.users++;
++	panfrost_cycle_counter_get(pfdev);
++	WRITE_ONCE(priv->timestamp_hold, true);
++	dev_info(pfdev->base.dev, "timestamp hold by %s[%d], %u users\n",
++		 current->comm, task_pid_nr(current), pfdev->timestamp_hold.users);
++out:
++	mutex_unlock(&pfdev->timestamp_hold.lock);
++	return ret;
++}
++
++static void panfrost_timestamp_release(struct panfrost_device *pfdev,
++				       struct panfrost_file_priv *priv)
++{
++	if (!priv->timestamp_hold)
++		return;
++
++	mutex_lock(&pfdev->timestamp_hold.lock);
++	panfrost_cycle_counter_put(pfdev);
++	pfdev->timestamp_hold.users--;
++	mutex_unlock(&pfdev->timestamp_hold.lock);
++	pm_runtime_put_autosuspend(pfdev->base.dev);
++}
++
++/* fallback for Mesa builds without the G77 model (upstream Mesa <= 26.2) */
++static bool g77_as_g57;
++module_param(g77_as_g57, bool, 0644);
++MODULE_PARM_DESC(g77_as_g57, "report Mali-G77 as G57 to userspace, for Mesa without G77 support");
++
+ static int panfrost_ioctl_get_param(struct drm_device *ddev, void *data, struct drm_file *file)
+ {
+ 	struct drm_panfrost_get_param *param = data;
+@@ -71,7 +121,12 @@ static int panfrost_ioctl_get_param(struct drm_device *ddev, void *data, struct
+ 		break
+ 
+ 	switch (param->param) {
+-		PANFROST_FEATURE(GPU_PROD_ID, id);
++	case DRM_PANFROST_PARAM_GPU_PROD_ID:
++		param->value = pfdev->features.id;
++		/* G77 (0x9000) -> G57 (0x9001), same Valhall v9 JM architecture */
++		if (g77_as_g57 && (param->value & 0xf00f) == 0x9000)
++			param->value |= 0x1;
++		break;
+ 		PANFROST_FEATURE(GPU_REVISION, revision);
+ 		PANFROST_FEATURE(SHADER_PRESENT, shader_present);
+ 		PANFROST_FEATURE(TILER_PRESENT, tiler_present);
+@@ -99,6 +154,9 @@ static int panfrost_ioctl_get_param(struct drm_device *ddev, void *data, struct
+ 		PANFROST_FEATURE(SELECTED_COHERENCY, selected_coherency);
+ 
+ 	case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP:
++		ret = panfrost_timestamp_hold(pfdev, file->driver_priv);
++		if (ret)
++			return ret;
+ 		ret = panfrost_ioctl_query_timestamp(pfdev, &param->value);
+ 		if (ret)
+ 			return ret;
+@@ -106,7 +164,8 @@ static int panfrost_ioctl_get_param(struct drm_device *ddev, void *data, struct
+ 
+ 	case DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY:
+ #ifdef CONFIG_ARM_ARCH_TIMER
+-		param->value = arch_timer_get_cntfrq();
++		param->value = (u64)arch_timer_get_cntfrq() <<
++			       pfdev->comp->timestamp_shift;
+ #else
+ 		param->value = 0;
+ #endif
+@@ -305,6 +364,12 @@ static int panfrost_ioctl_submit(struct drm_device *dev, void *data,
+ 	if (args->requirements & ~JOB_REQUIREMENTS)
+ 		return -EINVAL;
+ 
++	if (args->requirements & PANFROST_JD_REQ_CYCLE_COUNT) {
++		ret = panfrost_timestamp_hold(pfdev, file_priv);
++		if (ret)
++			return ret;
++	}
++
+ 	if (args->out_sync > 0) {
+ 		sync_out = drm_syncobj_find(file, args->out_sync);
+ 		if (!sync_out)
+@@ -326,6 +391,7 @@ static int panfrost_ioctl_submit(struct drm_device *dev, void *data,
+ 	kref_init(&job->refcount);
+ 
+ 	job->pfdev = pfdev;
++	job->pid = task_tgid_nr(current);
+ 	job->jc = args->jc;
+ 	job->requirements = args->requirements;
+ 	job->flush_id = panfrost_gpu_get_latest_flush_id(pfdev);
+@@ -718,6 +784,7 @@ panfrost_postclose(struct drm_device *dev, struct drm_file *file)
+ 
+ 	panfrost_perfcnt_close(file);
+ 	panfrost_jm_close(file);
++	panfrost_timestamp_release(panfrost_priv->pfdev, panfrost_priv);
+ 
+ 	panfrost_mmu_ctx_put(panfrost_priv->mmu);
+ 	kfree(panfrost_priv);
+@@ -1144,6 +1211,43 @@ static const struct panfrost_compatible mediatek_mt8192_data = {
+ 	.gpu_quirks = BIT(GPU_QUIRK_FORCE_AARCH64_PGTABLE),
+ };
+ 
++/*
++ * MT6885: the system timer only reaches GPU_TIMESTAMP when MFG_TIMESTAMP
++ * (mfgcfg + 0x130) bit 0 is set, otherwise it reads 0; the BSP sets it on
++ * every GPU power-on (mt_gpufreq_set_timestamp()).
++ */
++#define MT6885_MFG_TIMESTAMP	0x130
++
++static void panfrost_gpu_mt6885_quirk(struct panfrost_device *pfdev)
++{
++	static void __iomem *mfgcfg;
++
++	if (!mfgcfg) {
++		struct device_node *np =
++			of_find_compatible_node(NULL, NULL, "mediatek,mt6885-mfgcfg");
++
++		mfgcfg = np ? of_iomap(np, 0) : NULL;
++		of_node_put(np);
++		if (!mfgcfg) {
++			dev_warn_once(pfdev->base.dev, "no mfgcfg, GPU timestamps stay 0\n");
++			return;
++		}
++	}
++	writel(BIT(0), mfgcfg + MT6885_MFG_TIMESTAMP);
++}
++
++static const struct panfrost_compatible mediatek_mt6885_data = {
++	.num_supplies = ARRAY_SIZE(default_supplies) - 1,
++	.supply_names = default_supplies,
++	.num_pm_domains = 5,
++	.pm_domain_names = mediatek_pm_domains,
++	.pm_features = BIT(GPU_PM_CLK_DIS) | BIT(GPU_PM_VREG_OFF),
++	.gpu_quirks = BIT(GPU_QUIRK_FORCE_AARCH64_PGTABLE),
++	.vendor_quirk = panfrost_gpu_mt6885_quirk,
++	.timestamp_shift = 1,
++	.timestamp_hold = true,
++};
++
+ static const struct panfrost_compatible mediatek_mt8370_data = {
+ 	.num_supplies = ARRAY_SIZE(default_supplies) - 1,
+ 	.supply_names = default_supplies,
+@@ -1172,6 +1276,7 @@ static const struct of_device_id dt_match[] = {
+ 	{ .compatible = "arm,mali-t880", .data = &default_data, },
+ 	{ .compatible = "arm,mali-bifrost", .data = &default_data, },
+ 	{ .compatible = "arm,mali-valhall-jm", .data = &default_data, },
++	{ .compatible = "mediatek,mt6885-mali", .data = &mediatek_mt6885_data },
+ 	{ .compatible = "mediatek,mt8183-mali", .data = &mediatek_mt8183_data },
+ 	{ .compatible = "mediatek,mt8183b-mali", .data = &mediatek_mt8183_b_data },
+ 	{ .compatible = "mediatek,mt8186-mali", .data = &mediatek_mt8186_data },
+diff --git a/drivers/gpu/drm/panfrost/panfrost_features.h b/drivers/gpu/drm/panfrost/panfrost_features.h
+index 52f9d69f6..da3a928c5 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_features.h
++++ b/drivers/gpu/drm/panfrost/panfrost_features.h
+@@ -121,6 +121,9 @@ enum panfrost_hw_feature {
+ 	BIT_ULL(HW_FEATURE_IDVS_GROUP_SIZE) | \
+ 	BIT_ULL(HW_FEATURE_CLEAN_ONLY_SAFE))
+ 
++/* Mali-G77 (tTRx): same feature set as G57 in the Arm r21p0/r32p1 kbase */
++#define hw_features_g77 hw_features_g57
++
+ static inline bool panfrost_has_hw_feature(struct panfrost_device *pfdev,
+ 					   enum panfrost_hw_feature feat)
+ {
+diff --git a/drivers/gpu/drm/panfrost/panfrost_gem.c b/drivers/gpu/drm/panfrost/panfrost_gem.c
+index 3a7fce428..70adc752b 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_gem.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gem.c
+@@ -197,8 +197,22 @@ int panfrost_gem_open(struct drm_gem_object *obj, struct drm_file *file_priv)
+ 
+ 	mapping->mmu = panfrost_mmu_ctx_get(priv->mmu);
+ 	spin_lock(&mapping->mmu->mm_lock);
+-	ret = drm_mm_insert_node_generic(&mapping->mmu->mm, &mapping->mmnode,
+-					 size >> PAGE_SHIFT, align, color, 0);
++	if (mapping->mmu->high_va) {
++		u64 pfn_4g = SZ_4G >> PAGE_SHIFT;
++
++		ret = drm_mm_insert_node_in_range(&mapping->mmu->mm,
++						  &mapping->mmnode,
++						  size >> PAGE_SHIFT, align,
++						  color,
++						  bo->is_heap ? pfn_4g : 0,
++						  bo->is_heap ? U64_MAX : pfn_4g,
++						  DRM_MM_INSERT_BEST);
++	} else {
++		ret = drm_mm_insert_node_generic(&mapping->mmu->mm,
++						 &mapping->mmnode,
++						 size >> PAGE_SHIFT, align,
++						 color, 0);
++	}
+ 	spin_unlock(&mapping->mmu->mm_lock);
+ 	if (ret)
+ 		goto err;
+diff --git a/drivers/gpu/drm/panfrost/panfrost_gpu.c b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+index 7d555e63e..f41753bd2 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_gpu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+@@ -95,10 +95,14 @@ int panfrost_gpu_soft_reset(struct panfrost_device *pfdev)
+ 
+ 	/*
+ 	 * All in-flight jobs should have released their cycle
+-	 * counter references upon reset, but let us make sure
++	 * counter references upon reset, but let us make sure. Timestamp
++	 * holders keep theirs, so restart the counter for them.
+ 	 */
+-	if (drm_WARN_ON(&pfdev->base, atomic_read(&pfdev->cycle_counter.use_count) != 0))
+-		atomic_set(&pfdev->cycle_counter.use_count, 0);
++	val = READ_ONCE(pfdev->timestamp_hold.users);
++	if (drm_WARN_ON(&pfdev->base, atomic_read(&pfdev->cycle_counter.use_count) != val))
++		atomic_set(&pfdev->cycle_counter.use_count, val);
++	if (val)
++		gpu_write(pfdev, GPU_CMD, GPU_CMD_CYCLE_COUNT_START);
+ 
+ 	return 0;
+ }
+@@ -228,6 +232,9 @@ static const struct panfrost_model gpu_models[] = {
+ 	GPU_MODEL(g31, 0x7003,
+ 		GPU_REV(g31, 1, 0)),
+ 
++	/* MediaTek MT6885 (Dimensity 1000) Mali-G77 MC9 */
++	GPU_MODEL(g77, 0x9000),
++
+ 	GPU_MODEL(g57, 0x9001,
+ 		GPU_REV(g57, 0, 0)),
+ 
+diff --git a/drivers/gpu/drm/panfrost/panfrost_issues.h b/drivers/gpu/drm/panfrost/panfrost_issues.h
+index eb60cb836..c371e3862 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_issues.h
++++ b/drivers/gpu/drm/panfrost/panfrost_issues.h
+@@ -265,6 +265,11 @@ enum panfrost_hw_issue {
+ #define hw_issues_g57_r0p0 (\
+ 	BIT_ULL(HW_ISSUE_TTRX_3485))
+ 
++/* tTRx r0p0/r0p1 per kbase; TTRX_3485 (dummy job) is not listed for G77 */
++#define hw_issues_g77 (\
++	BIT_ULL(HW_ISSUE_TTRX_2968_TTRX_3162) | \
++	BIT_ULL(HW_ISSUE_TTRX_3076))
++
+ static inline bool panfrost_has_hw_issue(const struct panfrost_device *pfdev,
+ 					 enum panfrost_hw_issue issue)
+ {
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index d59b4863b..6cde30b61 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -178,6 +178,16 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)
+ 	pfdev->jobs[slot][0] = pfdev->jobs[slot][1];
+ 	pfdev->jobs[slot][1] = NULL;
+ 
++	/*
++	 * The queued job (JS_*_NEXT) starts running now: count its engine time
++	 * from here, not from when it was queued, or the time the two overlap
++	 * is counted twice (engine busy > 100%).
++	 */
++	if (pfdev->jobs[slot][0] && pfdev->jobs[slot][0]->is_profiled) {
++		pfdev->jobs[slot][0]->start_time = ktime_get();
++		pfdev->jobs[slot][0]->start_cycles = panfrost_cycle_counter_read(pfdev);
++	}
++
+ 	return job;
+ }
+ 
+@@ -463,10 +473,10 @@ static void panfrost_job_handle_err(struct panfrost_device *pfdev,
+ 			job_read(pfdev, JS_HEAD_LO(js)),
+ 			job_read(pfdev, JS_TAIL_LO(js)));
+ 	} else {
+-		dev_err(pfdev->base.dev, "js fault, js=%d, status=%s, head=0x%x, tail=0x%x",
++		dev_err(pfdev->base.dev, "js fault, js=%d, status=%s, head=0x%x, tail=0x%x, pid=%d, jc=0x%llx",
+ 			js, exception_name,
+ 			job_read(pfdev, JS_HEAD_LO(js)),
+-			job_read(pfdev, JS_TAIL_LO(js)));
++			job_read(pfdev, JS_TAIL_LO(js)), job->pid, job->jc);
+ 	}
+ 
+ 	if (js_status == DRM_PANFROST_EXCEPTION_STOPPED) {
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.h b/drivers/gpu/drm/panfrost/panfrost_job.h
+index c3f57e41a..deb35adb3 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.h
++++ b/drivers/gpu/drm/panfrost/panfrost_job.h
+@@ -20,6 +20,9 @@ struct panfrost_job {
+ 	struct panfrost_mmu *mmu;
+ 	struct panfrost_jm_ctx *ctx;
+ 
++	/* submitter, for fault reports */
++	pid_t pid;
++
+ 	/* Fence to be signaled by IRQ handler when the job is complete. */
+ 	struct dma_fence *done_fence;
+ 
+diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index 4a3162c3b..fff6318f0 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -801,8 +801,16 @@ struct panfrost_mmu *panfrost_mmu_ctx_create(struct panfrost_device *pfdev)
+ 	mmu->pfdev = pfdev;
+ 	spin_lock_init(&mmu->mm_lock);
+ 
+-	/* 4G enough for now. can be 48-bit */
+-	drm_mm_init(&mmu->mm, SZ_32M >> PAGE_SHIFT, (SZ_4G - SZ_32M) >> PAGE_SHIFT);
++	/*
++	 * 4G for regular BOs (userspace assumes 32-bit addresses on older
++	 * GPUs). With 64-bit page tables heap BOs go above 4G: they're only
++	 * grown on GPU faults, and a few big tiler heaps (one per VkDevice,
++	 * all devices share the DRM file) don't fit the low 4G next to
++	 * everything else.
++	 */
++	mmu->high_va = fmt == ARM_64_LPAE_S1 && va_bits > 36;
++	drm_mm_init(&mmu->mm, SZ_32M >> PAGE_SHIFT,
++		    ((mmu->high_va ? SZ_64G : SZ_4G) - SZ_32M) >> PAGE_SHIFT);
+ 	mmu->mm.color_adjust = panfrost_drm_mm_color_adjust;
+ 
+ 	INIT_LIST_HEAD(&mmu->list);

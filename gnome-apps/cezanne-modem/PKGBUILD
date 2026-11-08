@@ -1,0 +1,43 @@
+# Modem userspace for the Redmi K30 Ultra (cezanne): our own NVRAM file
+# service and RPC server for the MT6885 modem (kernel module cezanne_ccci,
+# mainline/modem/ccci), which it boots. The NVRAM is copied once from the
+# stock partitions (cezanne-modem-nvram-import); the modem's OTA
+# configuration files go to /usr/lib/firmware/mediatek/cezanne/mdota (from
+# the stock vendor image, mainline/modem/tools/install-mdota.sh).
+pkgname=cezanne-modem
+pkgver=1.0
+pkgrel=15
+pkgdesc="Modem file service, RPC, boot and call audio for the cezanne"
+arch=(any)
+license=(MIT)
+depends=(python e2fsprogs python-gobject alsa-lib alsa-utils util-linux glib2 libpulse)
+optdepends=('modemmanager: calls, SMS, mobile data (patched with the mtk-ccmni plugin, packaging/overlays/modemmanager)'
+            'gnome-calls: phone calls'
+            'chatty: SMS'
+            'cezanne-voice: calls through the AP with echo cancelling and noise reduction')
+source=(cezanne-modemd
+        cezanne-speechd
+        cezanne-modem-nvram-import
+        cezanne-modem.service
+        cezanne-speechd.service
+        78-cezanne-modem.rules)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 cezanne-modemd "$pkgdir/usr/bin/cezanne-modemd"
+  install -Dm755 cezanne-speechd "$pkgdir/usr/bin/cezanne-speechd"
+  install -Dm755 cezanne-modem-nvram-import "$pkgdir/usr/bin/cezanne-modem-nvram-import"
+  for f in "$startdir"/cezanne_modem/*.py; do
+    install -Dm644 "$f" "$pkgdir/usr/lib/cezanne-modem/cezanne_modem/${f##*/}"
+  done
+  install -Dm644 cezanne-modem.service "$pkgdir/usr/lib/systemd/system/cezanne-modem.service"
+  install -Dm644 cezanne-speechd.service "$pkgdir/usr/lib/systemd/system/cezanne-speechd.service"
+  install -Dm644 78-cezanne-modem.rules "$pkgdir/usr/lib/udev/rules.d/78-cezanne-modem.rules"
+  # gnome-session 51 skips their X-GNOME-HiddenUnderSystemd autostart entries
+  # and nothing enables the user units they ship instead, so incoming calls
+  # and SMS would go unnoticed until the app is opened by hand
+  local wants="$pkgdir/usr/lib/systemd/user/gnome-session.target.wants"
+  install -d "$wants"
+  ln -s ../calls-daemon.service "$wants/calls-daemon.service"
+  ln -s ../sm.puri.Chatty-daemon.service "$wants/sm.puri.Chatty-daemon.service"
+}

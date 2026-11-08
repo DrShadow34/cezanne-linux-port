@@ -1,0 +1,1335 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Storage for the cezanne: what fills the phone, as Android's storage page
+shows it. One bar for the used space and a list of categories:
+  Apps        installed apps (packages with an app in the app grid; their
+              size from pacman's database), their data in the hidden folders
+              of the home directory (~/.config/<app>, ~/.local/share/<app>,
+              ~/.<app>), /opt and Flatpak
+  Games       Steam's library (steamapps/common, the Proton prefixes)
+  Images, Videos, Audio, Documents & other
+              the files of the home directory outside hidden folders, by
+              their extension
+  Cache       ~/.cache, cache folders inside app data, Steam's shader and
+              download caches, /var/cache, /var/tmp
+  Trash       the trash
+  System      everything else: the system's packages, /etc, /var, /boot
+Each category opens a page: folders and the largest files, apps with their
+data and cache (cache can be cleared), games, cache folders (clearable),
+the trash (emptied), the system's largest packages.
+
+The whole root file system is walked by worker processes of this script
+(--scan-worker; Python threads would serialise on the interpreter lock):
+the tree is cut into units at known large folders and handed out to the
+first worker that is free, each sends back its totals. Sizes are the
+allocated sizes of the files before btrfs compression (what du reports), so
+they add up to more than the used space the bar shows. Folders this user
+cannot read (other users, /root) are left out.
+
+What the files take on disk needs root: only root may search btrfs' trees
+for a file's extent items (compressed size, type), as compsize does. When
+polkit lets the active session run the installed script as root
+(org.cezanne.storage.policy: pkexec ... --root-worker, no password), the
+workers run that way and also total the extents per category and folder
+(one tree search per file, against its folder's descriptor), and every
+page shows the size on disk and its share. The root workers take the home
+folder from pkexec's caller, never from the arguments, and only send back
+totals and the caller's own largest files.
+"""
+import collections
+import fcntl
+import heapq
+import json
+import os
+import pwd
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import threading
+
+APP_ID = 'org.cezanne.Storage'
+VERSION = '1.1'
+ROOT_EXEC = '/usr/bin/cezanne-storage'		# the path org.cezanne.storage.policy names
+POLICY = '/usr/share/polkit-1/actions/org.cezanne.storage.policy'
+HOME = os.path.expanduser('~')
+WEIGHTS_FILE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.join(HOME, '.cache'),
+                            'cezanne-storage', 'units.json')
+TOP_FILES = 50
+
+# category id, name, icon, colour
+CATEGORIES = [
+    ('apps', 'Apps', 'view-app-grid-symbolic', '#3584e4'),
+    ('games', 'Games', 'input-gaming-symbolic', '#9141ac'),
+    ('images', 'Images', 'image-x-generic-symbolic', '#2ec27e'),
+    ('video', 'Videos', 'video-x-generic-symbolic', '#e01b24'),
+    ('audio', 'Audio', 'audio-x-generic-symbolic', '#ff7800'),
+    ('documents', 'Documents & other', 'x-office-document-symbolic', '#e5a50a'),
+    ('cache', 'Cache', 'edit-clear-all-symbolic', '#1c9a9b'),
+    ('trash', 'Trash', 'user-trash-symbolic', '#865e3c'),
+    ('system', 'System', 'computer-symbolic', '#77767b'),
+]
+TYPED = ('images', 'video', 'audio', 'documents')
+
+IMAGE_EXT = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'avif', 'jxl', 'bmp', 'tif', 'tiff', 'dng',
+             'cr2', 'cr3', 'nef', 'arw', 'orf', 'rw2', 'raf', 'svg', 'ico', 'xcf', 'psd', 'kra', 'ppm',
+             'pgm', 'pbm', 'tga', 'exr', 'hdr', 'qoi'}
+VIDEO_EXT = {'mp4', 'mkv', 'webm', 'mov', 'avi', 'm4v', '3gp', 'ts', 'mts', 'm2ts', 'wmv', 'flv', 'ogv',
+             'mpg', 'mpeg', 'vob', 'h264', '264', 'h265', '265', 'hevc', 'ivf', 'obu', 'y4m'}
+AUDIO_EXT = {'mp3', 'flac', 'ogg', 'oga', 'opus', 'm4a', 'aac', 'wav', 'wma', 'alac', 'ape', 'mka',
+             'aiff', 'aif', 'mid', 'midi', 'amr', 'wv', 'dsf', 'caf'}
+EXT_CATEGORY = {**{e: 'images' for e in IMAGE_EXT}, **{e: 'video' for e in VIDEO_EXT},
+                **{e: 'audio' for e in AUDIO_EXT}}
+
+# folder names that hold an app's cache inside its data folder
+CACHE_NAMES = {'cache', 'Cache', 'caches', 'Caches', '.cache', 'GPUCache', 'Code Cache', 'ShaderCache',
+               'GrShaderCache', 'DawnCache', 'shadercache', 'Crash Reports', 'tmp', 'temp', 'Temp',
+               'thumbnails', 'cache2', 'startupCache'}
+# never offered for clearing: the file indexer's database is no cache to the user
+PROTECTED_CACHE = {os.path.join(HOME, '.cache', 'tracker3')}
+
+
+def clearable(folder):
+    """a cache folder of this user that may be emptied: one app's, not
+    ~/.cache as a whole"""
+    return (folder.startswith(HOME + '/') and folder not in PROTECTED_CACHE
+            and folder != os.path.join(HOME, '.cache') and os.path.isdir(folder))
+
+
+def cache_owner(folder):
+    """the app name a cache folder belongs to (for matching it to an app)"""
+    if not folder.startswith(HOME + '/'):
+        return os.path.basename(folder)
+    parts = folder[len(HOME) + 1:].split('/')
+    if parts[0] == '.cache':
+        return parts[1] if len(parts) > 1 else ''
+    if parts[0] == '.var' and len(parts) > 2:
+        return parts[2]
+    return app_folder(parts)[0]
+VIRTUAL_FS = {'proc', 'sysfs', 'devtmpfs', 'devpts', 'tmpfs', 'cgroup', 'cgroup2', 'securityfs', 'debugfs',
+              'tracefs', 'pstore', 'bpf', 'configfs', 'fusectl', 'mqueue', 'hugetlbfs', 'efivarfs',
+              'binfmt_misc', 'autofs', 'ramfs', 'fuse.portal', 'fuse.gvfsd-fuse', 'nsfs', 'overlay',
+              'squashfs', 'iso9660', 'nfs', 'cifs'}
+
+
+# data folders named after something else than the app's package or binary
+ALIASES = {'mozilla': 'firefox', 'thunderbird': 'thunderbird', 'steam': 'steam', 'pki': 'nss'}
+
+
+def norm(name):
+    """a name for matching folders to apps: lower case, letters and digits"""
+    return ''.join(c for c in name.lower() if c.isalnum())
+
+
+def skipped_mounts():
+    """mount points under / that are not the root's file system (virtual file
+    systems, other disks); btrfs subvolumes of the root's device are walked"""
+    mounts = []
+    try:
+        with open('/proc/self/mountinfo') as f:
+            for line in f:
+                pre, post = line.split(' - ', 1)
+                fields = pre.split()
+                fstype, source = post.split()[:2]
+                mounts.append((fields[4].replace('\\040', ' '), fstype, source))
+    except OSError:
+        return set()
+    root = next((m for m in mounts if m[0] == '/'), None)
+    return {p for p, fstype, source in mounts
+            if p != '/' and (fstype in VIRTUAL_FS or root is None or source != root[2])}
+
+
+def app_folder(parts):
+    """the app data folder of a hidden home path (parts of the path below
+    the home directory): (match name, its path)"""
+    top = parts[0]
+    if top in ('.config', '.var') and len(parts) > 1:
+        return parts[1], os.path.join(HOME, *parts[:2])
+    if top == '.local' and len(parts) > 2 and parts[1] in ('share', 'state', 'lib'):
+        return parts[2], os.path.join(HOME, *parts[:3])
+    if top == '.local' and len(parts) > 1:
+        return parts[1], os.path.join(HOME, *parts[:2])
+    return top[1:], os.path.join(HOME, top)
+
+
+def dir_context(path):
+    """(category, group) of what lies in a folder; category 'typed': each
+    file by its extension (the folders of the home directory)"""
+    if path == HOME or path.startswith(HOME + '/'):
+        rel = path[len(HOME) + 1:]
+        parts = rel.split('/') if rel else []
+        if not parts:
+            return 'typed', 'Home'
+        top = parts[0]
+        if not top.startswith('.'):
+            return 'typed', os.path.join(HOME, *parts[:2])
+        if top == '.cache':
+            return 'cache', os.path.join(HOME, *parts[:2])
+        if parts[:3] == ['.local', 'share', 'Trash']:
+            return 'trash', 'Trash'
+        if parts[:3] == ['.local', 'share', 'Steam']:
+            s = parts[3:]
+            if len(s) >= 3 and s[0] == 'steamapps' and s[1] in ('common', 'compatdata'):
+                return 'games', s[1] + '/' + s[2]
+            if s[:2] in (['steamapps', 'shadercache'], ['steamapps', 'downloading'], ['steamapps', 'temp']) \
+                    or s[:1] in (['appcache'], ['depotcache'], ['logs']):
+                return 'cache', 'Steam'
+            return 'apps', 'data:steam'
+        if top == '.var' and len(parts) >= 3 and parts[1] == 'app':
+            if len(parts) >= 4 and parts[3] == 'cache':
+                return 'cache', os.path.join(HOME, *parts[:4])
+            return 'apps', 'data:' + parts[2]
+        if parts[:3] == ['.local', 'share', 'flatpak']:
+            return 'apps', 'flatpak'
+        name, folder = app_folder(parts)
+        for i, p in enumerate(parts[1:], 1):
+            if p in CACHE_NAMES:
+                return 'cache', os.path.join(HOME, *parts[:i + 1])
+        return 'apps', 'data:' + name
+    if path.startswith('/home/'):
+        return 'system', 'Other users'
+    if path == '/opt' or path.startswith('/opt/'):
+        p = path.split('/')
+        return 'apps', 'opt:' + (p[2] if len(p) > 2 else '')
+    if path.startswith(('/var/cache/', '/var/tmp')) or path == '/var/cache':
+        return 'cache', '/'.join(path.split('/')[:4])
+    if path.startswith('/var/lib/flatpak'):
+        return 'apps', 'flatpak'
+    p = path.split('/')
+    if len(p) > 2 and p[1] == 'var':
+        return 'system', '/var/' + p[2]
+    return 'system', '/' + p[1] if len(p) > 1 and p[1] else '/'
+
+
+# btrfs' tree search (linux/btrfs.h, btrfs_tree.h), the v1 ioctl's 4096 bytes
+TREE_SEARCH = 0xd0009411
+SEARCH_KEY = struct.Struct('<7Q4I4Q')	# btrfs_ioctl_search_key
+SEARCH_HEADER = struct.Struct('<3Q2I')	# btrfs_ioctl_search_header
+EXTENT_DATA_KEY = 108
+EXTENT_HEAD = struct.Struct('<QQBBHB')	# btrfs_file_extent_item up to its type
+EXTENT_DISK = struct.Struct('<4Q')	# disk_bytenr, disk_num_bytes, offset, num_bytes
+REGULAR_EXTENT = EXTENT_HEAD.size + EXTENT_DISK.size
+U64 = (1 << 64) - 1
+COMPRESSION = {0: 'None', 1: 'zlib', 2: 'LZO', 3: 'zstd'}
+
+
+def file_extents(dfd, ino):
+    """(compression type, bytes on disk, bytes of file) per extent of an
+    inode in the subvolume of the folder dfd (needs root). A compressed
+    extent shared by several file ranges counts in proportion to the part
+    each references; holes count nothing."""
+    offset = 0
+    while True:
+        buf = bytearray(4096)
+        SEARCH_KEY.pack_into(buf, 0, 0, ino, ino, offset, U64, 0, U64,
+                             EXTENT_DATA_KEY, EXTENT_DATA_KEY, 4096, 0, 0, 0, 0, 0)
+        try:
+            fcntl.ioctl(dfd, TREE_SEARCH, buf)
+        except OSError:
+            return
+        n = SEARCH_KEY.unpack_from(buf, 0)[9]
+        pos = SEARCH_KEY.size
+        for _ in range(n):
+            _, _, offset, _, length = SEARCH_HEADER.unpack_from(buf, pos)
+            item = pos + SEARCH_HEADER.size
+            _, ram, comp, _, _, kind = EXTENT_HEAD.unpack_from(buf, item)
+            if kind == 0:		# inline: the data is in the item
+                yield comp, length - EXTENT_HEAD.size, ram
+            else:
+                bytenr, disk, _, num = EXTENT_DISK.unpack_from(buf, item + EXTENT_HEAD.size)
+                if bytenr:
+                    yield comp, (disk * num // ram if comp and ram else num), num
+            pos = item + length
+        # the kernel stops at the first item that does not fit: only then more
+        if n == 0 or len(buf) - pos >= SEARCH_HEADER.size + REGULAR_EXTENT:
+            return
+        offset += 1
+
+
+class Totals:
+    """what one walk found: bytes per category and group, the largest
+    files per file type, entries, unreadable folders; with extents (root),
+    bytes on disk and of the same files per category and group and per
+    compression type"""
+
+    def __init__(self):
+        self.cats = collections.Counter()
+        self.groups = collections.defaultdict(collections.Counter)
+        self.top = collections.defaultdict(list)
+        self.entries = 0
+        self.unreadable = []
+        self.disk = collections.defaultdict(collections.Counter)
+        self.logical = collections.defaultdict(collections.Counter)
+        self.algo = collections.defaultdict(lambda: [0, 0])
+
+    def extents(self, cat, group, dfd, ino):
+        for comp, disk, logical in file_extents(dfd, ino):
+            self.disk[cat][group] += disk
+            self.logical[cat][group] += logical
+            a = self.algo[comp]
+            a[0] += disk
+            a[1] += logical
+
+    def add(self, cat, group, size):
+        self.cats[cat] += size
+        self.groups[cat][group] += size
+
+    def file(self, cat, size, path):
+        h = self.top[cat]
+        if len(h) < TOP_FILES:
+            heapq.heappush(h, (size, path))
+        elif size > h[0][0]:
+            heapq.heapreplace(h, (size, path))
+
+    def json(self):
+        return {'cats': self.cats, 'groups': self.groups, 'top': self.top, 'entries': self.entries,
+                'unreadable': self.unreadable[:20], 'disk': self.disk, 'logical': self.logical,
+                'algo': self.algo}
+
+
+def walk(root, recursive, skip, extents=False):
+    """the totals of a folder's entries (and everything below it when
+    recursive), in inode order: btrfs keeps inodes by number, so the
+    metadata reads run nearly sequentially; extents: also what the files
+    take on disk (root only)"""
+    t = Totals()
+    seen = set()
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                ents = sorted(it, key=lambda e: e.inode())
+        except OSError:
+            t.unreadable.append(d)
+            continue
+        cat, group = dir_context(d)
+        dfd = -1
+        if extents:
+            try:
+                dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+            except OSError:
+                pass
+        try:
+            stack.extend(reversed(_walk_dir(t, d, ents, cat, group, dfd, seen, skip, recursive)))
+        finally:
+            if dfd >= 0:
+                os.close(dfd)
+    return t
+
+
+def _walk_dir(t, d, ents, cat, group, dfd, seen, skip, recursive):
+    """one folder's entries into t; its subfolders to walk"""
+    subdirs = []
+    for e in ents:
+        try:
+            st = e.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        t.entries += 1
+        isdir = e.is_dir(follow_symlinks=False)
+        if st.st_nlink > 1 and not isdir:
+            if (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+        size = st.st_blocks * 512
+        if isdir:
+            if e.path in skip:
+                continue
+            c, g = dir_context(e.path)
+            t.add(c if c != 'typed' else 'documents', g, size)
+            if recursive:
+                subdirs.append(e.path)
+            continue
+        if cat == 'typed':
+            if e.name.startswith('.') and d == HOME:
+                c, g = 'apps', 'data:dotfiles'	# ~/.bashrc and the like
+            else:
+                c, g = EXT_CATEGORY.get(e.name.rpartition('.')[2].lower(), 'documents'), group
+                t.file(c, size, e.path)
+        else:
+            c, g = cat, group
+        t.add(c, g, size)
+        if dfd >= 0 and stat.S_ISREG(st.st_mode) and st.st_size:
+            t.extents(c, g, dfd, st.st_ino)
+    return subdirs
+
+
+def scan_worker(root):
+    """--scan-worker / --root-worker: units ('tree:PATH' or 'files:PATH') on
+    stdin, one JSON line of totals per unit on stdout. As root (through
+    pkexec), with the extents, for the home folder of pkexec's caller."""
+    global HOME
+    if root:
+        if os.geteuid() != 0 or 'PKEXEC_UID' not in os.environ:
+            sys.exit('--root-worker runs through pkexec')
+        HOME = pwd.getpwuid(int(os.environ['PKEXEC_UID'])).pw_dir
+    skip = skipped_mounts()
+    for line in sys.stdin:
+        kind, _, path = line.rstrip('\n').partition(':')
+        t = walk(path, kind == 'tree', skip, extents=root)
+        out = t.json()
+        out['unit'] = line.rstrip('\n')
+        sys.stdout.write(json.dumps(out) + '\n')
+        sys.stdout.flush()
+
+
+if __name__ == '__main__' and sys.argv[1:2] in (['--scan-worker'], ['--root-worker']):
+    scan_worker(sys.argv[1] == '--root-worker')
+    sys.exit(0)
+
+import gi  # noqa: E402
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Gdk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
+
+CSS = '\n'.join(f'''
+.cat-{cid} progressbar > trough > progress {{ background-color: {color}; }}
+.cat-icon.cat-{cid} {{ background-color: {color}; }}''' for cid, _, _, color in CATEGORIES) + '''
+.cat-icon { color: white; border-radius: 10px; padding: 8px; }
+.cat-row progressbar > trough, .cat-row progressbar > trough > progress { min-height: 4px; }
+.used-size { font-size: 2.2em; font-weight: 800; }
+'''
+# folders split into units for the workers (their own entries one unit,
+# each subfolder another): the big ones, so no unit takes much longer
+SPLIT = ['/', '/usr', '/usr/lib', '/usr/share', '/var', '/var/lib', '/home', HOME,
+         os.path.join(HOME, '.local'), os.path.join(HOME, '.local', 'share'), os.path.join(HOME, 'Documents'),
+         os.path.join(HOME, '.cache'), os.path.join(HOME, '.local', 'share', 'Steam'),
+         os.path.join(HOME, '.local', 'share', 'Steam', 'steamapps')]
+
+
+def human(n):
+    for unit in ('B', 'kB', 'MB', 'GB', 'TB'):
+        if n < 1000 or unit == 'TB':
+            return f'{n:.0f} {unit}' if unit in ('B', 'kB') or n >= 100 else f'{n:.1f} {unit}'
+        n /= 1000
+
+
+def on_disk(disk, logical):
+    """'1.2 GB on disk · 43 %': what files take on disk, as a share of
+    their size"""
+    return f'{human(disk)} on disk · {disk / logical * 100:.0f} %' if logical else None
+
+
+def root_compression():
+    """the root file system's compress= mount option, or ''"""
+    try:
+        with open('/proc/self/mountinfo') as f:
+            for line in f:
+                pre, post = line.split(' - ', 1)
+                if pre.split()[4] == '/':
+                    opts = post.split()[2].split(',')
+                    return next((o.split('=', 1)[1] for o in opts if o.startswith('compress')), '')
+    except (OSError, IndexError):
+        pass
+    return ''
+
+
+def plan_units(skip):
+    units = []
+
+    def plan(d):
+        units.append('files:' + d)
+        try:
+            with os.scandir(d) as it:
+                subs = [e.path for e in it if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            return
+        for p in subs:
+            if p in skip:
+                continue
+            if p in SPLIT:
+                plan(p)
+            else:
+                units.append('tree:' + p)
+    plan('/')
+    return units
+
+
+class Scan(GObject.Object):
+    """the workers and the totals they send"""
+    __gsignals__ = {
+        'update': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'done': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.root = None	# workers as root (sizes on disk); None: not known yet
+        self._reset()
+        self.total_units = self.done_units = 0
+
+    def _reset(self):
+        self.cats = collections.Counter()
+        self.groups = collections.defaultdict(collections.Counter)
+        self.top = collections.defaultdict(list)
+        self.unreadable = []
+        self.entries = 0
+        self.disk = collections.defaultdict(collections.Counter)
+        self.logical = collections.defaultdict(collections.Counter)
+        self.algo = collections.defaultdict(lambda: [0, 0])
+
+    def probe_root(self, done):
+        """may the workers run as root? Only the installed script with its
+        policy (else pkexec would ask for the administrator's password):
+        an empty worker through pkexec, done() once known"""
+        if os.path.realpath(__file__) != ROOT_EXEC or not os.path.exists(POLICY):
+            self.root = False
+            done()
+            return
+        try:
+            p = Gio.Subprocess.new(['pkexec', ROOT_EXEC, '--root-worker'],
+                                   Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_SILENCE
+                                   | Gio.SubprocessFlags.STDERR_SILENCE)
+        except GLib.Error:
+            self.root = False
+            done()
+            return
+        p.get_stdin_pipe().close(None)
+
+        def finished(p, res):
+            try:
+                self.root = p.wait_check_finish(res)
+            except GLib.Error:
+                self.root = False	# not the active session, no polkit
+            done()
+        p.wait_check_async(None, finished)
+
+    def start(self):
+        self._reset()
+        self.running = True
+        try:
+            with open(WEIGHTS_FILE) as f:
+                self.weights = json.load(f)
+        except (OSError, ValueError):
+            self.weights = {}
+        self.new_weights = {}
+        units = plan_units(skipped_mounts())
+        # the biggest units first (last scan's entry counts), so none is left for the end
+        units.sort(key=lambda u: -self.weights.get(u, 1000 if u.startswith('tree:') else 0))
+        self.queue = collections.deque(units)
+        self.total_units = len(units)
+        self.done_units = 0
+        self.workers = []
+        argv = (['pkexec', ROOT_EXEC, '--root-worker'] if self.root
+                else [sys.executable, os.path.abspath(__file__), '--scan-worker'])
+        # the root workers spend their time in Python (a tree search per file): every core
+        for _ in range((os.cpu_count() or 4) if self.root else min(6, os.cpu_count() or 4)):
+            p = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE)
+            w = (p, Gio.DataInputStream.new(p.get_stdout_pipe()))
+            self.workers.append(w)
+            self._feed(w)
+
+    @property
+    def progress(self):
+        return self.done_units / self.total_units if self.total_units else 1.0
+
+    def _feed(self, w):
+        p, out = w
+        if not self.queue:
+            p.get_stdin_pipe().close(None)
+            self.workers.remove(w)
+            if not self.workers:
+                self._finished()
+            return
+        p.get_stdin_pipe().write_all((self.queue.popleft() + '\n').encode(), None)
+        out.read_line_async(GLib.PRIORITY_DEFAULT, None, self._line, w)
+
+    def _line(self, out, res, w):
+        try:
+            line, _ = out.read_line_finish_utf8(res)
+        except GLib.Error:
+            line = None
+        if not line:	# the worker died: its unit is lost, go on without it
+            self.workers.remove(w)
+            if not self.workers:
+                self._finished()
+            return
+        r = json.loads(line)
+        for k, v in r['cats'].items():
+            self.cats[k] += v
+        for cat, groups in r['groups'].items():
+            for g, v in groups.items():
+                self.groups[cat][g] += v
+        for cat, files in r['top'].items():
+            merged = self.top[cat] + [tuple(f) for f in files]
+            self.top[cat] = heapq.nlargest(TOP_FILES, merged)
+        for key in ('disk', 'logical'):
+            mine = getattr(self, key)
+            for cat, groups in r.get(key, {}).items():
+                for g, v in groups.items():
+                    mine[cat][g] += v
+        for comp, (d, l) in r.get('algo', {}).items():
+            a = self.algo[int(comp)]
+            a[0] += d
+            a[1] += l
+        self.unreadable += r['unreadable']
+        self.entries += r['entries']
+        self.new_weights[r['unit']] = r['entries']
+        self.done_units += 1
+        self.emit('update')
+        self._feed(w)
+
+    def _finished(self):
+        self.running = False
+        try:
+            os.makedirs(os.path.dirname(WEIGHTS_FILE), exist_ok=True)
+            with open(WEIGHTS_FILE, 'w') as f:
+                json.dump(self.new_weights, f)
+        except OSError:
+            pass
+        self.emit('done')
+
+
+class Packages:
+    """pacman's database: every package's installed size; the packages with
+    an app in the app grid"""
+
+    def __init__(self):
+        self.sizes = {}
+        self.apps = {}	# package -> Gio.DesktopAppInfo
+        self.ready = False
+
+    def load(self, done):
+        def work():
+            sizes = {}
+            db = '/var/lib/pacman/local'
+            for d in os.listdir(db):
+                try:
+                    with open(os.path.join(db, d, 'desc')) as f:
+                        lines = f.read().split('\n')
+                except OSError:
+                    continue
+                name = size = None
+                for i, l in enumerate(lines):
+                    if l == '%NAME%':
+                        name = lines[i + 1]
+                    elif l == '%SIZE%':
+                        size = int(lines[i + 1])
+                if name:
+                    sizes[name] = size or 0
+            desktop = sorted(os.path.join('/usr/share/applications', f)
+                             for f in os.listdir('/usr/share/applications') if f.endswith('.desktop'))
+            owners = {}
+            try:
+                out = subprocess.run(['pacman', '-Qo', *desktop], capture_output=True, text=True).stdout
+                for l in out.splitlines():
+                    path, _, rest = l.partition(' is owned by ')
+                    if rest:
+                        owners.setdefault(rest.split()[0], []).append(path)
+            except OSError:
+                pass
+            GLib.idle_add(self._loaded, sizes, owners, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _loaded(self, sizes, owners, done):
+        self.sizes = sizes
+        for pkg, files in owners.items():
+            for path in files:
+                app = Gio.DesktopAppInfo.new_from_filename(path)
+                if app and app.should_show():
+                    self.apps[pkg] = app
+                    break
+        self.ready = True
+        done()
+        return False
+
+
+class AppEntry:
+    def __init__(self, key, name, icon=None, app=None):
+        self.key, self.name, self.icon, self.app = key, name, icon, app
+        self.code = self.data = self.cache = 0
+        self.data_folders = []
+        self.cache_folders = []
+
+    @property
+    def total(self):
+        return self.code + self.data
+
+
+def steam_games():
+    """installdir -> name, appid -> installdir from Steam's app manifests"""
+    names, dirs = {}, {}
+    apps = os.path.join(HOME, '.local', 'share', 'Steam', 'steamapps')
+    try:
+        manifests = [f for f in os.listdir(apps) if f.startswith('appmanifest_') and f.endswith('.acf')]
+    except OSError:
+        return names, dirs
+    for m in manifests:
+        fields = {}
+        try:
+            with open(os.path.join(apps, m), errors='replace') as f:
+                for l in f:
+                    parts = l.strip().split('"')
+                    if len(parts) >= 4:
+                        fields.setdefault(parts[1], parts[3])
+        except OSError:
+            continue
+        if 'installdir' in fields:
+            names[fields['installdir']] = fields.get('name', fields['installdir'])
+            if 'appid' in fields:
+                dirs[fields['appid']] = fields['installdir']
+    return names, dirs
+
+
+class Model:
+    """the categories as the pages show them, from the scan and the
+    package database"""
+
+    def __init__(self, scan, packages):
+        self.scan, self.packages = scan, packages
+        self.apps = []
+        self.cats = {}
+        self.disk = {}		# category -> bytes on disk (root scans)
+        self.logical = {}	# category -> the same files' bytes
+
+    def compute(self):
+        scan, pk = self.scan, self.packages
+        cats = dict(scan.cats)
+        # apps: the packages with an app, their data folders, /opt, Flatpak
+        apps = {}
+        keys = {}
+        for pkg, app in pk.apps.items():
+            e = AppEntry(pkg, app.get_display_name(), app.get_icon(), app)
+            e.code = pk.sizes.get(pkg, 0)
+            apps[pkg] = e
+            exe = os.path.basename(app.get_executable() or '')
+            app_id = (app.get_id() or '').removesuffix('.desktop')
+            for k in (pkg, exe, app_id, app_id.rsplit('.', 1)[-1], app.get_display_name()):
+                if k:
+                    keys.setdefault(norm(k), e)
+        other = AppEntry('other', 'Other app data')
+        for g, v in scan.groups.get('apps', {}).items():
+            kind, _, name = g.partition(':')
+            if kind == 'data':
+                e = keys.get(norm(ALIASES.get(name, name))) or other
+                e.data += v
+                e.data_folders.append((name, v))
+            else:	# /opt/<name>, Flatpak: one entry each
+                key = g if kind == 'opt' else 'flatpak'
+                e = apps.setdefault(key, AppEntry(key, name or 'Flatpak' if kind != 'opt' else name))
+                e.data += v
+        if other.data:
+            apps['other'] = other
+        for folder, v in scan.groups.get('cache', {}).items():
+            e = keys.get(norm(cache_owner(folder)))
+            if e:
+                e.cache += v
+                e.cache_folders.append(folder)
+        app_code = sum(e.code for e in apps.values())
+        cats['apps'] = sum(e.total for e in apps.values())
+        # the app packages were walked as part of /usr (System)
+        cats['system'] = max(0, cats.get('system', 0) - app_code)
+        self.apps = sorted((e for e in apps.values() if e.total), key=lambda e: -e.total)
+        self.cats = cats
+        # on disk: as measured per category; the app packages' part of /usr
+        # (moved from System to Apps above) at System's share
+        disk = {c: sum(g.values()) for c, g in scan.disk.items()}
+        logical = {c: sum(g.values()) for c, g in scan.logical.items()}
+        if logical:
+            share = disk.get('system', 0) / logical['system'] if logical.get('system') else 1
+            disk['apps'] = disk.get('apps', 0) + app_code * share
+            logical['apps'] = logical.get('apps', 0) + app_code
+            disk['system'] = max(0, disk.get('system', 0) - app_code * share)
+            logical['system'] = max(0, logical.get('system', 0) - app_code)
+        self.disk, self.logical = disk, logical
+        return cats
+
+
+class CategoryRow(Gtk.ListBoxRow):
+    def __init__(self, cid, name, icon):
+        super().__init__(activatable=True)
+        self.cid = cid
+        self.add_css_class('cat-row')
+        self.add_css_class('cat-' + cid)
+        box = Gtk.Box(spacing=12, margin_top=10, margin_bottom=10, margin_start=12, margin_end=12)
+        img = Gtk.Image(icon_name=icon, valign=Gtk.Align.CENTER)
+        img.add_css_class('cat-icon')
+        img.add_css_class('cat-' + cid)
+        box.append(img)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True, valign=Gtk.Align.CENTER)
+        line = Gtk.Box()
+        title = Gtk.Label(label=name, xalign=0, hexpand=True)
+        title.add_css_class('heading')
+        self.size = Gtk.Label(label='…', xalign=1)
+        self.size.add_css_class('numeric')
+        line.append(title)
+        line.append(self.size)
+        self.bar = Gtk.ProgressBar()
+        self.comp = Gtk.Label(xalign=0, visible=False)
+        self.comp.add_css_class('caption')
+        self.comp.add_css_class('dim-label')
+        text.append(line)
+        text.append(self.bar)
+        text.append(self.comp)
+        box.append(text)
+        box.append(Gtk.Image(icon_name='go-next-symbolic', valign=Gtk.Align.CENTER))
+        self.set_child(box)
+
+    def set_size(self, size, fraction):
+        self.size.set_label(human(size))
+        self.bar.set_fraction(min(1.0, fraction))
+
+    def set_disk(self, disk, logical):
+        label = on_disk(disk, logical)
+        self.comp.set_label(label or '')
+        self.comp.set_visible(bool(label))
+
+
+class UsageBar(Gtk.DrawingArea):
+    """the used space, split in the categories' shares; the rest is free"""
+
+    def __init__(self):
+        super().__init__(content_height=22, hexpand=True)
+        self.parts = []
+        self.used = 0.0
+        self.set_draw_func(self._draw)
+
+    def set_parts(self, used_fraction, parts):
+        self.used = used_fraction
+        self.parts = parts
+        self.queue_draw()
+
+    def _draw(self, area, cr, w, h):
+        r = h / 2
+        cr.new_sub_path()
+        cr.arc(r, r, r, 1.5708, 4.7124)
+        cr.arc(w - r, r, r, 4.7124, 1.5708)
+        cr.close_path()
+        cr.clip()
+        fg = self.get_color()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.1)
+        cr.paint()
+        total = sum(v for _, v in self.parts) or 1
+        x = 0.0
+        for color, v in self.parts:
+            seg = w * self.used * v / total
+            c = Gdk.RGBA()
+            c.parse(color)
+            cr.set_source_rgba(c.red, c.green, c.blue, 1)
+            cr.rectangle(x, 0, seg + 0.5, h)
+            cr.fill()
+            x += seg
+
+
+def size_row(title, subtitle, size, activatable=False):
+    row = Adw.ActionRow(title=GLib.markup_escape_text(title), activatable=activatable)
+    if subtitle:
+        row.set_subtitle(GLib.markup_escape_text(subtitle))
+    lbl = Gtk.Label(label=human(size), valign=Gtk.Align.CENTER)
+    lbl.add_css_class('numeric')
+    lbl.add_css_class('dim-label')
+    row.add_suffix(lbl)
+    return row
+
+
+def tilde(path):
+    return '~' + path[len(HOME):] if path == HOME or path.startswith(HOME + '/') else path
+
+
+def clear_folder(folder, done):
+    """delete what is inside a folder (not the folder), off the main loop;
+    done(freed bytes)"""
+    def work():
+        freed = 0
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            entries = []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    t = walk(e.path, True, set())
+                    freed += sum(t.cats.values())
+                    shutil.rmtree(e.path, ignore_errors=True)
+                else:
+                    freed += e.stat(follow_symlinks=False).st_blocks * 512
+                    os.unlink(e.path)
+            except OSError:
+                pass
+        GLib.idle_add(done, freed)
+    threading.Thread(target=work, daemon=True).start()
+
+
+class Storage(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='Storage', default_width=540, default_height=1100)
+        self.scan = Scan()
+        self.packages = Packages()
+        self.model = Model(self.scan, self.packages)
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+        self.nav = Adw.NavigationView()
+        self.toasts.set_child(self.nav)
+
+        header = Adw.HeaderBar()
+        self.refresh = Gtk.Button(icon_name='view-refresh-symbolic', tooltip_text='Recalculate')
+        self.refresh.connect('clicked', lambda b: self.start())
+        header.pack_start(self.refresh)
+        menu = Gio.Menu()
+        menu.append('About Storage', 'app.about')
+        header.pack_end(Gtk.MenuButton(icon_name='open-menu-symbolic', menu_model=menu, primary=True,
+                                       tooltip_text='Main Menu'))
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=18, margin_bottom=24,
+                      margin_start=12, margin_end=12)
+        self.used = Gtk.Label(xalign=0)
+        self.used.add_css_class('used-size')
+        self.of = Gtk.Label(xalign=0)
+        self.of.add_css_class('dim-label')
+        box.append(self.used)
+        box.append(self.of)
+        self.bar = UsageBar()
+        self.bar.set_margin_top(6)
+        box.append(self.bar)
+        status = Gtk.Box(spacing=8)
+        self.spinner = Adw.Spinner()
+        self.status = Gtk.Label(xalign=0, hexpand=True)
+        self.status.add_css_class('dim-label')
+        self.free = Gtk.Label(xalign=1)
+        self.free.add_css_class('dim-label')
+        status.append(self.spinner)
+        status.append(self.status)
+        status.append(self.free)
+        box.append(status)
+
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=12)
+        self.list.add_css_class('boxed-list')
+        self.rows = {}
+        for cid, name, icon, _ in CATEGORIES:
+            row = CategoryRow(cid, name, icon)
+            self.rows[cid] = row
+            self.list.append(row)
+        self.list.connect('row-activated', lambda lb, row: self.open_category(row.cid))
+        box.append(self.list)
+        more = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=12)
+        more.add_css_class('boxed-list')
+        self.comp_row = Adw.ActionRow(title='Compression', activatable=True, visible=False)
+        self.comp_row.add_prefix(Gtk.Image(icon_name='package-x-generic-symbolic'))
+        self.comp_row.add_suffix(Gtk.Image(icon_name='go-next-symbolic'))
+        self.comp_row.connect('activated', lambda r: self.nav.push(CompressionPage(self)))
+        more.append(self.comp_row)
+        self.more = more
+        box.append(more)
+        self.note = Gtk.Label(wrap=True, xalign=0, margin_top=12)
+        self.note.add_css_class('dim-label')
+        self.note.add_css_class('caption')
+        box.append(self.note)
+
+        view = Adw.ToolbarView(content=Gtk.ScrolledWindow(
+            child=Adw.Clamp(child=box, maximum_size=600), hscrollbar_policy=Gtk.PolicyType.NEVER))
+        view.add_top_bar(header)
+        self.nav.add(Adw.NavigationPage(child=view, title='Storage', tag='main'))
+
+        # a result per unit: redraw at most four times a second meanwhile
+        self.update_id = 0
+        self.scan.connect('update', lambda s: self._queue_update())
+        self.scan.connect('done', lambda s: self.update())
+        self.packages.load(self.update)
+        self.scan.probe_root(self.start)	# then scan, as root when allowed
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text))
+
+    def _queue_update(self):
+        if not self.update_id:
+            self.update_id = GLib.timeout_add(250, self._timed_update)
+
+    def _timed_update(self):
+        self.update_id = 0
+        self.update()
+        return GLib.SOURCE_REMOVE
+
+    def start(self):
+        if self.scan.running or self.scan.root is None:
+            return
+        self.refresh.set_sensitive(False)
+        self.scan.start()
+        self.update()
+
+    def update(self):
+        st = os.statvfs('/')
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        used = total - st.f_bfree * st.f_frsize
+        self.used.set_label(human(used))
+        self.of.set_label(f'used of {human(total)}')
+        self.free.set_label(f'{human(free)} free')
+        cats = self.model.compute() if self.packages.ready else dict(self.scan.cats)
+        if not self.packages.ready:
+            cats.pop('apps', None)
+        counted = sum(cats.get(c[0], 0) for c in CATEGORIES) or 1
+        for cid, _, _, _ in CATEGORIES:
+            v = cats.get(cid, 0)
+            if cid == 'apps' and not self.packages.ready:
+                continue
+            self.rows[cid].set_size(v, v / counted)
+        m = self.model
+        known = self.packages.ready and bool(m.logical)
+        for cid, _, _, _ in CATEGORIES:
+            self.rows[cid].set_disk(m.disk.get(cid, 0), m.logical.get(cid, 0) if known else 0)
+        disk, logical = sum(m.disk.values()), sum(m.logical.values())
+        self.comp_row.set_visible(known)
+        self.more.set_visible(known)
+        if known:
+            self.comp_row.set_subtitle(f'{human(logical)} of files in {human(disk)} on disk '
+                                       f'({disk / logical * 100:.0f} %), {human(logical - disk)} saved')
+        # the used space is what the files take on disk, when measured
+        shares = m.disk if known else cats
+        self.bar.set_parts(used / total if total else 0,
+                           [(color, shares.get(cid, 0)) for cid, _, _, color in CATEGORIES])
+        running = self.scan.running
+        self.spinner.set_visible(running)
+        self.refresh.set_sensitive(not running)
+        self.status.set_label(f'Calculating… {self.scan.progress * 100:.0f} %' if running else '')
+        note = []
+        if known:
+            note.append('Sizes are the files’ sizes before compression; Compression shows what '
+                        'they take on disk.')
+        elif counted > used * 1.05:
+            note.append(f'Sizes are the files’ sizes ({human(counted)} in all); btrfs compression stores '
+                        f'them in less space, so they add up to more than the {human(used)} used.')
+        if not running and self.scan.unreadable:
+            n = len(self.scan.unreadable)
+            note.append(f'{n} folder{"s" if n > 1 else ""} this account cannot read (other users, the '
+                        'administrator’s) are not counted.')
+        self.note.set_label('\n\n'.join(note))
+        self.note.set_visible(bool(note))
+        page = self.nav.get_visible_page()
+        if not running and isinstance(page, CategoryPage):
+            page.fill()
+
+    def open_category(self, cid):
+        if not self.scan.cats:
+            return
+        self.nav.push(CategoryPage(self, cid))
+
+    def clear(self, folders, title):
+        folders = [f for f in folders if clearable(f)]
+        if not folders:
+            return
+        where = ', '.join(tilde(f) for f in folders)
+        dialog = Adw.AlertDialog(heading=f'Clear {title}?',
+                                 body=f'Everything inside {where} is deleted. Apps rebuild their cache when '
+                                      'they need it, so they may be slower at first.')
+        dialog.add_response('cancel', 'Cancel')
+        dialog.add_response('clear', 'Clear')
+        dialog.set_response_appearance('clear', Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def response(d, r):
+            if r != 'clear':
+                return
+            left, freed = [len(folders)], [0]
+
+            def one(n):
+                freed[0] += n
+                left[0] -= 1
+                if not left[0]:
+                    self.toast(f'{human(freed[0])} freed')
+                    self.start()
+            for f in folders:
+                clear_folder(f, one)
+        dialog.connect('response', response)
+        dialog.present(self)
+
+    def empty_trash(self):
+        dialog = Adw.AlertDialog(heading='Empty the trash?',
+                                 body='Everything in the trash is deleted for good.')
+        dialog.add_response('cancel', 'Cancel')
+        dialog.add_response('empty', 'Empty Trash')
+        dialog.set_response_appearance('empty', Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def response(d, r):
+            if r != 'empty':
+                return
+            trash = os.path.join(HOME, '.local', 'share', 'Trash')
+            subs = [os.path.join(trash, s) for s in ('files', 'info', 'expunged')]
+            subs = [f for f in subs if os.path.isdir(f)]
+            left, freed = [len(subs)], [0]
+
+            def one(n):
+                freed[0] += n
+                left[0] -= 1
+                if not left[0]:
+                    self.toast(f'{human(freed[0])} freed')
+                    self.start()
+            for f in subs:
+                clear_folder(f, one)
+        dialog.connect('response', response)
+        dialog.present(self)
+
+
+class CategoryPage(Adw.NavigationPage):
+    def __init__(self, win, cid):
+        name = next(c[1] for c in CATEGORIES if c[0] == cid)
+        super().__init__(title=name)
+        self.win, self.cid = win, cid
+        self.view = Adw.ToolbarView()
+        self.view.add_top_bar(Adw.HeaderBar())
+        self.set_child(self.view)
+        self.fill()
+
+    def fill(self):
+        page = Adw.PreferencesPage()
+        m = self.win.model
+        if m.logical.get(self.cid):
+            g = self._group(page)
+            g.add(size_row('On disk', f'{m.disk[self.cid] / m.logical[self.cid] * 100:.0f} % of '
+                           f'{human(m.logical[self.cid])}, with btrfs compression', m.disk[self.cid]))
+        pages = {'apps': self._apps, 'games': self._games, 'cache': self._cache, 'trash': self._trash_page,
+                 'system': self._system}
+        pages.get(self.cid, self._typed)(page)
+        self.view.set_content(page)
+
+    def _disk(self, group):
+        """a group's size on disk, as a subtitle (root scans)"""
+        scan = self.win.scan
+        return on_disk(scan.disk.get(self.cid, {}).get(group, 0), scan.logical.get(self.cid, {}).get(group, 0))
+
+    def _group(self, page, title=None, description=None):
+        g = Adw.PreferencesGroup(title=title or '', description=description or '')
+        page.add(g)
+        return g
+
+    def _typed(self, page):
+        scan = self.win.scan
+        groups = scan.groups.get(self.cid, {})
+        g = self._group(page, 'Folders')
+        for folder, v in sorted(groups.items(), key=lambda kv: -kv[1])[:15]:
+            if v < 100_000:
+                break
+            row = size_row(tilde(folder) if folder != 'Home' else 'Home folder', self._disk(folder), v,
+                           activatable=folder != 'Home')
+            if folder != 'Home':
+                row.connect('activated', lambda r, f=folder: self._open(f))
+            g.add(row)
+        g = self._group(page, 'Largest files')
+        for size, path in sorted(scan.top.get(self.cid, []), reverse=True)[:40]:
+            row = size_row(os.path.basename(path), tilde(os.path.dirname(path)), size, activatable=True)
+            row.connect('activated', lambda r, p=path: self._open(p))
+            more = Gtk.MenuButton(icon_name='view-more-symbolic', valign=Gtk.Align.CENTER,
+                                  tooltip_text='More')
+            more.add_css_class('flat')
+            menu = Gio.Menu()
+            menu.append('Show in Folder', 'file.folder')
+            menu.append('Move to Trash', 'file.trash')
+            more.set_menu_model(menu)
+            actions = Gio.SimpleActionGroup()
+            for n, cb in (('folder', self._folder), ('trash', self._to_trash)):
+                a = Gio.SimpleAction(name=n)
+                a.connect('activate', lambda a, p, cb=cb, path=path, row=row, g=g: cb(path, row, g))
+                actions.add_action(a)
+            more.insert_action_group('file', actions)
+            row.add_suffix(more)
+            g.add(row)
+
+    def _open(self, path):
+        Gtk.FileLauncher(file=Gio.File.new_for_path(path)).launch(self.win, None, None)
+
+    def _folder(self, path, row, group):
+        Gtk.FileLauncher(file=Gio.File.new_for_path(path)).open_containing_folder(self.win, None, None)
+
+    def _to_trash(self, path, row, group):
+        try:
+            Gio.File.new_for_path(path).trash(None)
+        except GLib.Error as e:
+            self.win.toast(e.message)
+            return
+        group.remove(row)
+        self.win.toast(f'“{os.path.basename(path)}” moved to the trash')
+
+    def _apps(self, page):
+        g = self._group(page)
+        for e in self.win.model.apps:
+            row = size_row(e.name, f'App {human(e.code)}  ·  Data {human(e.data)}'
+                           + (f'  ·  Cache {human(e.cache)}' if e.cache else ''), e.total, activatable=True)
+            img = Gtk.Image(pixel_size=32)
+            if e.icon:
+                img.set_from_gicon(e.icon)
+            else:
+                img.set_from_icon_name('application-x-executable-symbolic')
+            row.add_prefix(img)
+            row.connect('activated', lambda r, e=e: self._app(e))
+            g.add(row)
+
+    def _app(self, e):
+        dialog = Adw.Dialog(title=e.name, content_width=420)
+        page = Adw.PreferencesPage()
+        g = Adw.PreferencesGroup()
+        for title, v in (('App', e.code), ('Data', e.data), ('Cache', e.cache)):
+            if v or title != 'Cache':
+                g.add(size_row(title, None, v))
+        page.add(g)
+        if e.data_folders:
+            g = Adw.PreferencesGroup(title='Data folders')
+            for name, v in sorted(e.data_folders, key=lambda x: -x[1])[:20]:
+                g.add(size_row(name, None, v))
+            page.add(g)
+        actions = Adw.PreferencesGroup()
+        folders = [f for f in e.cache_folders if clearable(f)]
+        if folders:
+            b = Adw.ButtonRow(title='Clear Cache', start_icon_name='edit-clear-all-symbolic')
+            b.connect('activated', lambda r: (dialog.close(), self.win.clear(folders, f'the cache of {e.name}')))
+            actions.add(b)
+        if e.app:
+            b = Adw.ButtonRow(title='Open', start_icon_name='external-link-symbolic')
+            b.connect('activated', lambda r: (dialog.close(), e.app.launch([], None)))
+            actions.add(b)
+        page.add(actions)
+        view = Adw.ToolbarView(content=page)
+        view.add_top_bar(Adw.HeaderBar())
+        dialog.set_child(view)
+        dialog.present(self.win)
+
+    def _games(self, page):
+        names, dirs = steam_games()
+
+        def game(g):
+            kind, _, name = g.partition('/')
+            if kind == 'compatdata':
+                name = dirs.get(name, f'Proton prefix {name}')
+            return names.get(name, name)
+        games = collections.Counter()
+        for g, v in self.win.scan.groups.get('games', {}).items():
+            games[game(g)] += v
+        group = self._group(page, description='Steam library: the games and their Proton prefixes')
+        steamapps = os.path.join(HOME, '.local', 'share', 'Steam', 'steamapps', 'common')
+        inv = {v: k for k, v in names.items()}
+        disk, logical = collections.Counter(), collections.Counter()
+        for g, v in self.win.scan.disk.get('games', {}).items():
+            disk[game(g)] += v
+            logical[game(g)] += self.win.scan.logical['games'][g]
+        for name, v in games.most_common():
+            row = size_row(name, on_disk(disk[name], logical[name]), v, activatable=True)
+            row.connect('activated', lambda r, d=inv.get(name, name): self._open(os.path.join(steamapps, d)))
+            group.add(row)
+
+    def _cache(self, page):
+        groups = self.win.scan.groups.get('cache', {})
+        user = self._group(page, 'Apps’ cache', 'Cleared caches are rebuilt by the apps when needed')
+        system = self._group(page, 'System cache', 'Cleared by the administrator (pacman -Sc for packages)')
+        for folder, v in sorted(groups.items(), key=lambda kv: -kv[1]):
+            if v < 1_000_000:
+                continue
+            if folder == 'Steam':
+                name = 'Steam (shaders, downloads)'
+            elif folder.startswith((os.path.join(HOME, '.cache') + '/', '/var/')):
+                name = os.path.basename(folder)
+            else:	# a cache folder inside an app's data: the app's name
+                name = cache_owner(folder)
+            where = tilde(folder) if folder != 'Steam' else None
+            disk = self._disk(folder)
+            row = size_row(name, ' · '.join(x for x in (where, disk) if x) or None, v)
+            if clearable(folder):
+                b = Gtk.Button(label='Clear', valign=Gtk.Align.CENTER)
+                b.connect('clicked', lambda b, f=folder, n=name: self.win.clear([f], n))
+                row.add_suffix(b)
+            (user if folder == 'Steam' or folder.startswith(HOME + '/') else system).add(row)
+
+    def _trash_page(self, page):
+        v = self.win.scan.cats.get('trash', 0)
+        g = self._group(page)
+        g.add(size_row('In the trash', None, v))
+        actions = self._group(page)
+        b = Adw.ButtonRow(title='Empty Trash', start_icon_name='user-trash-symbolic', sensitive=v > 0)
+        b.add_css_class('destructive-action')
+        b.connect('activated', lambda r: self.win.empty_trash())
+        actions.add(b)
+
+    def _system(self, page):
+        g = self._group(page, 'Folders')
+        groups = dict(self.win.scan.groups.get('system', {}))
+        app_code = sum(e.code for e in self.win.model.apps)
+        if '/usr' in groups:
+            groups['/usr'] = max(0, groups['/usr'] - app_code)
+        for folder, v in sorted(groups.items(), key=lambda kv: -kv[1])[:12]:
+            if v < 100_000:
+                break
+            g.add(size_row(folder, self._disk(folder), v))
+        pk = self.win.packages
+        g = self._group(page, 'Largest packages', 'Installed size of the system’s packages (apps are under Apps)')
+        sizes = sorted(((v, n) for n, v in pk.sizes.items() if n not in pk.apps), reverse=True)[:25]
+        for v, n in sizes:
+            g.add(size_row(n, None, v))
+
+
+class CompressionPage(Adw.NavigationPage):
+    """what btrfs compression saves: in all, by category, by method"""
+
+    def __init__(self, win):
+        super().__init__(title='Compression')
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        page = Adw.PreferencesPage()
+        m, scan = win.model, win.scan
+        disk, logical = sum(m.disk.values()), sum(m.logical.values())
+        opt = root_compression()
+        g = Adw.PreferencesGroup(title='File system', description=(
+            f'btrfs compresses new files when they are written (compress={opt}); what does not '
+            'compress is stored as it is' if opt else 'btrfs, compressed as the files were written'))
+        g.add(size_row('Files', 'Their size before compression', logical))
+        g.add(size_row('On disk', f'{disk / logical * 100:.0f} % of their size' if logical else None, disk))
+        g.add(size_row('Saved', None, logical - disk))
+        page.add(g)
+        g = Adw.PreferencesGroup(title='By category')
+        for cid, name, icon, _ in CATEGORIES:
+            d, l = m.disk.get(cid, 0), m.logical.get(cid, 0)
+            if not l:
+                continue
+            g.add(self._share_row(name, d, l, icon, cid))
+        page.add(g)
+        g = Adw.PreferencesGroup(title='By method', description='None: written uncompressed, as btrfs found '
+                                 'the data did not compress (media, archives) or before compression was on')
+        for comp, (d, l) in sorted(scan.algo.items(), key=lambda kv: -kv[1][1]):
+            if l:
+                g.add(self._share_row(COMPRESSION.get(comp, str(comp)), d, l))
+        page.add(g)
+        view.set_content(page)
+        self.set_child(view)
+
+    @staticmethod
+    def _share_row(title, disk, logical, icon=None, cid=None):
+        row = Adw.ActionRow(title=GLib.markup_escape_text(title),
+                            subtitle=f'{human(disk)} on disk of {human(logical)}')
+        if icon:
+            img = Gtk.Image(icon_name=icon, valign=Gtk.Align.CENTER)
+            img.add_css_class('cat-icon')
+            img.add_css_class('cat-' + cid)
+            row.add_prefix(img)
+        lbl = Gtk.Label(label=f'{disk / logical * 100:.0f} %', valign=Gtk.Align.CENTER)
+        lbl.add_css_class('numeric')
+        lbl.add_css_class('dim-label')
+        row.add_suffix(lbl)
+        return row
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        about = Gio.SimpleAction(name='about')
+        about.connect('activate', self._about)
+        self.add_action(about)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        css = Gtk.CssProvider()
+        css.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.get_active_window() or Storage(self)
+        win.present()
+
+    def _about(self, *a):
+        Adw.AboutDialog(application_name='Storage', application_icon=APP_ID, version=VERSION,
+                        developer_name='arch-port', license_type=Gtk.License.MIT_X11,
+                        comments='What fills the phone’s storage').present(self.get_active_window())
+
+
+if __name__ == '__main__':
+    sys.exit(App().run(sys.argv))

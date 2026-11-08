@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-m += cezanne-vdec.o
+cezanne-vdec-y := vdec_drv.o vdec_h264.o vdec_h264_hw.o vdec_vp9.o vdec_vp9_hw.o vdec_vp8.o vdec_vp8_hw.o \
+	vdec_av1.o vdec_av1_hw.o vdec_av1_tables.o vdec_hevc.o vdec_hevc_hw.o
+# VDEC_BRINGUP=1: header-word override parameters for test/vdec-bitsearch
+ccflags-$(VDEC_BRINGUP) += -DVDEC_BRINGUP

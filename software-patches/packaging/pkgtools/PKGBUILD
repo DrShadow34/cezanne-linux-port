@@ -1,0 +1,24 @@
+# cezanne-build and its daily timer: keeps the local [cezanne] repo current
+# (packaging/README.md). The packaging tree itself is synced from the project
+# to /home/alarm/cezanne-pkg (packaging/cezanne-pkg sync).
+# The version is the build time: cezanne-build rebuilds when the dir changes.
+pkgname=cezanne-pkgtools
+pkgver=0
+pkgrel=1
+pkgdesc="Builds the cezanne packages into the local pacman repo; daily rebuild of stale overlays"
+arch=(any)
+url="https://localhost/arch-port"
+license=(GPL-2.0-or-later)
+# devtools-alarm: the clean build chroot (mkarchroot, makechrootpkg)
+depends=(bash pacman git curl libarchive systemd devtools-alarm)
+install=cezanne-pkgtools.install
+
+pkgver() {
+  date -u +%Y%m%d.%H%M%S
+}
+
+package() {
+  install -Dm755 "$startdir/cezanne-build" "$pkgdir/usr/bin/cezanne-build"
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/system" \
+    "$startdir/cezanne-build.service" "$startdir/cezanne-build.timer"
+}

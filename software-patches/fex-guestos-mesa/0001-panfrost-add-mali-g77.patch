@@ -1,0 +1,13 @@
+--- a/src/panfrost/model/pan_model.c	2026-10-21 15:57:13.215312415 +0200
++++ b/src/panfrost/model/pan_model.c	2026-10-21 15:57:13.234848728 +0200
+@@ -81,6 +81,10 @@
+    BIFROST_MODEL(PAN_PROD_ID(7, 2, 2),    "G52",    "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192)),
+    BIFROST_MODEL(PAN_PROD_ID(7, 4, 2),    "G52 r1", "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES( 8192,  8192)),
+ 
++   /* tTRx, e.g. MediaTek MT6885 (Dimensity 1000/1000+), G77 MC9. Same Valhall v9 JM
++    * core as the G57 (which is derived from it): same tile buffer and per-core rates. */
++   VALHALL_MODEL(PAN_PROD_ID(9, 0, 0), 0, "G77",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
++                                              MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(9, 0, 1), 0, "G57",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
+                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(9, 0, 3), 0, "G57",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),

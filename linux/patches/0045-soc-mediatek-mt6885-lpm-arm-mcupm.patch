@@ -1,0 +1,124 @@
+From: arch-port
+Subject: [PATCH] soc: mediatek: mt6885-lpm: arm MCUPM low-power control for the SPM
+
+Without it the SPM firmware's watchdog resets the SoC in deep suspend
+(MCUPM never handles MCUSYS-off). Port of the BSP lpm platform init.
+---
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index f3ccf0347..cf3e4af5c 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -9,5 +9,5 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
+-obj-$(CONFIG_ARCH_MEDIATEK) += mt6885-cpuhp.o
++obj-$(CONFIG_ARCH_MEDIATEK) += mt6885-cpuhp.o mt6885-lpm.o
+ obj-$(CONFIG_MTK_DSI_CMD_KICK) += mtk-dsi-cmd-kick.o
+diff --git a/drivers/soc/mediatek/mt6885-lpm.c b/drivers/soc/mediatek/mt6885-lpm.c
+new file mode 100644
+index 000000000..576a2564a
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6885-lpm.c
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6885 low-power setup the SPM firmware depends on. From the 4.14 BSP's
++ * lpm/modules/platform/mt6885 (mtk_lp_plat_apmcu_mbox.c,
++ * mtk_wait_mbox_init_done() / mtk_notify_subsys_ap_ready()): once MCUPM's
++ * task reports INIT, tell it through the APMCU mailbox (MCUPM mbox 3, plain
++ * SRAM slots) to handle MCUSYS, buck and ARMPLL power-down, with the buck
++ * and ARMPLL off in low power, and that the AP is ready. Without it MCUPM
++ * never does its part of MCUSYS-off and the SPM firmware's watchdog resets
++ * the SoC in deep suspend.
++ *
++ * The BSP also sets MCUPM_CM_CTRL (CPU -> DRAM frequency coupling, cm_mgr);
++ * nothing drives that here, so it stays off.
++ *
++ * Only done when ATF runs the SPM resource constraints, i.e. lk loaded the
++ * SPM firmware (normal / boot-slot boot; a recovery-slot boot has none).
++ */
++#include <linux/arm-smccc.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/workqueue.h>
++
++#define MCUPM_MBOX3_SRAM	0x1031fec0
++#define MCUPM_MBOX3_SIZE	0xa0
++
++#define SLOT_AP_READY		0
++#define SLOT_PWR_CTRL_EN	4
++#define SLOT_BUCK_MODE		6
++#define SLOT_ARMPLL_MODE	7
++#define SLOT_TASK_STA		8
++
++#define MCUPM_MCUSYS_CTRL	BIT(0)
++#define MCUPM_BUCK_CTRL		BIT(1)
++#define MCUPM_ARMPLL_CTRL	BIT(2)
++#define MCUPM_BUCK_OFF_MODE	2
++#define MCUPM_ARMPLL_OFF	2
++#define MCUPM_TASK_INIT		1
++
++/* MTK LPM SIP: SPM debug user, constraint switch of cpu_buck_ldo */
++#define SIP_MTK_LPM_CONTROL	0xc2000507
++#define LPM_MAGIC		0xda000000
++#define LPM_USER_SPM_DBG	1
++#define LPM_ACT_GET		BIT(2)
++#define LPM_DBG_RC_SWITCH	5
++#define LPM_RC_CPU_BUCK_LDO	3
++
++#define POLL_MS			100
++#define POLL_MAX		300	/* 30 s */
++
++static void __iomem *mbox;
++static unsigned int polls;
++
++static void mt6885_lpm_arm(struct work_struct *w);
++static DECLARE_DELAYED_WORK(mt6885_lpm_work, mt6885_lpm_arm);
++
++static void mt6885_lpm_arm(struct work_struct *w)
++{
++	u32 sta = readl(mbox + 4 * SLOT_TASK_STA);
++
++	if (sta != MCUPM_TASK_INIT) {
++		if (++polls < POLL_MAX) {
++			schedule_delayed_work(&mt6885_lpm_work, msecs_to_jiffies(POLL_MS));
++			return;
++		}
++		pr_warn("mt6885-lpm: MCUPM task state %u, not INIT; not armed\n", sta);
++		return;
++	}
++	writel(MCUPM_ARMPLL_OFF, mbox + 4 * SLOT_ARMPLL_MODE);
++	writel(MCUPM_BUCK_OFF_MODE, mbox + 4 * SLOT_BUCK_MODE);
++	writel(MCUPM_MCUSYS_CTRL | MCUPM_BUCK_CTRL | MCUPM_ARMPLL_CTRL,
++	       mbox + 4 * SLOT_PWR_CTRL_EN);
++	writel(1, mbox + 4 * SLOT_AP_READY);
++	pr_info("mt6885-lpm: MCUPM low-power control armed\n");
++}
++
++static bool mt6885_spm_constraints_on(void)
++{
++	struct arm_smccc_res r;
++
++	arm_smccc_smc(SIP_MTK_LPM_CONTROL,
++		      LPM_MAGIC | LPM_USER_SPM_DBG << 16 | LPM_DBG_RC_SWITCH,
++		      LPM_ACT_GET, LPM_RC_CPU_BUCK_LDO, 0, 0, 0, 0, &r);
++	return r.a0 && r.a0 != SMCCC_RET_NOT_SUPPORTED;
++}
++
++static int __init mt6885_lpm_init(void)
++{
++	if (!of_machine_is_compatible("mediatek,mt6885"))
++		return 0;
++	if (!mt6885_spm_constraints_on()) {
++		pr_info("mt6885-lpm: no SPM constraints (no SPM firmware), skipped\n");
++		return 0;
++	}
++	mbox = ioremap(MCUPM_MBOX3_SRAM, MCUPM_MBOX3_SIZE);
++	if (!mbox)
++		return -ENOMEM;
++	schedule_delayed_work(&mt6885_lpm_work, 0);
++	return 0;
++}
++late_initcall(mt6885_lpm_init);

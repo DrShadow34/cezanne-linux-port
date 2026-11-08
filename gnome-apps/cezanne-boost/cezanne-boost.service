@@ -1,0 +1,22 @@
+[Unit]
+Description=Touch boost (cezanne): gnome-shell on the fast cores while the screen is touched
+
+[Service]
+ExecStart=/usr/bin/cezanne-boost
+Restart=on-failure
+# root for /dev/input and other users' threads; only CAP_SYS_NICE is needed
+CapabilityBoundingSet=CAP_SYS_NICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

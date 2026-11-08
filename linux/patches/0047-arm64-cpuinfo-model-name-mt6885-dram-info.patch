@@ -1,0 +1,388 @@
+diff --git a/arch/arm64/kernel/cpuinfo.c b/arch/arm64/kernel/cpuinfo.c
+index 45c63f3d7..bd81e141c 100644
+--- a/arch/arm64/kernel/cpuinfo.c
++++ b/arch/arm64/kernel/cpuinfo.c
+@@ -24,6 +24,7 @@
+ #include <linux/sched.h>
+ #include <linux/smp.h>
+ #include <linux/delay.h>
++#include <linux/of.h>
+ 
+ /*
+  * In case the boot CPU is hotpluggable, we record its initial state and
+@@ -219,6 +220,25 @@ static const char *const compat_hwcap2_str[] = {
+ };
+ #endif /* CONFIG_COMPAT */
+ 
++/*
++ * cezanne port: arm64 prints no "model name", so desktop tools (GNOME's
++ * About page via libgtop, sysinfo-based monitors) show no processor. A
++ * board can name it with a "model-name" string on /cpus.
++ */
++static const char *cpu_model_name;
++
++static int __init cpuinfo_model_name_init(void)
++{
++	struct device_node *np = of_find_node_by_path("/cpus");
++
++	if (np) {
++		of_property_read_string(np, "model-name", &cpu_model_name);
++		of_node_put(np);
++	}
++	return 0;
++}
++core_initcall(cpuinfo_model_name_init);
++
+ static int c_show(struct seq_file *m, void *v)
+ {
+ 	int j;
+@@ -236,6 +256,8 @@ static int c_show(struct seq_file *m, void *v)
+ 	if (compat)
+ 		seq_printf(m, "model name\t: ARMv8 Processor rev %d (%s)\n",
+ 			   MIDR_REVISION(midr), COMPAT_ELF_PLATFORM);
++	else if (cpu_model_name)
++		seq_printf(m, "model name\t: %s\n", cpu_model_name);
+ 
+ 	seq_printf(m, "BogoMIPS\t: %lu.%02lu\n",
+ 		   loops_per_jiffy / (500000UL/HZ),
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index cf3e4af5c..16b6f320c 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -9,5 +9,5 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
+-obj-$(CONFIG_ARCH_MEDIATEK) += mt6885-cpuhp.o mt6885-lpm.o
++obj-$(CONFIG_ARCH_MEDIATEK) += mt6885-cpuhp.o mt6885-lpm.o mt6885-dram-info.o
+ obj-$(CONFIG_MTK_DSI_CMD_KICK) += mtk-dsi-cmd-kick.o
+diff --git a/drivers/soc/mediatek/mt6885-dram-info.c b/drivers/soc/mediatek/mt6885-dram-info.c
+new file mode 100644
+index 000000000..b9eb85a34
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6885-dram-info.c
+@@ -0,0 +1,324 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6885 DRAM description for userspace (cezanne port). Phones have no
++ * SMBIOS, so desktop tools find no memory modules. lk describes the DRAM in
++ * the "mediatek,common-dramc" node of the FDT it boots with (kept by the
++ * boot shim in the lk-fdt carve-out): type, channels, ranks and their
++ * sizes, mode registers, the DVFS data rates and where the DDRPHY keeps
++ * its PLL settings. This driver reads that once and exposes
++ *
++ *   type, vendor, channels, ranks, max_data_rate   (lk's view, MT/s)
++ *   data_rate        current rate from the DDRPHY PLL (MediaTek's fmeter
++ *                    v1 formula, drivers/memory/mediatek/dramc.c in the BSP)
++ *   memory_devices   one SMBIOS-style module per rank as KEY=value lines,
++ *                    the properties systemd's dmi_memory_id gives a PC
++ *                    (imported by a udev rule; Mission Center reads them)
++ */
++#include <linux/io.h>
++#include <linux/libfdt.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++
++#define MAX_RANKS	4
++#define MAX_STEPS	16
++
++struct field {			/* (register offset, mask, shift) */
++	u32 offset, mask, shift;
++};
++
++struct dram_info {
++	void __iomem *phy_nao, *phy_ao;		/* DDRPHY channel 0 */
++	u32 type, channels, ranks, vendor;
++	u64 rank_size[MAX_RANKS];
++	u32 steps, step[MAX_STEPS];
++	u32 crystal, shu_of;
++	struct field shu_lv, pll_id;
++	/* per PLL (pll_id selects) */
++	struct field sdmpcw[2], prediv[2], posdiv[2], ckdiv4[2], pll_md[2],
++		     cldiv2[2], fbksel[2], dqsopen[2], dqopen[2];
++	bool fmeter;
++};
++
++static const char * const dram_types[] = {
++	[1] = "DDR1", [2] = "LPDDR2", [3] = "LPDDR3", [4] = "DDR3",
++	[5] = "LPDDR4", [6] = "LPDDR4X", [7] = "LPDDR4P", [8] = "LPDDR5",
++};
++
++/* LPDDR4 MR5 manufacturer ids (JEDEC) */
++static const char *dram_vendor(u32 id)
++{
++	switch (id) {
++	case 0x01: return "Samsung";
++	case 0x05: return "Nanya";
++	case 0x06: return "SK hynix";
++	case 0x08: return "Winbond";
++	case 0x13: return "CXMT";
++	case 0xff: return "Micron";
++	}
++	return "Unknown";
++}
++
++/* lk's rate table is the PLL's (3068 = 3200 ...); the BSP's decode_freq */
++static u32 nominal_rate(u32 mts)
++{
++	static const u32 map[][2] = {
++		{ 4264, 4266 }, { 3718, 3733 }, { 3068, 3200 }, { 2366, 2400 },
++		{ 1859, 1866 }, { 1534, 1600 }, { 1144, 1200 }, { 754, 800 },
++		{ 396, 400 },
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(map); i++)
++		if (map[i][0] == mts)
++			return map[i][1];
++	return mts;
++}
++
++static int prop_u32s(const void *fdt, int node, const char *name, u32 *out, int max)
++{
++	const fdt32_t *p;
++	int len, i;
++
++	p = fdt_getprop(fdt, node, name, &len);
++	if (!p || len < 4)
++		return 0;
++	len /= 4;
++	for (i = 0; i < len && i < max; i++)
++		out[i] = fdt32_to_cpu(p[i]);
++	return i;
++}
++
++static bool prop_fields(const void *fdt, int node, const char *name, struct field *f, int n)
++{
++	u32 v[6];
++	int i;
++
++	if (prop_u32s(fdt, node, name, v, 3 * n) != 3 * n)
++		return false;
++	for (i = 0; i < n; i++)
++		f[i] = (struct field){ v[3 * i], v[3 * i + 1], v[3 * i + 2] };
++	return true;
++}
++
++static int parse_lk_fdt(struct device *dev, struct dram_info *d)
++{
++	struct device_node *np;
++	struct resource res;
++	u32 v[2 * MAX_RANKS], mr[16];
++	void *fdt;
++	int node, n, i, ret = -ENODEV;
++
++	np = of_parse_phandle(dev->of_node, "memory-region", 0);
++	if (!np)
++		return -ENODEV;
++	ret = of_address_to_resource(np, 0, &res);
++	of_node_put(np);
++	if (ret)
++		return ret;
++	fdt = memremap(res.start, resource_size(&res), MEMREMAP_WB);
++	if (!fdt)
++		return -ENOMEM;
++	ret = -ENODEV;
++	if (fdt_check_header(fdt) || fdt_totalsize(fdt) > resource_size(&res))
++		goto out;
++	node = fdt_node_offset_by_compatible(fdt, -1, "mediatek,common-dramc");
++	if (node < 0)
++		goto out;
++
++	prop_u32s(fdt, node, "dram_type", &d->type, 1);
++	prop_u32s(fdt, node, "ch_cnt", &d->channels, 1);
++	prop_u32s(fdt, node, "rk_cnt", &d->ranks, 1);
++	d->ranks = min_t(u32, d->ranks, MAX_RANKS);
++	n = prop_u32s(fdt, node, "rk_size", v, MAX_RANKS);
++	for (i = 0; i < n; i++)		/* Gbit */
++		d->rank_size[i] = (u64)v[i] << 27;
++	/* (index, value) pairs; the value repeats the byte per die */
++	n = prop_u32s(fdt, node, "mr", mr, ARRAY_SIZE(mr));
++	for (i = 0; i + 1 < n; i += 2)
++		if (mr[i] == 5)
++			d->vendor = mr[i + 1] & 0xff;
++	d->steps = prop_u32s(fdt, node, "freq_step", d->step, MAX_STEPS);
++
++	d->fmeter = prop_u32s(fdt, node, "crystal_freq", &d->crystal, 1) &&
++		    prop_u32s(fdt, node, "shu_of", &d->shu_of, 1) &&
++		    prop_fields(fdt, node, "shu_lv", &d->shu_lv, 1) &&
++		    prop_fields(fdt, node, "pll_id", &d->pll_id, 1) &&
++		    prop_fields(fdt, node, "sdmpcw", d->sdmpcw, 2) &&
++		    prop_fields(fdt, node, "prediv", d->prediv, 2) &&
++		    prop_fields(fdt, node, "posdiv", d->posdiv, 2) &&
++		    prop_fields(fdt, node, "ckdiv4", d->ckdiv4, 2) &&
++		    prop_fields(fdt, node, "pll_md", d->pll_md, 2) &&
++		    prop_fields(fdt, node, "cldiv2", d->cldiv2, 2) &&
++		    prop_fields(fdt, node, "fbksel", d->fbksel, 2) &&
++		    prop_fields(fdt, node, "dqsopen", d->dqsopen, 2) &&
++		    prop_fields(fdt, node, "dqopen", d->dqopen, 2);
++	ret = d->ranks && d->type ? 0 : -ENODEV;
++out:
++	memunmap(fdt);
++	return ret;
++}
++
++static u32 rd(void __iomem *base, const struct field *f, u32 extra)
++{
++	return (readl(base + f->offset + extra) & f->mask) >> f->shift;
++}
++
++/* current data rate, MT/s (BSP fmeter_v1) */
++static u32 data_rate(struct dram_info *d)
++{
++	u32 shu, pll, of, pcw, vco;
++
++	if (!d->fmeter)
++		return 0;
++	shu = rd(d->phy_nao, &d->shu_lv, 0);
++	pll = rd(d->phy_nao, &d->pll_id, 0) & 1;
++	of = d->shu_of * shu;
++	pcw = rd(d->phy_ao, &d->sdmpcw[pll], of);
++	vco = ((d->crystal >> rd(d->phy_ao, &d->prediv[pll], of)) * (pcw >> 8)) >>
++	      rd(d->phy_ao, &d->posdiv[pll], of) >> rd(d->phy_ao, &d->ckdiv4[pll], of) >>
++	      rd(d->phy_ao, &d->pll_md[pll], of) >> rd(d->phy_ao, &d->cldiv2[pll], of) <<
++	      rd(d->phy_ao, &d->fbksel[pll], of);
++	if (rd(d->phy_ao, &d->dqsopen[pll], of) || rd(d->phy_ao, &d->dqopen[pll], of))
++		vco >>= 2;
++	return nominal_rate(vco);
++}
++
++static u32 max_rate(struct dram_info *d)
++{
++	u32 m = 0, i;
++
++	for (i = 0; i < d->steps; i++)
++		m = max(m, nominal_rate(d->step[i]));
++	return m;
++}
++
++static const char *type_name(struct dram_info *d)
++{
++	return d->type < ARRAY_SIZE(dram_types) && dram_types[d->type] ?
++	       dram_types[d->type] : "Unknown";
++}
++
++static ssize_t type_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	return sysfs_emit(buf, "%s\n", type_name(dev_get_drvdata(dev)));
++}
++static DEVICE_ATTR_RO(type);
++
++static ssize_t vendor_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct dram_info *d = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%s\n", dram_vendor(d->vendor));
++}
++static DEVICE_ATTR_RO(vendor);
++
++static ssize_t channels_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct dram_info *d = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", d->channels);
++}
++static DEVICE_ATTR_RO(channels);
++
++static ssize_t ranks_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct dram_info *d = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", d->ranks);
++}
++static DEVICE_ATTR_RO(ranks);
++
++static ssize_t data_rate_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", data_rate(dev_get_drvdata(dev)));
++}
++static DEVICE_ATTR_RO(data_rate);
++
++static ssize_t max_data_rate_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", max_rate(dev_get_drvdata(dev)));
++}
++static DEVICE_ATTR_RO(max_data_rate);
++
++static ssize_t memory_devices_show(struct device *dev, struct device_attribute *a, char *buf)
++{
++	struct dram_info *d = dev_get_drvdata(dev);
++	u32 i, rate = max_rate(d);
++	int len;
++
++	len = sysfs_emit(buf, "MEMORY_ARRAY_LOCATION=System Board Or Motherboard\n"
++			 "MEMORY_ARRAY_NUM_DEVICES=%u\n", d->ranks);
++	for (i = 0; i < d->ranks; i++)
++		len += sysfs_emit_at(buf, len,
++			"MEMORY_DEVICE_%u_PRESENT=1\n"
++			"MEMORY_DEVICE_%u_SIZE=%llu\n"
++			"MEMORY_DEVICE_%u_FORM_FACTOR=Row Of Chips\n"
++			"MEMORY_DEVICE_%u_LOCATOR=Rank %u\n"
++			"MEMORY_DEVICE_%u_BANK_LOCATOR=%u channels x 16 bit\n"
++			"MEMORY_DEVICE_%u_TYPE=%s\n"
++			"MEMORY_DEVICE_%u_MANUFACTURER=%s\n"
++			"MEMORY_DEVICE_%u_SPEED_MTS=%u\n"
++			"MEMORY_DEVICE_%u_CONFIGURED_SPEED_MTS=%u\n"
++			"MEMORY_DEVICE_%u_DATA_WIDTH=%u\n"
++			"MEMORY_DEVICE_%u_TOTAL_WIDTH=%u\n"
++			"MEMORY_DEVICE_%u_RANK=1\n",
++			i, i, d->rank_size[i], i, i, i, i, d->channels, i, type_name(d),
++			i, dram_vendor(d->vendor), i, rate, i, rate,
++			i, d->channels * 16, i, d->channels * 16, i);
++	return len;
++}
++static DEVICE_ATTR_RO(memory_devices);
++
++static struct attribute *dram_info_attrs[] = {
++	&dev_attr_type.attr,
++	&dev_attr_vendor.attr,
++	&dev_attr_channels.attr,
++	&dev_attr_ranks.attr,
++	&dev_attr_data_rate.attr,
++	&dev_attr_max_data_rate.attr,
++	&dev_attr_memory_devices.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(dram_info);
++
++static int dram_info_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct dram_info *d;
++	int ret;
++
++	d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
++	if (!d)
++		return -ENOMEM;
++	ret = parse_lk_fdt(dev, d);
++	if (ret)
++		return dev_err_probe(dev, ret, "no DRAM description from lk\n");
++	d->phy_nao = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(d->phy_nao))
++		return PTR_ERR(d->phy_nao);
++	d->phy_ao = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(d->phy_ao))
++		return PTR_ERR(d->phy_ao);
++	platform_set_drvdata(pdev, d);
++	dev_info(dev, "%u x %llu MiB %s (%s), %u channels, %u MT/s max, %u MT/s now\n",
++		 d->ranks, d->rank_size[0] >> 20, type_name(d), dram_vendor(d->vendor),
++		 d->channels, max_rate(d), data_rate(d));
++	return 0;
++}
++
++static const struct of_device_id dram_info_of_match[] = {
++	{ .compatible = "cezanne,mt6885-dram-info" },
++	{ }
++};
++
++static struct platform_driver dram_info_driver = {
++	.probe = dram_info_probe,
++	.driver = {
++		.name = "cezanne-dram-info",
++		.of_match_table = dram_info_of_match,
++		.dev_groups = dram_info_groups,
++	},
++};
++builtin_platform_driver(dram_info_driver);

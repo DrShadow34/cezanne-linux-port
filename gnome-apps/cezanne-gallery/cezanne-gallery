@@ -1,0 +1,1868 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Gallery for the cezanne: the photos and videos of the home directory, as
+the Android gallery shows them. Photos: a timeline (newest first, one header
+per day) of the media folders: the camera, screenshots, screen recordings,
+Pictures, Videos and Downloads. Albums: one per folder; the camera's photos
+(~/Pictures/Camera) and videos (~/Videos/Camera) are one album, as DCIM is.
+Folders elsewhere in the home directory (projects, game data) are under
+"Other folders"; each can be added to Photos or hidden. The viewer swipes
+between items, zooms (pinch, double tap), plays videos, shows the details and
+moves items to the trash with an undo.
+
+What is a photo or a video and where it lies comes from GNOME's file indexer
+(LocalSearch; SPARQL over D-Bus with TinySPARQL). It indexes $HOME
+recursively, skips hidden directories and every folder holding a .nomedia
+file (Android's convention: "Hide folder" writes one), and its notifier
+brings in new files, such as Snapshot's pictures, while the gallery is open.
+Thumbnails are the freedesktop cache (~/.cache/thumbnails) filled by
+gnome-desktop's factory and the thumbnailers (glycin for images,
+ffmpegthumbnailer for videos). Full images load through glycin, which
+applies the orientation. The camera's RAW pairs (same name, .dng and .jpeg or
+.png) show as one picture; a DNG without its JPEG shows the preview embedded
+in it (gexiv2). Videos play through a playbin of their own (VideoPlayer):
+decoded in hardware, converted in system memory for gtk4paintablesink.
+"Upscale 2x (AI)" writes an upscaled copy next to a photo with cezanne-photo
+(Real-ESRGAN x4plus on the APU through cezanne-upscaled, else on the GPU) or
+a video with cezanne-video-upscale (the compact Real-ESRGAN on the APU, up
+to 1080p), in the background, one at a time.
+"""
+import collections
+import hashlib
+import json
+import os
+import re
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Gdk', '4.0')
+gi.require_version('Gsk', '4.0')
+gi.require_version('Graphene', '1.0')
+gi.require_version('Adw', '1')
+gi.require_version('GdkPixbuf', '2.0')
+gi.require_version('GnomeDesktop', '4.0')
+gi.require_version('Gly', '2')
+gi.require_version('GlyGtk4', '2')
+gi.require_version('Tsparql', '3.0')
+gi.require_version('GExiv2', '0.16')
+gi.require_version('Gst', '1.0')
+from gi.repository import (Adw, Gdk, GdkPixbuf, GExiv2, Gio, GLib, Gly, GlyGtk4,  # noqa: E402
+                           GnomeDesktop, GObject, Graphene, Gsk, Gst, Gtk, Pango, Tsparql)
+
+APP_ID = 'org.cezanne.Gallery'
+VERSION = '1.0'
+SETTINGS_FILE = os.path.join(GLib.get_user_config_dir(), 'cezanne-gallery', 'settings.json')
+THUMB_DIR = os.path.join(GLib.get_user_cache_dir(), 'thumbnails')
+THUMB_SIZE = 256	# freedesktop "large"
+THUMB_CACHE = 300	# textures kept in memory (256 KiB each)
+THUMB_WORKERS = 3
+
+# AI upscaling (cezanne-photo --upscale 2): photos up to 24 MP (the 4x
+# intermediate of more needs gigabytes); ~7.3 min for 16 MP on the APU
+UPSCALE_SOCKET = '/run/cezanne-upscale.sock'
+UPSCALE_MAX_PIXELS = 24_000_000
+UPSCALE_SECONDS_PER_MP = 440 / 16
+UPSCALE_TYPES = ('image/jpeg', 'image/png')
+# videos: frames up to 1080p, ~2.7 s per 1.5 MP frame on the APU
+VIDEO_UPSCALE_MAX_PIXELS = 2_100_000
+VIDEO_SECONDS_PER_MP_FRAME = 2.7 / 1.55
+
+LOCALSEARCH = 'org.freedesktop.LocalSearch3'
+CONTROL = 'org.freedesktop.LocalSearch3.Control'
+MINER_PATH = '/org/freedesktop/Tracker3/Miner/Files'
+MINER_IFACE = 'org.freedesktop.Tracker3.Miner'
+
+CELL = 130	# target grid cell width (logical px): 4 columns on the phone
+GAP = 2
+SKIP_MIME = {'image/svg+xml', 'image/x-icon', 'image/vnd.microsoft.icon'}
+RAW_EXT = ('.dng',)
+PAIR_EXT = ('.jpeg', '.jpg', '.png', '.heic', '.heif', '.avif', '.jxl')
+
+# the phone's cameras by their libcamera id (the DT node, written as the EXIF model)
+CAMERAS = {
+    'camera-sensor@1a': 'Main camera (Sony IMX682)',
+    'camera-sensor@20': 'Ultra-wide camera (Hynix HI1337)',
+    'camera-sensor@2d': 'Macro camera (Samsung S5K5E9)',
+    'camera-sensor@3c': 'Depth camera (OmniVision OV02B1B)',
+    'camera-sensor@56': 'Front camera (Samsung S5K3T2)',
+}
+
+QUERY = '''
+SELECT DISTINCT ?url ?mime ?created ?modified ?w ?h ?dur WHERE {
+  { ?r a nfo:Image } UNION { ?r a nfo:Video }
+  ?r nie:isStoredAs ?f ; nie:mimeType ?mime .
+  ?f nie:url ?url ; nfo:fileLastModified ?modified .
+  OPTIONAL { ?r nie:contentCreated ?created }
+  OPTIONAL { ?r nfo:width ?w }
+  OPTIONAL { ?r nfo:height ?h }
+  OPTIONAL { ?r nfo:duration ?dur }
+}'''
+
+CSS = '''
+.gallery-grid, .gallery-grid > row { background: none; padding: 0; }
+.gallery-grid > row:hover, .gallery-grid > row:selected { background: none; }
+.date-header { font-weight: bold; padding: 16px 12px 6px 12px; }
+.album-cover { border-radius: 12px; background: alpha(currentColor, 0.08); }
+.folder-thumb { border-radius: 8px; background: alpha(currentColor, 0.08); }
+.viewer { background: black; color: white; }
+.viewer headerbar, .viewer .bottom-bar {
+  background: alpha(black, 0.55); color: white; box-shadow: none; }
+.viewer .bottom-bar { padding: 6px; }
+.video-controls { background: alpha(black, 0.55); border-radius: 12px; padding: 2px 10px; color: white; }
+'''
+
+HOME = GLib.get_home_dir()
+
+
+def special_dir(kind):
+    d = GLib.get_user_special_dir(kind)
+    return d.rstrip('/') if d and d.rstrip('/') != HOME else None
+
+
+PICTURES = special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or os.path.join(HOME, 'Pictures')
+VIDEOS = special_dir(GLib.UserDirectory.DIRECTORY_VIDEOS) or os.path.join(HOME, 'Videos')
+DOWNLOAD = special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.join(HOME, 'Downloads')
+MEDIA_ROOTS = (PICTURES, VIDEOS, DOWNLOAD)
+
+
+def under(path, root):
+    return path == root or path.startswith(root + '/')
+
+
+def album_of(folder):
+    """(key, name) of the album a folder's items belong to"""
+    if folder in (os.path.join(PICTURES, 'Camera'), os.path.join(VIDEOS, 'Camera')):
+        return 'camera', 'Camera'
+    named = {
+        os.path.join(PICTURES, 'Screenshots'): 'Screenshots',
+        os.path.join(VIDEOS, 'Screencasts'): 'Screen recordings',
+        os.path.join(DOWNLOAD, 'Telegram Desktop'): 'Telegram',
+        PICTURES: 'Pictures', VIDEOS: 'Videos', DOWNLOAD: 'Downloads', HOME: 'Home',
+    }
+    return folder, named.get(folder, os.path.basename(folder) or folder)
+
+
+def album_order(key):
+    """well-known albums first, as on Android"""
+    order = {'camera': 0, os.path.join(PICTURES, 'Screenshots'): 1, os.path.join(VIDEOS, 'Screencasts'): 2,
+             DOWNLOAD: 3, PICTURES: 4, VIDEOS: 5}
+    return order.get(key, 10)
+
+
+def upscaler_available():
+    """cezanne-photo and an upscaler for it: the APU service or the GPU one"""
+    return bool(GLib.find_program_in_path('cezanne-photo')) and (
+        os.path.exists(UPSCALE_SOCKET) or bool(GLib.find_program_in_path('realesrgan-ncnn-vulkan')))
+
+
+def video_upscaler_available():
+    return os.path.exists(UPSCALE_SOCKET) and bool(GLib.find_program_in_path('cezanne-video-upscale'))
+
+
+def can_upscale(gallery, item):
+    """the item is a photo or a video the installed upscalers take"""
+    px = (item.width or 0) * (item.height or 0)
+    if item.video:
+        return gallery.can_upscale_video and 0 < px <= VIDEO_UPSCALE_MAX_PIXELS
+    return gallery.can_upscale and item.mime in UPSCALE_TYPES and 0 < px <= UPSCALE_MAX_PIXELS
+
+
+def human_size(n):
+    for unit in ('bytes', 'KB', 'MB', 'GB'):
+        if n < 1000 or unit == 'GB':
+            return f'{n:.0f} {unit}' if unit == 'bytes' else f'{n:.1f} {unit}'
+        n /= 1000
+
+
+def duration_text(s):
+    s = int(s)
+    return f'{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}' if s >= 3600 else f'{s // 60}:{s % 60:02d}'
+
+
+def day_title(t):
+    d = GLib.DateTime.new_from_unix_local(int(t))
+    now = GLib.DateTime.new_now_local()
+    days = (GLib.DateTime.new_local(now.get_year(), now.get_month(), now.get_day_of_month(), 0, 0, 0).to_unix()
+            - GLib.DateTime.new_local(d.get_year(), d.get_month(), d.get_day_of_month(), 0, 0, 0).to_unix()) // 86400
+    if days == 0:
+        return 'Today'
+    if days == 1:
+        return 'Yesterday'
+    if 1 < days < 7:
+        return d.format('%A')
+    return d.format('%-d %B') if d.get_year() == now.get_year() else d.format('%-d %B %Y')
+
+
+def iso_time(s):
+    d = GLib.DateTime.new_from_iso8601(s, GLib.TimeZone.new_local()) if s else None
+    return d.to_unix() if d else None
+
+
+def cover_item(items):
+    """an album's cover: its newest picture, else its newest video"""
+    return next((it for it in items if not it.video), items[0] if items else None)
+
+
+class Item:
+    """one photo or video (a RAW + JPEG pair is one item: the JPEG, .raw = the DNG)"""
+    __slots__ = ('uri', 'path', 'mime', 'video', 'time', 'mtime', 'width', 'height', 'duration', 'raw',
+                 'folder', 'name')
+
+    def __init__(self, uri, path, mime, created, modified, w, h, dur):
+        self.uri, self.path, self.mime = uri, path, mime
+        self.video = mime.startswith('video/')
+        self.mtime = modified or 0
+        self.time = created or self.mtime
+        self.width, self.height = w, h
+        self.duration = dur
+        self.raw = None
+        self.folder, self.name = os.path.split(path)
+
+
+class Settings:
+    """folders shown in Photos besides the media folders, favourites"""
+
+    def __init__(self):
+        try:
+            with open(SETTINGS_FILE) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        self.shown = set(data.get('shown', []))
+        self.favorites = set(data.get('favorites', []))
+
+    def save(self):
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        tmp = SETTINGS_FILE + '.new'
+        with open(tmp, 'w') as f:
+            json.dump({'shown': sorted(self.shown), 'favorites': sorted(self.favorites)}, f, indent=1)
+        os.replace(tmp, SETTINGS_FILE)
+
+
+class Index(GObject.Object):
+    """the indexer's photos and videos, re-read when it reports changes"""
+    __gsignals__ = {
+        'loaded': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'failed': (GObject.SignalFlags.RUN_FIRST, None, (str,)),
+        'status': (GObject.SignalFlags.RUN_FIRST, None, (str, float)),
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.conn = None
+        self.items = []
+        self.busy = self.again = False
+        self.reload_id = 0
+
+    def start(self):
+        Tsparql.SparqlConnection.bus_new_async(LOCALSEARCH, None, None, None, self._connected)
+        Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+                                  LOCALSEARCH, MINER_PATH, MINER_IFACE, None, self._miner_proxy)
+
+    def _connected(self, src, res):
+        try:
+            self.conn = Tsparql.SparqlConnection.bus_new_finish(res)
+        except GLib.Error as e:
+            self.emit('failed', e.message)
+            return
+        self.notifier = self.conn.create_notifier()
+        self.notifier.connect('events', self._events)
+        self.reload()
+        # the media folders are crawled again in case the index missed them
+        # (a stale database that took them for up to date); cheap when it did not
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        for d in MEDIA_ROOTS:
+            if os.path.isdir(d):
+                bus.call(CONTROL, MINER_PATH + '/Index', 'org.freedesktop.Tracker3.Miner.Files.Index',
+                         'IndexLocation', GLib.Variant('(sasas)', (Gio.File.new_for_path(d).get_uri(), [], [])),
+                         None, Gio.DBusCallFlags.NONE, -1, None, None)
+
+    def _miner_proxy(self, src, res):
+        try:
+            self.miner = Gio.DBusProxy.new_for_bus_finish(res)
+        except GLib.Error:
+            return
+        self.miner.connect('g-signal', self._miner_signal)
+        self.miner.call('GetStatus', None, Gio.DBusCallFlags.NONE, -1, None, self._miner_status)
+
+    def _miner_status(self, proxy, res):
+        try:
+            status, = proxy.call_finish(res).unpack()
+        except GLib.Error:
+            return
+        self.emit('status', status, -1.0)
+
+    def _miner_signal(self, proxy, sender, signal, params):
+        if signal == 'Progress':
+            status, progress, _remaining = params.unpack()
+            self.emit('status', status, progress)
+
+    def _events(self, notifier, service, graph, events):
+        # a burst of changes (a crawl, a copy) is read once
+        if self.reload_id:
+            GLib.source_remove(self.reload_id)
+        self.reload_id = GLib.timeout_add(1500, self._reload_timeout)
+
+    def _reload_timeout(self):
+        self.reload_id = 0
+        self.reload()
+        return False
+
+    def reload(self):
+        if self.busy:
+            self.again = True
+            return
+        self.busy = True
+        threading.Thread(target=self._query, daemon=True).start()
+
+    def _query(self):
+        rows = []
+        try:
+            cur = self.conn.query(QUERY, None)
+            while cur.next(None):
+                col = [cur.get_string(i)[0] if cur.is_bound(i) else None for i in range(7)]
+                rows.append(col)
+            cur.close()
+        except GLib.Error as e:
+            GLib.idle_add(self._done, None, e.message)
+            return
+        GLib.idle_add(self._done, self._items(rows), None)
+
+    @staticmethod
+    def _items(rows):
+        items = []
+        seen = set()	# a file whose triples sit in several graphs comes more than once
+        for url, mime, created, modified, w, h, dur in rows:
+            if mime in SKIP_MIME or not url.startswith('file://') or url in seen:
+                continue
+            seen.add(url)
+            path = Gio.File.new_for_uri(url).get_path()
+            if not path:
+                continue
+            items.append(Item(url, path, mime, iso_time(created), iso_time(modified),
+                              int(w) if w else None, int(h) if h else None, float(dur) if dur else None))
+        # RAW + JPEG pairs: one item
+        by_stem = {}
+        for it in items:
+            stem, ext = os.path.splitext(it.path)
+            if ext.lower() in PAIR_EXT:
+                by_stem[stem] = it
+        out = []
+        for it in items:
+            stem, ext = os.path.splitext(it.path)
+            if ext.lower() in RAW_EXT and stem in by_stem:
+                by_stem[stem].raw = it.path
+                continue
+            out.append(it)
+        out.sort(key=lambda it: it.time, reverse=True)
+        return out
+
+    def _done(self, items, error):
+        self.busy = False
+        if error:
+            self.emit('failed', error)
+        else:
+            self.items = items
+            self.emit('loaded')
+        if self.again:
+            self.again = False
+            self.reload()
+        return False
+
+
+def raw_preview_pixbuf(path, min_size):
+    """the largest preview embedded in a RAW file (the smallest >= min_size
+    when one is big enough), rotated as the file says"""
+    md = GExiv2.Metadata()
+    md.open_path(path)
+    props = sorted(md.get_preview_properties() or [], key=lambda p: p.get_width() * p.get_height())
+    if not props:
+        return None
+    big = [p for p in props if max(p.get_width(), p.get_height()) >= min_size]
+    data = md.get_preview_image(big[0] if big else props[-1]).get_data()
+    loader = GdkPixbuf.PixbufLoader()
+    loader.write(data)
+    loader.close()
+    pb = loader.get_pixbuf()
+    o = md.get_orientation()
+    rot = {GExiv2.Orientation.ROT_90: GdkPixbuf.PixbufRotation.CLOCKWISE,
+           GExiv2.Orientation.ROT_180: GdkPixbuf.PixbufRotation.UPSIDEDOWN,
+           GExiv2.Orientation.ROT_270: GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE}.get(o)
+    return pb.rotate_simple(rot) if rot else pb
+
+
+class Thumbnails:
+    """freedesktop thumbnails as textures: cache lookups and RAW previews in
+    worker threads (newest request first), generation through gnome-desktop's
+    factory (the thumbnailer processes) on the main loop"""
+
+    def __init__(self):
+        self.factory = GnomeDesktop.DesktopThumbnailFactory.new(GnomeDesktop.DesktopThumbnailSize.LARGE)
+        self.cache = collections.OrderedDict()
+        self.waiting = {}	# uri -> [callbacks]
+        self.items = {}
+        self.queue = []
+        self.cond = threading.Condition()
+        self.generating = 0
+        self.gen_queue = []
+        for _ in range(THUMB_WORKERS):
+            threading.Thread(target=self._worker, daemon=True).start()
+
+    def get(self, item, cb):
+        """the texture now, or None and cb(texture) later (None: no thumbnail)"""
+        tex = self.cache.get(item.uri)
+        if tex is not None:
+            self.cache.move_to_end(item.uri)
+            return tex
+        new = item.uri not in self.waiting
+        self.waiting.setdefault(item.uri, []).append(cb)
+        if new:
+            self.items[item.uri] = item
+            with self.cond:
+                self.queue.append(item)
+                self.cond.notify()
+        return None
+
+    def cancel(self, item, cb):
+        cbs = self.waiting.get(item.uri)
+        if cbs and cb in cbs:
+            cbs.remove(cb)
+            if not cbs:
+                del self.waiting[item.uri]
+                with self.cond:
+                    if item in self.queue:
+                        self.queue.remove(item)
+
+    @staticmethod
+    def _path(uri, kind='large'):
+        md5 = hashlib.md5(uri.encode()).hexdigest()
+        if kind == 'fail':
+            return os.path.join(THUMB_DIR, 'fail', 'gnome-thumbnail-factory', md5 + '.png')
+        return os.path.join(THUMB_DIR, kind, md5 + '.png')
+
+    def _worker(self):
+        while True:
+            with self.cond:
+                while not self.queue:
+                    self.cond.wait()
+                item = self.queue.pop()	# newest first: what is on screen now
+            GLib.idle_add(self._result, item, *self._lookup(item))
+
+    def _lookup(self, item):
+        try:
+            mtime = int(os.stat(item.path).st_mtime)
+        except OSError:
+            return 'none', None, 0
+        for path in (self._path(item.uri), self._path(item.uri, 'fail')):
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file(path)
+            except GLib.Error:
+                continue
+            if pb.get_option('tEXt::Thumb::MTime') == str(mtime):
+                return ('found', Gdk.Texture.new_for_pixbuf(pb), mtime) if 'fail' not in path else ('none', None, 0)
+        if os.path.splitext(item.path)[1].lower() in RAW_EXT:
+            try:
+                pb = raw_preview_pixbuf(item.path, THUMB_SIZE)
+            except GLib.Error:
+                pb = None
+            if pb:
+                s = THUMB_SIZE / max(pb.get_width(), pb.get_height())
+                if s < 1:
+                    pb = pb.scale_simple(max(1, round(pb.get_width() * s)), max(1, round(pb.get_height() * s)),
+                                         GdkPixbuf.InterpType.BILINEAR)
+                try:
+                    os.makedirs(os.path.dirname(self._path(item.uri)), exist_ok=True)
+                    pb.savev(self._path(item.uri), 'png', ['tEXt::Thumb::URI', 'tEXt::Thumb::MTime'],
+                             [item.uri, str(mtime)])
+                except GLib.Error:
+                    pass
+                return 'found', Gdk.Texture.new_for_pixbuf(pb), mtime
+        return 'generate', None, mtime
+
+    def _result(self, item, state, tex, mtime):
+        if state == 'generate':
+            if self.factory.can_thumbnail(item.uri, item.mime, mtime):
+                self.gen_queue.append((item, mtime))
+                self._next_generation()
+                return False
+            tex = None
+        self._deliver(item, tex)
+        return False
+
+    def _next_generation(self):
+        # two thumbnailer processes at a time; the newest request first
+        while self.generating < 2 and self.gen_queue:
+            item, mtime = self.gen_queue.pop()
+            if item.uri not in self.waiting:
+                continue
+            self.generating += 1
+            self.factory.generate_thumbnail_async(item.uri, item.mime, None, self._generated, (item, mtime))
+
+    def _generated(self, factory, res, data):
+        item, mtime = data
+        self.generating -= 1
+        try:
+            pb = factory.generate_thumbnail_finish(res)
+        except GLib.Error:
+            pb = None
+        if pb:
+            factory.save_thumbnail_async(pb, item.uri, mtime, None, None, None)
+            self._deliver(item, Gdk.Texture.new_for_pixbuf(pb))
+        else:
+            factory.create_failed_thumbnail_async(item.uri, mtime, None, None, None)
+            self._deliver(item, None)
+        self._next_generation()
+
+    def _deliver(self, item, tex):
+        if tex is not None:
+            self.cache[item.uri] = tex
+            while len(self.cache) > THUMB_CACHE:
+                self.cache.popitem(last=False)
+        self.items.pop(item.uri, None)
+        for cb in self.waiting.pop(item.uri, []):
+            cb(tex)
+
+    def forget(self, item):
+        self.cache.pop(item.uri, None)
+
+
+class Thumb(Gtk.Widget):
+    """a square grid cell: the thumbnail cropped to fill it, the length of a
+    video, a RAW / favourite mark"""
+    __gtype_name__ = 'GalleryThumb'
+
+    def __init__(self, gallery, badges=True):
+        super().__init__()
+        self.gallery = gallery
+        self.badges = badges
+        self.item = None
+        self.tex = None
+        self.size = CELL
+        self.set_cursor_from_name('pointer')
+        click = Gtk.GestureClick()
+        click.connect('released', self._clicked)
+        self.add_controller(click)
+
+    def set_item(self, item, size):
+        if self.item is not None and self.tex is None:
+            self.gallery.thumbs.cancel(self.item, self._loaded)
+        self.item = item
+        self.tex = None
+        if size != self.size:
+            self.size = size
+            self.queue_resize()
+        if item is not None:
+            self.tex = self.gallery.thumbs.get(item, self._loaded)
+        self.queue_draw()
+
+    def _loaded(self, tex):
+        self.tex = tex
+        self.queue_draw()
+
+    def _clicked(self, gesture, n, x, y):
+        if self.item is not None and self.on_activate:
+            self.on_activate(self.item)
+
+    on_activate = None
+
+    def do_measure(self, orientation, for_size):
+        return self.size, self.size, -1, -1
+
+    def do_snapshot(self, s):
+        w, h = self.get_width(), self.get_height()
+        rect = Graphene.Rect().init(0, 0, w, h)
+        if self.tex is None:
+            c = Gdk.RGBA()
+            c.parse('rgba(128,128,128,0.15)')
+            s.append_color(c, rect)
+        else:
+            tw, th = self.tex.get_width(), self.tex.get_height()
+            k = max(w / tw, h / th)
+            dw, dh = tw * k, th * k
+            s.push_clip(rect)
+            s.append_scaled_texture(self.tex, Gsk.ScalingFilter.TRILINEAR,
+                                    Graphene.Rect().init((w - dw) / 2, (h - dh) / 2, dw, dh))
+            s.pop()
+        if self.item is None or not self.badges:
+            return
+        marks = []
+        if self.item.video:
+            marks.append('▶ ' + duration_text(self.item.duration) if self.item.duration else '▶')
+        if self.item.raw:
+            marks.append('RAW')
+        if self.item.path in self.gallery.settings.favorites:
+            marks.insert(0, '♥')
+        if marks:
+            self._badge(s, '  '.join(marks), w, h)
+
+    def _badge(self, s, text, w, h):
+        layout = self.create_pango_layout(text)
+        attrs = Pango.AttrList()
+        attrs.insert(Pango.attr_weight_new(Pango.Weight.BOLD))
+        attrs.insert(Pango.attr_scale_new(0.8))
+        layout.set_attributes(attrs)
+        lw, lh = (v / Pango.SCALE for v in layout.get_size())
+        bw, bh = lw + 10, lh + 2
+        x, y = w - bw - 4, h - bh - 4
+        bg = Gdk.RGBA()
+        bg.parse('rgba(0,0,0,0.55)')
+        r = Gsk.RoundedRect()
+        r.init_from_rect(Graphene.Rect().init(x, y, bw, bh), 6)
+        s.push_rounded_clip(r)
+        s.append_color(bg, Graphene.Rect().init(x, y, bw, bh))
+        s.pop()
+        s.save()
+        s.translate(Graphene.Point().init(x + 5, y + 1))
+        white = Gdk.RGBA()
+        white.parse('white')
+        s.append_layout(layout, white)
+        s.restore()
+
+
+class Cover(Thumb):
+    """an album cover: a thumbnail cell as wide as its column, square"""
+    __gtype_name__ = 'GalleryCover'
+
+    def __init__(self, gallery):
+        super().__init__(gallery, badges=False)
+        self.set_overflow(Gtk.Overflow.HIDDEN)
+        self.add_css_class('album-cover')
+
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, orientation, for_size):
+        if orientation == Gtk.Orientation.VERTICAL and for_size > 0:
+            return for_size, for_size, -1, -1
+        return 48, CELL, -1, -1
+
+
+
+class Row(GObject.Object):
+    """a grid line: a day header or up to `columns` items"""
+
+    def __init__(self, header=None, items=()):
+        super().__init__()
+        self.header = header
+        self.items = items
+
+
+class MediaGrid(Gtk.Widget):
+    """a scrolling grid of thumbnails; with headers, one line per day first
+    (the timeline). Lines of cells in a ListView: GridView has no sections."""
+    __gtype_name__ = 'GalleryMediaGrid'
+
+    def __init__(self, gallery, headers):
+        super().__init__()
+        self.gallery = gallery
+        self.headers = headers
+        self.items = []
+        self.width = 0
+        self.columns = 4
+        self.cell = CELL
+        self.store = Gio.ListStore(item_type=Row)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect('setup', self._setup)
+        factory.connect('bind', self._bind)
+        factory.connect('unbind', self._unbind)
+        self.view = Gtk.ListView(model=Gtk.NoSelection(model=self.store), factory=factory)
+        self.view.add_css_class('gallery-grid')
+        self.scroller = Gtk.ScrolledWindow(child=self.view, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.scroller.set_parent(self)
+
+    def do_dispose(self):
+        self.scroller.unparent()
+
+    def do_measure(self, orientation, for_size):
+        return self.scroller.measure(orientation, for_size)
+
+    def do_size_allocate(self, w, h, baseline):
+        self.scroller.allocate(w, h, baseline, None)
+        if w != self.width:
+            self.width = w
+            GLib.idle_add(self._relayout)
+
+    def set_items(self, items):
+        self.items = items
+        self._relayout()
+
+    def _relayout(self):
+        if not self.width:
+            return False
+        self.columns = max(3, (self.width + GAP) // (CELL + GAP))
+        self.cell = (self.width - GAP * (self.columns - 1)) // self.columns
+        rows = []
+        day = None
+        line = []
+        for it in self.items:
+            if self.headers:
+                d = time.localtime(it.time)[:3]
+                if d != day:
+                    if line:
+                        rows.append(Row(items=line))
+                        line = []
+                    rows.append(Row(header=day_title(it.time)))
+                    day = d
+            line.append(it)
+            if len(line) == self.columns:
+                rows.append(Row(items=line))
+                line = []
+        if line:
+            rows.append(Row(items=line))
+        self.store.splice(0, self.store.get_n_items(), rows)
+        return False
+
+    def _setup(self, factory, li):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header = Gtk.Label(xalign=0)
+        header.add_css_class('date-header')
+        cells = Gtk.Box(spacing=GAP, margin_bottom=GAP)
+        box.append(header)
+        box.append(cells)
+        li.set_child(box)
+        li.set_activatable(False)
+        li.set_focusable(False)
+
+    def _bind(self, factory, li):
+        row = li.get_item()
+        box = li.get_child()
+        header, cells = box.get_first_child(), box.get_last_child()
+        header.set_visible(row.header is not None)
+        cells.set_visible(row.header is None)
+        if row.header is not None:
+            header.set_label(row.header)
+            return
+        thumbs = []
+        c = cells.get_first_child()
+        while c:
+            thumbs.append(c)
+            c = c.get_next_sibling()
+        while len(thumbs) < len(row.items):
+            t = Thumb(self.gallery)
+            t.on_activate = self._activate
+            cells.append(t)
+            thumbs.append(t)
+        for t in thumbs[len(row.items):]:
+            t.set_item(None, self.cell)
+            cells.remove(t)
+        for t, it in zip(thumbs, row.items):
+            t.set_item(it, self.cell)
+
+    def _unbind(self, factory, li):
+        cells = li.get_child().get_last_child()
+        c = cells.get_first_child()
+        while c:
+            c.set_item(None, self.cell)
+            c = c.get_next_sibling()
+
+    def _activate(self, item):
+        self.gallery.open_viewer(self.items, self.items.index(item))
+
+
+class ImageView(Gtk.Widget):
+    """an image fitted to the page, zoomed by pinching or double tapping and
+    panned by the pager's drag while zoomed"""
+    __gtype_name__ = 'GalleryImageView'
+    __gsignals__ = {'tap': (GObject.SignalFlags.RUN_FIRST, None, ())}
+    MAX_ZOOM = 8.0
+
+    def __init__(self):
+        super().__init__()
+        self.tex = None
+        self.zoom = 1.0
+        self.pan = [0.0, 0.0]
+        self.tap_id = 0
+        self.anim = None
+        pinch = Gtk.GestureZoom()
+        pinch.connect('begin', self._pinch_begin)
+        pinch.connect('scale-changed', self._pinch)
+        pinch.connect('end', self._pinch_end)
+        self.add_controller(pinch)
+        click = Gtk.GestureClick()
+        click.connect('pressed', self._pressed)
+        click.connect('released', self._released)
+        self.add_controller(click)
+
+    @property
+    def zoomed(self):
+        return self.zoom > 1.01
+
+    def set_texture(self, tex):
+        self.tex = tex
+        self.queue_draw()
+
+    def _fit(self):
+        if not self.tex:
+            return 1.0
+        return min(self.get_width() / self.tex.get_width(), self.get_height() / self.tex.get_height())
+
+    def _clamp(self):
+        if not self.tex:
+            return
+        s = self._fit() * self.zoom
+        for i, (view, size) in enumerate(((self.get_width(), self.tex.get_width()),
+                                          (self.get_height(), self.tex.get_height()))):
+            room = max(0.0, (size * s - view) / 2)
+            self.pan[i] = min(room, max(-room, self.pan[i]))
+
+    def zoom_at(self, zoom, x, y):
+        """zoom keeping the image point under (x, y) where it is"""
+        zoom = min(self.MAX_ZOOM, max(1.0, zoom))
+        k = zoom / self.zoom
+        cx, cy = self.get_width() / 2 + self.pan[0], self.get_height() / 2 + self.pan[1]
+        cx, cy = x - (x - cx) * k, y - (y - cy) * k
+        self.zoom = zoom
+        self.pan = [cx - self.get_width() / 2, cy - self.get_height() / 2]
+        self._clamp()
+        self.queue_draw()
+
+    def pan_begin(self):
+        self.pan_start = list(self.pan)
+
+    def pan_by(self, dx, dy):
+        self.pan = [self.pan_start[0] + dx, self.pan_start[1] + dy]
+        self._clamp()
+        self.queue_draw()
+
+    def reset(self):
+        self.zoom = 1.0
+        self.pan = [0.0, 0.0]
+        self.queue_draw()
+
+    def _pinch_begin(self, g, seq):
+        g.set_state(Gtk.EventSequenceState.CLAIMED)	# no page swipe while pinching
+        self.pinch_zoom = self.zoom
+
+    def _pinch(self, g, scale):
+        ok, x, y = g.get_bounding_box_center()
+        if ok:
+            self.zoom_at(self.pinch_zoom * scale, x, y)
+
+    def _pinch_end(self, g, seq):
+        if self.zoom < 1.05:
+            self.reset()
+
+    def _pressed(self, g, n, x, y):
+        if n == 2:
+            if self.tap_id:
+                GLib.source_remove(self.tap_id)
+                self.tap_id = 0
+            self._animate_zoom(1.0 if self.zoomed else 2.5, x, y)
+
+    def _released(self, g, n, x, y):
+        if n == 1 and not self.tap_id:
+            self.tap_id = GLib.timeout_add(250, self._tap)
+
+    def _tap(self):
+        self.tap_id = 0
+        self.emit('tap')
+        return False
+
+    def _animate_zoom(self, target, x, y):
+        start = self.zoom
+        if target == 1.0:
+            x, y = self.get_width() / 2 + self.pan[0], self.get_height() / 2 + self.pan[1]
+        self.anim = Adw.TimedAnimation.new(self, 0.0, 1.0, 200, Adw.CallbackAnimationTarget.new(
+            lambda v: self.zoom_at(start + (target - start) * v, x, y)))
+        self.anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+        self.anim.play()
+
+    def do_measure(self, orientation, for_size):
+        return 0, 0, -1, -1
+
+    def do_size_allocate(self, w, h, baseline):
+        self._clamp()
+
+    def do_snapshot(self, s):
+        if not self.tex:
+            return
+        w, h = self.get_width(), self.get_height()
+        k = self._fit() * self.zoom
+        dw, dh = self.tex.get_width() * k, self.tex.get_height() * k
+        x, y = (w - dw) / 2 + self.pan[0], (h - dh) / 2 + self.pan[1]
+        s.append_scaled_texture(self.tex, Gsk.ScalingFilter.TRILINEAR, Graphene.Rect().init(x, y, dw, dh))
+
+
+class VideoPlayer(Gtk.Widget):
+    """a video with its own playbin: decoded in hardware (VA, else V4L2),
+    then converted in system memory for gtk4paintablesink. GTK's own video
+    widget takes the decoders' dmabufs as they are, and those import into
+    GL green / black on the G77 (MediaTek-tiled and VA NV12 alike)."""
+    __gtype_name__ = 'GalleryVideoPlayer'
+    __gsignals__ = {'tap': (GObject.SignalFlags.RUN_FIRST, None, ())}
+
+    def __init__(self, path):
+        super().__init__()
+        self.set_layout_manager(Gtk.BinLayout())
+        sinkbin = Gst.parse_bin_from_description(
+            'videoflip video-direction=auto ! videoconvert ! video/x-raw,format=RGBx ! gtk4paintablesink name=sink',
+            True)
+        self.picture = Gtk.Picture(paintable=sinkbin.get_by_name('sink').get_property('paintable'),
+                                   can_shrink=True)
+        self.play = Gst.ElementFactory.make('playbin3')
+        self.play.set_property('uri', Gio.File.new_for_path(path).get_uri())
+        self.play.set_property('video-sink', sinkbin)
+        bus = self.play.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message', self._message)
+        self.play.set_state(Gst.State.PAUSED)	# the first frame
+        self.playing = False
+        self.duration = 0
+        self.tick_id = 0
+
+        overlay = Gtk.Overlay(child=self.picture)
+        self.button = Gtk.Button(icon_name='media-playback-start-symbolic', halign=Gtk.Align.CENTER,
+                                 valign=Gtk.Align.CENTER, width_request=64, height_request=64)
+        for c in ('osd', 'circular'):
+            self.button.add_css_class(c)
+        self.button.connect('clicked', lambda b: self.toggle())
+        overlay.add_overlay(self.button)
+        self.scale = Gtk.Scale(hexpand=True, draw_value=False)
+        self.scale.set_range(0, 1)
+        self.scale.connect('change-value', self._seek)
+        self.time = Gtk.Label(label='0:00')
+        self.time.add_css_class('numeric')
+        self.controls = Gtk.Box(spacing=8, valign=Gtk.Align.END, margin_start=12, margin_end=12,
+                                margin_bottom=72)
+        self.controls.add_css_class('video-controls')
+        self.controls.append(self.scale)
+        self.controls.append(self.time)
+        overlay.add_overlay(self.controls)
+        overlay.set_parent(self)
+        click = Gtk.GestureClick()
+        click.connect('released', lambda *a: self.emit('tap'))
+        self.picture.add_controller(click)
+
+    def toggle(self):
+        self.set_playing(not self.playing)
+
+    def set_playing(self, on):
+        self.playing = on
+        self.play.set_state(Gst.State.PLAYING if on else Gst.State.PAUSED)
+        self.button.set_icon_name('media-playback-pause-symbolic' if on else 'media-playback-start-symbolic')
+        self.button.set_opacity(0.0 if on else 1.0)	# out of the way while it plays; a tap still pauses
+        if on and not self.tick_id:
+            self.tick_id = GLib.timeout_add(250, self._tick)
+
+    def set_chrome(self, show):
+        self.controls.set_visible(show)
+
+    def _tick(self):
+        ok, pos = self.play.query_position(Gst.Format.TIME)
+        if not self.duration:
+            ok2, dur = self.play.query_duration(Gst.Format.TIME)
+            self.duration = dur if ok2 and dur > 0 else 0
+        if ok and self.duration:
+            self.scale.set_range(0, self.duration / Gst.SECOND)
+            self.scale.set_value(pos / Gst.SECOND)
+            self.time.set_label(f'{duration_text(pos / Gst.SECOND)} / {duration_text(self.duration / Gst.SECOND)}')
+        if not self.playing:
+            self.tick_id = 0
+            return False
+        return True
+
+    def _seek(self, scale, scroll, value):
+        self.play.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                              int(max(0, value) * Gst.SECOND))
+        return False
+
+    def _message(self, bus, msg):
+        if msg.type == Gst.MessageType.EOS:
+            self.set_playing(False)
+            self.play.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, 0)
+            self._tick()
+        elif msg.type == Gst.MessageType.ASYNC_DONE:
+            self._tick()
+        elif msg.type == Gst.MessageType.ERROR:
+            err, _dbg = msg.parse_error()
+            self.time.set_label(err.message)
+
+    def stop(self):
+        if self.tick_id:
+            GLib.source_remove(self.tick_id)
+            self.tick_id = 0
+        self.play.set_state(Gst.State.NULL)
+        self.play.get_bus().remove_signal_watch()
+
+    def do_dispose(self):
+        self.stop()
+        child = self.get_first_child()
+        if child:
+            child.unparent()
+
+
+class MediaPage(Gtk.Widget):
+    """one item in the viewer: the image (thumbnail first, then the full
+    picture through glycin) or a video player"""
+    __gtype_name__ = 'GalleryMediaPage'
+    __gsignals__ = {'tap': (GObject.SignalFlags.RUN_FIRST, None, ())}
+
+    def __init__(self, gallery, item):
+        super().__init__()
+        self.set_layout_manager(Gtk.BinLayout())
+        self.item = item
+        self.cancel = Gio.Cancellable()
+        if item.video:
+            self.image = None
+            self.video = VideoPlayer(item.path)
+            self.video.connect('tap', lambda *a: self.emit('tap'))
+            self.video.set_parent(self)
+            return
+        self.video = None
+        self.image = ImageView()
+        self.image.connect('tap', lambda *a: self.emit('tap'))
+        self.image.set_parent(self)
+        tex = gallery.thumbs.cache.get(item.uri)
+        if tex:
+            self.image.set_texture(tex)
+        loader = Gly.Loader.new(Gio.File.new_for_path(item.path))
+        loader.load_async(self.cancel, self._loaded)
+
+    @property
+    def zoomed(self):
+        return self.image is not None and self.image.zoomed
+
+    def _loaded(self, loader, res):
+        try:
+            image = loader.load_finish(res)
+            image.next_frame_async(self.cancel, self._frame)
+        except GLib.Error as e:
+            if not e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                self._fallback()
+
+    def _frame(self, image, res):
+        try:
+            frame = image.next_frame_finish(res)
+        except GLib.Error as e:
+            if not e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                self._fallback()
+            return
+        self.image.set_texture(GlyGtk4.frame_get_texture(frame))
+
+    def _fallback(self):
+        # a format glycin does not read (DNG): the embedded preview
+        path = self.item.path
+
+        def work():
+            try:
+                pb = raw_preview_pixbuf(path, 0)
+            except GLib.Error:
+                pb = None
+            if pb:
+                tex = Gdk.Texture.new_for_pixbuf(pb)
+                GLib.idle_add(lambda: self.cancel.is_cancelled() or self.image.set_texture(tex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def leave(self):
+        """not the current page any more"""
+        if self.image:
+            self.image.reset()
+        if self.video:
+            self.video.set_playing(False)
+
+    def set_chrome(self, show):
+        if self.video:
+            self.video.set_chrome(show)
+
+    def do_dispose(self):
+        self.cancel.cancel()
+        child = self.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            child.unparent()
+            child = nxt
+
+
+class Pager(Gtk.Widget):
+    """the viewer's pages side by side: the current one and its neighbours,
+    swiped with a drag (or panning the current image while it is zoomed)"""
+    __gtype_name__ = 'GalleryPager'
+    __gsignals__ = {'changed': (GObject.SignalFlags.RUN_FIRST, None, ())}
+    SPACING = 16
+
+    def __init__(self, make_page):
+        super().__init__()
+        self.set_overflow(Gtk.Overflow.HIDDEN)
+        self.make_page = make_page
+        self.items = []
+        self.index = 0
+        self.pages = {}
+        self.offset = 0.0
+        self.anim = None
+        self.panning = False
+        drag = Gtk.GestureDrag()
+        drag.connect('drag-begin', self._begin)
+        drag.connect('drag-update', self._update)
+        drag.connect('drag-end', self._end)
+        drag.connect('cancel', lambda g, seq: self._settle(0))
+        self.add_controller(drag)
+
+    @property
+    def current(self):
+        return self.pages.get(self.index)
+
+    def set_items(self, items, index):
+        for p in self.pages.values():
+            p.unparent()
+        self.pages = {}
+        self.items = items
+        self.index = index
+        self.offset = 0.0
+        self._fill()
+        self.emit('changed')
+
+    def _fill(self):
+        want = {i for i in (self.index - 1, self.index, self.index + 1) if 0 <= i < len(self.items)}
+        for i in list(self.pages):
+            if i not in want:
+                self.pages.pop(i).unparent()
+        for i in sorted(want):
+            if i not in self.pages:
+                page = self.make_page(self.items[i])
+                page.set_parent(self)
+                self.pages[i] = page
+        self.queue_allocate()
+
+    def go(self, step):
+        if 0 <= self.index + step < len(self.items):
+            self._settle(-step * (self.get_width() + self.SPACING), step)
+
+    def _begin(self, g, x, y):
+        if self.anim:
+            self.anim.skip()
+        page = self.current
+        self.panning = page is not None and page.zoomed
+        if self.panning:
+            page.image.pan_begin()
+        self.start = self.offset
+        self.track = [(time.monotonic(), 0.0)]
+
+    def _update(self, g, dx, dy):
+        if self.panning:
+            self.current.image.pan_by(dx, dy)
+            return
+        if abs(dx) > 8 or abs(self.offset) > 0:
+            g.set_state(Gtk.EventSequenceState.CLAIMED)
+        off = self.start + dx
+        if (off > 0 and self.index == 0) or (off < 0 and self.index == len(self.items) - 1):
+            off /= 3	# nothing that way: resist
+        self.offset = off
+        self.track = (self.track + [(time.monotonic(), dx)])[-6:]
+        self.queue_allocate()
+
+    def _end(self, g, dx, dy):
+        if self.panning:
+            self.panning = False
+            return
+        (t0, x0), (t1, x1) = self.track[0], self.track[-1]
+        v = (x1 - x0) / (t1 - t0) if t1 > t0 else 0.0
+        w = self.get_width() + self.SPACING
+        step = 0
+        if (self.offset < -w / 4 or v < -400) and self.index + 1 < len(self.items):
+            step = 1
+        elif (self.offset > w / 4 or v > 400) and self.index > 0:
+            step = -1
+        self._settle(-step * w, step)
+
+    def _settle(self, target, step=0):
+        start = self.offset
+
+        def move(v):
+            self.offset = start + (target - start) * v
+            self.queue_allocate()
+
+        self.anim = Adw.TimedAnimation.new(self, 0.0, 1.0, 220, Adw.CallbackAnimationTarget.new(move))
+        self.anim.set_easing(Adw.Easing.EASE_OUT_CUBIC)
+        self.anim.connect('done', lambda a: self._settled(step))
+        self.anim.play()
+
+    def _settled(self, step):
+        self.anim = None
+        if step:
+            old = self.current
+            self.index += step
+            self.offset = 0.0
+            if old:
+                old.leave()
+            self._fill()
+            self.emit('changed')
+
+    def do_measure(self, orientation, for_size):
+        return 0, 0, -1, -1
+
+    def do_size_allocate(self, w, h, baseline):
+        for i, page in self.pages.items():
+            x = (i - self.index) * (w + self.SPACING) + self.offset
+            page.allocate(w, h, baseline, Gsk.Transform.new().translate(Graphene.Point().init(x, 0)))
+
+    def do_dispose(self):
+        for p in self.pages.values():
+            p.unparent()
+        self.pages = {}
+
+
+class Viewer(Adw.NavigationPage):
+    """full-screen photos and videos: tap for the bars, swipe for the next"""
+
+    def __init__(self, gallery, items, index):
+        super().__init__(title='Photo', can_pop=False)	# swipes are for the photos
+        self.gallery = gallery
+        self.add_css_class('viewer')
+        self.pager = Pager(self._page)
+        self.pager.connect('changed', self._changed)
+
+        self.header = Adw.HeaderBar(show_title=True)
+        back = Gtk.Button(icon_name='go-previous-symbolic', tooltip_text='Back')
+        back.connect('clicked', lambda b: gallery.nav.pop())
+        self.header.pack_start(back)
+        self.title = Adw.WindowTitle()
+        self.header.set_title_widget(self.title)
+        menu = Gio.Menu()
+        if gallery.can_upscale or gallery.can_upscale_video:
+            menu.append('Upscale 2× (AI)', 'viewer.upscale')
+        menu.append('Set as Wallpaper', 'viewer.wallpaper')
+        menu.append('Show in Folder', 'viewer.folder')
+        self.header.pack_end(Gtk.MenuButton(icon_name='view-more-symbolic', menu_model=menu,
+                                            tooltip_text='More'))
+
+        bar = Gtk.CenterBox()
+        bar.add_css_class('bottom-bar')
+        buttons = Gtk.Box(spacing=24, homogeneous=True)
+        self.fav = Gtk.Button(icon_name='emblem-favorite-symbolic', tooltip_text='Favourite')
+        self.fav.connect('clicked', lambda b: self._favorite())
+        for icon, tip, cb in (('send-to-symbolic', 'Open With…', self._open_with),
+                              ('help-about-symbolic', 'Details', self._details),
+                              ('user-trash-symbolic', 'Move to Trash', self._delete)):
+            b = Gtk.Button(icon_name=icon, tooltip_text=tip)
+            b.connect('clicked', lambda b, cb=cb: cb())
+            buttons.append(b)
+        buttons.prepend(self.fav)
+        for b in buttons:
+            b.add_css_class('flat')
+        bar.set_center_widget(buttons)
+
+        self.toolbar = Adw.ToolbarView(content=self.pager, extend_content_to_top_edge=True,
+                                       extend_content_to_bottom_edge=True)
+        self.toolbar.add_top_bar(self.header)
+        self.toolbar.add_bottom_bar(bar)
+        self.set_child(self.toolbar)
+
+        actions = Gio.SimpleActionGroup()
+        for name, cb in (('wallpaper', self._wallpaper), ('folder', self._folder),
+                         ('upscale', lambda: gallery.upscale(self.item))):
+            a = Gio.SimpleAction(name=name)
+            a.connect('activate', lambda a, p, cb=cb: cb())
+            actions.add_action(a)
+        self.upscale_action = actions.lookup_action('upscale')
+        self.insert_action_group('viewer', actions)
+        # the menu entry follows a running upscale while the viewer shows
+        self.up_handler = 0
+        self.connect('showing', self._showing)
+        self.connect('hidden', self._hidden)
+        keys = Gtk.EventControllerKey()
+        keys.connect('key-pressed', self._key)
+        self.add_controller(keys)
+        self.pager.set_items(items, index)
+
+    def _showing(self, page):
+        if not self.up_handler:
+            self.up_handler = self.gallery.connect('notify::upscaling',
+                                                   lambda g, p: self._changed(self.pager))
+        self._changed(self.pager)
+
+    def _hidden(self, page):
+        if self.up_handler:
+            self.gallery.disconnect(self.up_handler)
+            self.up_handler = 0
+
+    def _page(self, item):
+        page = MediaPage(self.gallery, item)
+        page.connect('tap', lambda p: self._toggle_bars())
+        page.set_chrome(self.toolbar.get_reveal_top_bars() if hasattr(self, 'toolbar') else True)
+        return page
+
+    @property
+    def item(self):
+        return self.pager.items[self.pager.index] if self.pager.items else None
+
+    def _changed(self, pager):
+        it = self.item
+        if not it:
+            return
+        d = GLib.DateTime.new_from_unix_local(int(it.time))
+        self.title.set_title(d.format('%-d %B %Y'))
+        self.title.set_subtitle(d.format('%H:%M'))
+        fav = it.path in self.gallery.settings.favorites
+        self.fav.set_icon_name('starred-symbolic' if fav else 'non-starred-symbolic')
+        self.upscale_action.set_enabled(not self.gallery.upscaling and can_upscale(self.gallery, it))
+
+    def _toggle_bars(self):
+        show = not self.toolbar.get_reveal_top_bars()
+        self.toolbar.set_reveal_top_bars(show)
+        self.toolbar.set_reveal_bottom_bars(show)
+        for page in self.pager.pages.values():
+            page.set_chrome(show)
+
+    def _key(self, ctl, keyval, code, state):
+        if keyval in (Gdk.KEY_Right, Gdk.KEY_Page_Down):
+            self.pager.go(1)
+        elif keyval in (Gdk.KEY_Left, Gdk.KEY_Page_Up):
+            self.pager.go(-1)
+        elif keyval == Gdk.KEY_Escape:
+            self.gallery.nav.pop()
+        else:
+            return False
+        return True
+
+    def _favorite(self):
+        it = self.item
+        favs = self.gallery.settings.favorites
+        favs.symmetric_difference_update({it.path})
+        self.gallery.settings.save()
+        self._changed(self.pager)
+        self.gallery.refresh_views()
+
+    def _open_with(self):
+        Gtk.FileLauncher(file=Gio.File.new_for_path(self.item.path), always_ask=True).launch(
+            self.gallery, None, None)
+
+    def _folder(self):
+        Gtk.FileLauncher(file=Gio.File.new_for_path(self.item.path)).open_containing_folder(
+            self.gallery, None, None)
+
+    def _wallpaper(self):
+        uri = self.item.uri
+        bg = Gio.Settings(schema_id='org.gnome.desktop.background')
+        bg.set_string('picture-uri', uri)
+        bg.set_string('picture-uri-dark', uri)
+        self.gallery.toast('Wallpaper set')
+
+    def _details(self):
+        DetailsDialog(self.gallery, self.item).present(self.gallery)
+
+    def _delete(self):
+        it = self.item
+        self.gallery.delete([it])
+        items = [x for x in self.pager.items if x is not it]
+        if not items:
+            self.gallery.nav.pop()
+            return
+        self.pager.set_items(items, min(self.pager.index, len(items) - 1))
+
+
+class DetailsDialog(Adw.Dialog):
+    """date, file, size, resolution, camera settings"""
+
+    def __init__(self, gallery, item):
+        super().__init__(title='Details', content_width=420)
+        page = Adw.PreferencesPage()
+        rows = []
+        d = GLib.DateTime.new_from_unix_local(int(item.time))
+        rows.append(('Taken' if item.time != item.mtime else 'Modified', d.format('%A, %-d %B %Y, %H:%M')))
+        rows.append(('File', item.name))
+        rows.append(('Folder', item.folder.replace(HOME, '~', 1)))
+        try:
+            size = os.stat(item.path).st_size
+            if item.raw:
+                rows.append(('Size', f'{human_size(size)} + RAW {human_size(os.stat(item.raw).st_size)}'))
+            else:
+                rows.append(('Size', human_size(size)))
+        except OSError:
+            pass
+        if item.width and item.height:
+            mp = item.width * item.height / 1e6
+            rows.append(('Resolution', f'{item.width} × {item.height}' + (f' ({mp:.1f} MP)' if mp >= 1 else '')))
+        if item.video and item.duration:
+            rows.append(('Length', duration_text(item.duration)))
+        if not item.video:
+            rows += self._exif(item.path)
+        if item.raw:
+            rows.append(('RAW', os.path.basename(item.raw)))
+        group = Adw.PreferencesGroup()
+        for title, value in rows:
+            row = Adw.ActionRow(title=title, subtitle=value, subtitle_selectable=True, use_markup=False)
+            row.add_css_class('property')
+            group.add(row)
+        page.add(group)
+        view = Adw.ToolbarView(content=page)
+        view.add_top_bar(Adw.HeaderBar())
+        self.set_child(view)
+
+    @staticmethod
+    def _exif(path):
+        md = GExiv2.Metadata()
+        try:
+            md.open_path(path)
+        except GLib.Error:
+            return []
+
+        def tag(name):
+            try:
+                return md.try_get_tag_interpreted_string(name) if md.try_has_tag(name) else None
+            except GLib.Error:
+                return None
+
+        out = []
+        model = tag('Exif.Image.Model') or ''
+        name = CAMERAS.get(model.rsplit('/', 1)[-1])
+        model = name or ' '.join(v for v in (tag('Exif.Image.Make'), model) if v)
+        if model:
+            out.append(('Camera', model))
+        shot = [v for v in (tag('Exif.Photo.ExposureTime'), tag('Exif.Photo.FNumber'),
+                            tag('Exif.Photo.FocalLength')) if v]
+        iso = tag('Exif.Photo.ISOSpeedRatings')
+        if iso:
+            shot.append('ISO ' + iso)
+        if shot:
+            out.append(('Exposure', '  ·  '.join(shot)))
+        return out
+
+
+class Album(GObject.Object):
+    def __init__(self, key, name, items, kind='folder', folders=()):
+        super().__init__()
+        self.key, self.name, self.items, self.kind = key, name, items, kind
+        self.folders = folders
+
+
+class AlbumsView(Gtk.ScrolledWindow):
+    """album covers in a grid: favourites, the media folders, other folders"""
+
+    def __init__(self, gallery):
+        super().__init__(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.gallery = gallery
+        self.store = Gio.ListStore(item_type=Album)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect('setup', self._setup)
+        factory.connect('bind', self._bind)
+        factory.connect('unbind', self._unbind)
+        grid = Gtk.GridView(model=Gtk.NoSelection(model=self.store), factory=factory, min_columns=2,
+                            max_columns=3, single_click_activate=True)
+        grid.add_css_class('gallery-grid')
+        grid.connect('activate', lambda g, pos: gallery.open_album(self.store.get_item(pos)))
+        self.set_child(grid)
+
+    def set_albums(self, albums):
+        self.store.splice(0, self.store.get_n_items(), albums)
+
+    def _setup(self, factory, li):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_start=6, margin_end=6,
+                      margin_top=6, margin_bottom=10)
+        cover = Cover(self.gallery)
+        name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        name.add_css_class('heading')
+        count = Gtk.Label(xalign=0)
+        count.add_css_class('dim-label')
+        count.add_css_class('caption')
+        for w in (cover, name, count):
+            box.append(w)
+        li.set_child(box)
+
+    def _bind(self, factory, li):
+        album = li.get_item()
+        box = li.get_child()
+        cover = box.get_first_child()
+        name = cover.get_next_sibling()
+        count = name.get_next_sibling()
+        name.set_label(album.name)
+        if album.kind == 'others':
+            count.set_label(f'{len(album.folders)} folders')
+        else:
+            n = len(album.items)
+            count.set_label(f'{n} item' if n == 1 else f'{n} items')
+        cover.set_item(cover_item(album.items), CELL)
+
+    def _unbind(self, factory, li):
+        li.get_child().get_first_child().set_item(None, CELL)
+
+
+class FolderList(Adw.NavigationPage):
+    """the folders outside the media folders that hold pictures or videos"""
+
+    def __init__(self, gallery, albums):
+        super().__init__(title='Other folders')
+        self.gallery = gallery
+        self.store = Gio.ListStore(item_type=Album)
+        self.store.splice(0, 0, albums)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect('setup', self._setup)
+        factory.connect('bind', self._bind)
+        factory.connect('unbind', self._unbind)
+        view = Gtk.ListView(model=Gtk.NoSelection(model=self.store), factory=factory, single_click_activate=True)
+        view.add_css_class('navigation-sidebar')
+        view.connect('activate', lambda v, pos: gallery.open_album(self.store.get_item(pos)))
+        tv = Adw.ToolbarView(content=Gtk.ScrolledWindow(child=view, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        tv.add_top_bar(Adw.HeaderBar())
+        self.set_child(tv)
+
+    def _setup(self, factory, li):
+        box = Gtk.Box(spacing=12, margin_top=4, margin_bottom=4)
+        pic = Thumb(self.gallery, badges=False)
+        pic.set_overflow(Gtk.Overflow.HIDDEN)
+        pic.add_css_class('folder-thumb')
+        pic.set_valign(Gtk.Align.CENTER)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        name.add_css_class('heading')
+        path = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.START)
+        path.add_css_class('dim-label')
+        path.add_css_class('caption')
+        text.append(name)
+        text.append(path)
+        box.append(pic)
+        box.append(text)
+        li.set_child(box)
+
+    def _bind(self, factory, li):
+        album = li.get_item()
+        pic = li.get_child().get_first_child()
+        name, path = pic.get_next_sibling().get_first_child(), pic.get_next_sibling().get_last_child()
+        n = len(album.items)
+        name.set_label(f'{album.name}  ·  {n}')
+        path.set_label(album.key.replace(HOME, '~', 1))
+        pic.set_item(cover_item(album.items), 56)
+
+    def _unbind(self, factory, li):
+        li.get_child().get_first_child().set_item(None, 56)
+
+
+class AlbumPage(Adw.NavigationPage):
+    def __init__(self, gallery, album):
+        super().__init__(title=album.name, tag='album')
+        self.gallery = gallery
+        self.album = album
+        self.grid = MediaGrid(gallery, headers=False)
+        self.grid.set_items(album.items)
+        header = Adw.HeaderBar()
+        self.title = Adw.WindowTitle(title=album.name)
+        header.set_title_widget(self.title)
+        if album.kind == 'folder':
+            menu = Gio.Menu()
+            media = any(under(album.key, r) for r in MEDIA_ROOTS)
+            if not media:
+                menu.append('Show in Photos', 'album.shown')
+            menu.append('Open Folder', 'album.open')
+            menu.append('Hide Folder', 'album.hide')
+            header.pack_end(Gtk.MenuButton(icon_name='view-more-symbolic', menu_model=menu,
+                                           tooltip_text='More'))
+            actions = Gio.SimpleActionGroup()
+            shown = Gio.SimpleAction.new_stateful('shown', None,
+                                                  GLib.Variant('b', album.key in gallery.settings.shown))
+            shown.connect('activate', self._shown)
+            actions.add_action(shown)
+            for name, cb in (('open', self._open), ('hide', self._hide)):
+                a = Gio.SimpleAction(name=name)
+                a.connect('activate', lambda a, p, cb=cb: cb())
+                actions.add_action(a)
+            self.insert_action_group('album', actions)
+        self._subtitle()
+        tv = Adw.ToolbarView(content=self.grid)
+        tv.add_top_bar(header)
+        self.set_child(tv)
+
+    def _subtitle(self):
+        n = len(self.album.items)
+        self.title.set_subtitle(f'{n} item' if n == 1 else f'{n} items')
+
+    def update(self, album):
+        self.album = album
+        self.grid.set_items(album.items)
+        self._subtitle()
+
+    def _shown(self, action, param):
+        on = not action.get_state().get_boolean()
+        action.set_state(GLib.Variant('b', on))
+        (self.gallery.settings.shown.add if on else self.gallery.settings.shown.discard)(self.album.key)
+        self.gallery.settings.save()
+        self.gallery.refresh_views()
+
+    def _open(self):
+        Gtk.FileLauncher(file=Gio.File.new_for_path(self.album.key)).launch(self.gallery, None, None)
+
+    def _hide(self):
+        dialog = Adw.AlertDialog(
+            heading='Hide this folder?',
+            body=f'“{self.album.name}” will no longer show in the gallery. A .nomedia file in the folder '
+                 'tells the file indexer to skip it; delete that file to show the folder again.')
+        dialog.add_response('cancel', 'Cancel')
+        dialog.add_response('hide', 'Hide')
+        dialog.set_response_appearance('hide', Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect('response', lambda d, r: r == 'hide' and self.gallery.hide_folder(self.album))
+        dialog.present(self.gallery)
+
+
+class Gallery(Adw.ApplicationWindow):
+    upscaling = GObject.Property(type=bool, default=False)
+
+    def __init__(self, app):
+        super().__init__(application=app, title='Gallery', default_width=540, default_height=1100)
+        self.can_upscale = upscaler_available()
+        self.can_upscale_video = video_upscaler_available()
+        self.up_toast = None
+        self.settings = Settings()
+        self.thumbs = Thumbnails()
+        self.index = Index()
+        self.pending = []	# moved to the trash when their toast goes away
+        self.removed = set()
+        self.albums = {}
+        self.others = []
+
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+        self.nav = Adw.NavigationView()
+        self.toasts.set_child(self.nav)
+
+        self.stack = Adw.ViewStack()
+        self.photos = MediaGrid(self, headers=True)
+        self.albums_view = AlbumsView(self)
+        self.photos_stack = Gtk.Stack()
+        self.status = Adw.StatusPage(icon_name='image-x-generic-symbolic', title='Looking for photos')
+        self.status.set_child(Adw.Spinner(width_request=32, height_request=32))
+        self.photos_stack.add_named(self.status, 'status')
+        self.photos_stack.add_named(self.photos, 'grid')
+        self.stack.add_titled_with_icon(self.photos_stack, 'photos', 'Photos', 'image-x-generic-symbolic')
+        self.stack.add_titled_with_icon(self.albums_view, 'albums', 'Albums', 'folder-pictures-symbolic')
+
+        header = Adw.HeaderBar()
+        self.title = Adw.WindowTitle(title='Photos')
+        header.set_title_widget(self.title)
+        self.stack.connect('notify::visible-child-name', lambda s, p: self.title.set_title(
+            s.get_page(s.get_visible_child()).get_title()))
+        menu = Gio.Menu()
+        menu.append('About Gallery', 'app.about')
+        header.pack_end(Gtk.MenuButton(icon_name='open-menu-symbolic', menu_model=menu,
+                                       tooltip_text='Main Menu', primary=True))
+        self.banner = Adw.Banner()
+        view = Adw.ToolbarView(content=self.stack)
+        view.add_top_bar(header)
+        view.add_top_bar(self.banner)
+        view.add_bottom_bar(Adw.ViewSwitcherBar(stack=self.stack, reveal=True))
+        self.nav.add(Adw.NavigationPage(child=view, title='Gallery', tag='main'))
+
+        self.index.connect('loaded', lambda i: self.refresh_views())
+        self.index.connect('failed', self._failed)
+        self.index.connect('status', self._miner_status)
+        self.connect('close-request', self._closing)
+        self.index.start()
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text))
+
+    # -- AI upscaling: a copy next to the photo, in the background -------
+    def upscale(self, item):
+        if self.upscaling or item is None:
+            return
+        stem, ext = os.path.splitext(item.path)
+        mp = item.width * item.height / 1e6
+        if item.video:
+            out = f'{stem} (upscaled 2x).mp4'
+            cmd = ['cezanne-video-upscale', '--scale', '2', item.path, out]
+            seconds = (item.duration or 0) * 30 * mp * VIDEO_SECONDS_PER_MP_FRAME
+        else:
+            out = f'{stem} (upscaled 2x){ext}'
+            cmd = ['cezanne-photo', '--upscale', '2', item.path, out]
+            seconds = mp * UPSCALE_SECONDS_PER_MP
+        try:
+            proc = Gio.Subprocess.new(cmd, Gio.SubprocessFlags.STDERR_PIPE)
+        except GLib.Error as e:
+            self.toast(f'Cannot upscale: {e.message}')
+            return
+        minutes = max(1, round(seconds / 60))
+        self.up_toast = Adw.Toast(title=f'Upscaling, about {minutes} min…', timeout=0)
+        self.toasts.add_toast(self.up_toast)
+        self.upscaling = True
+        err = Gio.DataInputStream.new(proc.get_stderr_pipe())
+        err.read_line_async(GLib.PRIORITY_DEFAULT, None, self._upscale_line, [])
+        proc.wait_async(None, self._upscaled, (out, minutes))
+
+    def _upscale_line(self, stream, res, lines):
+        try:
+            line, _n = stream.read_line_finish_utf8(res)
+        except GLib.Error:
+            line = None
+        if line is None:
+            return
+        lines.append(line)
+        m = re.search(r'(\d+) %', line)
+        f = re.match(r'frame (\d+) / (\d+)', line)
+        if f:
+            m = [None, str(min(99, 100 * int(f.group(1)) // max(int(f.group(2)), 1)))]
+        if m and self.up_toast:
+            self.up_toast.set_title(f'Upscaling: {m[1]} %')
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._upscale_line, lines)
+
+    def _upscaled(self, proc, res, data):
+        out, _minutes = data
+        try:
+            proc.wait_finish(res)
+            ok = proc.get_successful()
+        except GLib.Error:
+            ok = False
+        self.upscaling = False
+        if self.up_toast:
+            self.up_toast.dismiss()
+            self.up_toast = None
+        if not ok:
+            self.toast('Upscaling failed')
+            return
+        t = Adw.Toast(title='Upscaled copy saved', button_label='Show', timeout=10)
+        t.connect('button-clicked', lambda t: self._show_file(out))
+        self.toasts.add_toast(t)
+
+    def _show_file(self, path):
+        """the new file in the viewer, once the indexer has it"""
+        items = [it for it in self.index.items if it.path == path]
+        if items:
+            self.open_viewer(items, 0)
+        else:
+            Gtk.FileLauncher(file=Gio.File.new_for_path(path)).open_containing_folder(self, None, None)
+
+    def _failed(self, index, message):
+        self.status.set_child(None)
+        self.status.set_icon_name('dialog-warning-symbolic')
+        self.status.set_title('The file indexer is not available')
+        self.status.set_description(f'The gallery lists photos and videos through LocalSearch.\n{message}')
+        self.photos_stack.set_visible_child_name('status')
+
+    def _miner_status(self, index, status, progress):
+        busy = status not in ('Idle', '')
+        if busy:
+            pct = f' ({progress * 100:.0f} %)' if 0 < progress < 1 else ''
+            self.banner.set_title(f'Looking for new photos and videos{pct}')
+        self.banner.set_revealed(busy)
+
+    def media_folder(self, folder):
+        return any(under(folder, r) for r in MEDIA_ROOTS) or folder in self.settings.shown
+
+    def refresh_views(self):
+        items = [it for it in self.index.items if it.path not in self.removed]
+        groups = collections.OrderedDict()
+        for it in items:
+            key, name = album_of(it.folder)
+            groups.setdefault(key, (name, []))[1].append(it)
+        self.albums = {key: Album(key, name, its) for key, (name, its) in groups.items()}
+        media = [a for a in self.albums.values() if a.key == 'camera' or self.media_folder(a.key)]
+        media.sort(key=lambda a: (album_order(a.key), -a.items[0].time))
+        self.others = sorted((a for a in self.albums.values() if a not in media), key=lambda a: -a.items[0].time)
+        shown = []
+        favs = [it for it in items if it.path in self.settings.favorites]
+        if favs:
+            shown.append(Album('favorites', 'Favourites', favs, kind='favorites'))
+        shown += media
+        if self.others:
+            covers = [a.items[0] for a in self.others]
+            shown.append(Album('others', 'Other folders', covers, kind='others', folders=self.others))
+        self.albums_view.set_albums(shown)
+
+        timeline = [it for a in media for it in a.items]
+        timeline.sort(key=lambda it: it.time, reverse=True)
+        self.photos.set_items(timeline)
+        if timeline:
+            self.photos_stack.set_visible_child_name('grid')
+        else:
+            self.status.set_child(None)
+            self.status.set_title('No photos or videos')
+            self.status.set_description('Pictures taken with the camera and saved to Pictures, Videos or '
+                                        'Downloads show here.')
+            self.photos_stack.set_visible_child_name('status')
+        page = self.nav.get_visible_page()
+        if isinstance(page, AlbumPage):
+            album = self.albums.get(page.album.key)
+            if album:
+                page.update(album)
+            elif page.album.kind == 'favorites':
+                page.update(Album('favorites', 'Favourites', favs, kind='favorites'))
+
+    def open_viewer(self, items, index):
+        self.nav.push(Viewer(self, items, index))
+
+    def open_album(self, album):
+        if album.kind == 'others':
+            self.nav.push(FolderList(self, album.folders))
+        else:
+            self.nav.push(AlbumPage(self, album))
+
+    def hide_folder(self, album):
+        try:
+            open(os.path.join(album.key, '.nomedia'), 'a').close()
+        except OSError as e:
+            self.toast(f'Could not hide the folder: {e.strerror}')
+            return
+        self.removed.update(it.path for it in album.items)
+        self.nav.pop_to_tag('main')
+        self.refresh_views()
+        self.toast(f'“{album.name}” hidden')
+
+    def delete(self, items):
+        self.removed.update(it.path for it in items)
+        self.pending.append(items)
+        self.refresh_views()
+        n = len(items)
+        toast = Adw.Toast(title='Moved to the trash' if n == 1 else f'{n} items moved to the trash',
+                          button_label='Undo')
+        toast.connect('button-clicked', lambda t: self._undo(items))
+        toast.connect('dismissed', lambda t: self._trash(items))
+        self.toasts.add_toast(toast)
+
+    def _undo(self, items):
+        if items in self.pending:
+            self.pending.remove(items)
+            self.removed.difference_update(it.path for it in items)
+            self.refresh_views()
+
+    def _trash(self, items, wait=False):
+        if items not in self.pending:
+            return
+        self.pending.remove(items)
+        for it in items:
+            for path in (it.path, it.raw):
+                if not path:
+                    continue
+                f = Gio.File.new_for_path(path)
+                if wait:
+                    try:
+                        f.trash(None)
+                    except GLib.Error:
+                        pass
+                else:
+                    f.trash_async(GLib.PRIORITY_DEFAULT, None, None, None)
+            self.thumbs.forget(it)
+
+    def _closing(self, win):
+        for items in list(self.pending):
+            self._trash(items, wait=True)
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        about = Gio.SimpleAction(name='about')
+        about.connect('activate', self._about)
+        self.add_action(about)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        Gst.init(None)
+        css = Gtk.CssProvider()
+        css.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.get_active_window() or Gallery(self)
+        win.present()
+
+    def _about(self, *a):
+        Adw.AboutDialog(application_name='Gallery', application_icon=APP_ID, version=VERSION,
+                        developer_name='arch-port', license_type=Gtk.License.MIT_X11,
+                        comments='Photos and videos of the home directory, found by GNOME’s file indexer'
+                        ).present(self.get_active_window())
+
+
+if __name__ == '__main__':
+    sys.exit(App().run(sys.argv))

@@ -1,0 +1,58 @@
+usb: mtu3: don't wait for IP sleep without a Type-C partner (force-vbus)
+
+With VBUS sensed outside the PHY (mediatek,force-vbus, patch 0004) the
+device IP sees a forced-valid VBUS even with the cable out and doesn't
+report sleep about half the time, so a deep (SPM) suspend on battery
+failed with -EBUSY. Track the Type-C port's role (none = no partner) and
+skip the wait then, as for a device that isn't pulled up (the state the
+deep measurements had with the UDC unbound). Cable in: unchanged.
+(Reporting the VBUS session to the UDC core instead broke enumeration at
+boot: a vbus_handler(true) before the gadget is bound only saves
+connected = true and the bind then skips the pullup.)
+
+diff --git a/drivers/usb/mtu3/mtu3.h b/drivers/usb/mtu3/mtu3.h
+index ea94df6bf..e99d51e85 100644
+--- a/drivers/usb/mtu3/mtu3.h
++++ b/drivers/usb/mtu3/mtu3.h
+@@ -268,6 +268,7 @@ struct ssusb_mtk {
+ 	int u3p_dis_msk;
+ 	bool force_vbus;
+ 	bool kept_powered;
++	bool no_partner;
+ 	struct dentry *dbgfs_root;
+ 	/* usb wakeup for host mode */
+ 	bool uwk_en;
+diff --git a/drivers/usb/mtu3/mtu3_core.c b/drivers/usb/mtu3/mtu3_core.c
+index 0d3ca1123..166ebea8b 100644
+--- a/drivers/usb/mtu3/mtu3_core.c
++++ b/drivers/usb/mtu3/mtu3_core.c
+@@ -1025,6 +1025,15 @@ bool ssusb_gadget_ip_sleep_check(struct ssusb_mtk *ssusb)
+ 	if (!mtu)
+ 		return true;
+ 
++	/*
++	 * VBUS sensed outside the PHY is forced valid: with no cable (no
++	 * Type-C partner) the IP doesn't report sleep either, and a suspend
++	 * through the SPM failed with -EBUSY. Nothing is on the bus then:
++	 * don't wait, as for a device that isn't pulled up.
++	 */
++	if (ssusb->force_vbus && ssusb->no_partner)
++		return false;
++
+ 	/* device is started and pullup D+, ip can sleep */
+ 	if (mtu->is_active && mtu->softconnect)
+ 		return true;
+diff --git a/drivers/usb/mtu3/mtu3_dr.c b/drivers/usb/mtu3/mtu3_dr.c
+index 89ab3ffd2..6187a90d6 100644
+--- a/drivers/usb/mtu3/mtu3_dr.c
++++ b/drivers/usb/mtu3/mtu3_dr.c
+@@ -137,6 +137,9 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 
+ 	current_role = ssusb->is_host ? USB_ROLE_HOST : USB_ROLE_DEVICE;
+ 
++	/* the Type-C port's view of the cable, see ssusb_gadget_ip_sleep_check() */
++	ssusb->no_partner = desired_role == USB_ROLE_NONE;
++
+ 	if (desired_role == USB_ROLE_NONE) {
+ 		/* the default mode is host as probe does */
+ 		desired_role = USB_ROLE_HOST;

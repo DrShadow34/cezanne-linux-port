@@ -1,0 +1,21 @@
+# FM radio app for the Redmi K30 Ultra (cezanne): the MT6635 receiver through
+# MediaTek's /dev/fm (fmradio_drv + cezanne-fm.service, NOTES "FM radio"),
+# audio from the UL3 capture into PipeWire.
+pkgname=cezanne-fm
+pkgver=1.0
+pkgrel=2
+pkgdesc="FM radio for the cezanne's MT6635 receiver"
+arch=(any)
+license=(MIT)
+depends=(python python-gobject gtk4 libadwaita gstreamer gst-plugins-base
+         gst-plugin-pipewire alsa-utils)
+source=(cezanne-fm
+        org.cezanne.FmRadio.desktop
+        org.cezanne.FmRadio.svg)
+sha256sums=(SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 cezanne-fm "$pkgdir/usr/bin/cezanne-fm"
+  install -Dm644 org.cezanne.FmRadio.desktop "$pkgdir/usr/share/applications/org.cezanne.FmRadio.desktop"
+  install -Dm644 org.cezanne.FmRadio.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.cezanne.FmRadio.svg"
+}

@@ -1,0 +1,6 @@
+# GNOME 51's "switchable" authentication (SSSD) is on by default, but Arch's
+# GDM has no gdm-switchable-auth PAM service: the lock screen restarted it
+# ~20 times a second and leaked a gdm-session-worker each time. The classic
+# services (gdm-password, gdm-fingerprint) do password and fingerprint.
+[org.gnome.login-screen]
+enable-switchable-authentication=false

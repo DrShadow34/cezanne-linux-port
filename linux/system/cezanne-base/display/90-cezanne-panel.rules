@@ -1,0 +1,5 @@
+# panel HBM / FOD and DC dimming control for the session (video group):
+# cezanne-fod extension, DC dimming toggle, colour mode picker, AOD
+ACTION=="add|bind", SUBSYSTEM=="mipi-dsi", KERNEL=="1400e000.dsi.0", RUN+="/bin/sh -c 'cd /sys%p && chgrp video hbm dc_dimming color_mode doze && chmod g+w hbm dc_dimming color_mode doze'"
+# RTC wake alarm for the AOD clock updates (cezanne-aod extension)
+ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", RUN+="/bin/sh -c 'chgrp video /sys%p/wakealarm && chmod g+w /sys%p/wakealarm'"

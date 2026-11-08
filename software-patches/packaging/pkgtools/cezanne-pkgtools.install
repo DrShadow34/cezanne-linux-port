@@ -1,0 +1,12 @@
+post_install() {
+  systemctl daemon-reload
+  systemctl enable --now cezanne-build.timer
+  # the bootstrap copy
+  rm -f /usr/local/sbin/cezanne-build
+}
+post_upgrade() {
+  systemctl daemon-reload
+}
+pre_remove() {
+  systemctl disable --now cezanne-build.timer
+}

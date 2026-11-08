@@ -1,0 +1,19 @@
+diff --git a/drivers/thermal/mediatek/lvts_thermal.c b/drivers/thermal/mediatek/lvts_thermal.c
+index 4116ccaaf..4371daa40 100644
+--- a/drivers/thermal/mediatek/lvts_thermal.c
++++ b/drivers/thermal/mediatek/lvts_thermal.c
+@@ -102,8 +102,12 @@
+ 
+ #define LVTS_MSR_OFFSET_MT8196		-984
+ 
+-#define LVTS_MSR_READ_TIMEOUT_US	400
+-#define LVTS_MSR_READ_WAIT_US		(LVTS_MSR_READ_TIMEOUT_US / 2)
++/*
++ * The valid bit drops while a sensor is measured: the MT6885 little-cluster
++ * controller cycles 4 sensors and failed ~25% of the reads at 400 us.
++ */
++#define LVTS_MSR_READ_TIMEOUT_US	4000
++#define LVTS_MSR_READ_WAIT_US		200
+ 
+ #define LVTS_MINIMUM_THRESHOLD		20000
+ 

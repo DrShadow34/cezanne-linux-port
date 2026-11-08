@@ -1,0 +1,12 @@
+{
+  "uuid": "cezanne-dc-dimming@arch-port",
+  "name": "Cezanne Display",
+  "description": "Quick settings for the cezanne panel: DC dimming toggle and MIUI colour schemes.",
+  "shell-version": [
+    "51"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

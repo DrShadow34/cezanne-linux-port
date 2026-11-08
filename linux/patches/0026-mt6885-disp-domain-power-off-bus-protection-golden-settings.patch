@@ -1,0 +1,599 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ccorr.c b/drivers/gpu/drm/mediatek/mtk_disp_ccorr.c
+index 6d7bf4afa..1a6dd6354 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ccorr.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ccorr.c
+@@ -31,8 +31,13 @@
+ 
+ struct mtk_disp_ccorr_data {
+ 	u32 matrix_bits;
++	/* MT6885: registers take effect directly (lk sets this) */
++	bool bypass_shadow;
+ };
+ 
++#define DISP_CCORR_SHADOW			0x00a0
++#define CCORR_BYPASS_SHADOW				BIT(2)
++
+ struct mtk_disp_ccorr {
+ 	struct clk *clk;
+ 	void __iomem *regs;
+@@ -70,6 +75,9 @@ void mtk_ccorr_start(struct device *dev)
+ {
+ 	struct mtk_disp_ccorr *ccorr = dev_get_drvdata(dev);
+ 
++	if (ccorr->data->bypass_shadow)
++		writel(readl(ccorr->regs + DISP_CCORR_SHADOW) | CCORR_BYPASS_SHADOW,
++		       ccorr->regs + DISP_CCORR_SHADOW);
+ 	writel(CCORR_EN, ccorr->regs + DISP_CCORR_EN);
+ }
+ 
+@@ -177,7 +185,14 @@ static const struct mtk_disp_ccorr_data mt8192_ccorr_driver_data = {
+ 	.matrix_bits = 11,
+ };
+ 
++static const struct mtk_disp_ccorr_data mt6885_ccorr_driver_data = {
++	.matrix_bits = 11,
++	.bypass_shadow = true,
++};
++
+ static const struct of_device_id mtk_disp_ccorr_driver_dt_match[] = {
++	{ .compatible = "mediatek,mt6885-disp-ccorr",
++	  .data = &mt6885_ccorr_driver_data},
+ 	{ .compatible = "mediatek,mt8183-disp-ccorr",
+ 	  .data = &mt8183_ccorr_driver_data},
+ 	{ .compatible = "mediatek,mt8192-disp-ccorr",
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_color.c b/drivers/gpu/drm/mediatek/mtk_disp_color.c
+index 39c7de4cd..9dc665302 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_color.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_color.c
+@@ -28,8 +28,13 @@
+ 
+ struct mtk_disp_color_data {
+ 	unsigned int color_offset;
++	/* MT6885: registers take effect directly (lk sets this) */
++	bool bypass_shadow;
+ };
+ 
++#define DISP_COLOR_SHADOW_CTRL(c)	((c)->data->color_offset + 0xb0)
++#define COLOR_BYPASS_SHADOW			BIT(0)
++
+ /*
+  * struct mtk_disp_color - DISP_COLOR driver structure
+  * @crtc: associated crtc to report irq events to
+@@ -71,6 +76,10 @@ void mtk_color_start(struct device *dev)
+ {
+ 	struct mtk_disp_color *color = dev_get_drvdata(dev);
+ 
++	if (color->data->bypass_shadow)
++		writel(readl(color->regs + DISP_COLOR_SHADOW_CTRL(color)) |
++		       COLOR_BYPASS_SHADOW,
++		       color->regs + DISP_COLOR_SHADOW_CTRL(color));
+ 	writel(COLOR_BYPASS_ALL | COLOR_SEQ_SEL,
+ 	       color->regs + DISP_COLOR_CFG_MAIN);
+ 	writel(0x1, color->regs + DISP_COLOR_START(color));
+@@ -144,7 +153,14 @@ static const struct mtk_disp_color_data mt8173_color_driver_data = {
+ 	.color_offset = DISP_COLOR_START_MT8173,
+ };
+ 
++static const struct mtk_disp_color_data mt6885_color_driver_data = {
++	.color_offset = DISP_COLOR_START_MT8173,
++	.bypass_shadow = true,
++};
++
+ static const struct of_device_id mtk_disp_color_driver_dt_match[] = {
++	{ .compatible = "mediatek,mt6885-disp-color",
++	  .data = &mt6885_color_driver_data},
+ 	{ .compatible = "mediatek,mt2701-disp-color",
+ 	  .data = &mt2701_color_driver_data},
+ 	{ .compatible = "mediatek,mt8167-disp-color",
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+index 97a899e4b..9ff99c562 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_ovl.c
+@@ -30,6 +30,7 @@
+ #define OVL_LAYER_SMI_ID_EN				BIT(0)
+ #define OVL_BGCLR_SEL_IN				BIT(2)
+ #define OVL_LAYER_AFBC_EN(n)				BIT(4+n)
++#define OVL_OUTPUT_CLAMP				BIT(26)
+ #define DISP_REG_OVL_ROI_BGCLR			0x0028
+ #define DISP_REG_OVL_SRC_CON			0x002c
+ #define DISP_REG_OVL_CON(n)			(0x0030 + 0x20 * (n))
+@@ -41,6 +42,15 @@
+ #define OVL_CONST_BLEND					BIT(28)
+ #define DISP_REG_OVL_RDMA_CTRL(n)		(0x00c0 + 0x20 * (n))
+ #define DISP_REG_OVL_RDMA_GMC(n)		(0x00c8 + 0x20 * (n))
++#define DISP_REG_OVL_RDMA_GMC_S2(n)		(0x01e0 + 4 * (n))
++#define DISP_REG_OVL_RDMA_BURST_CON1		0x01f4
++#define OVL_RDMA_BURST16_EN				BIT(28)
++#define DISP_REG_OVL_RDMA_GREQ_NUM		0x01f8
++#define DISP_REG_OVL_RDMA_GREQ_URG_NUM		0x01fc
++#define DISP_REG_OVL_RDMA_ULTRA_SRC		0x020c
++#define DISP_REG_OVL_RDMA_BUF_LOW(n)		(0x0210 + 4 * (n))
++#define DISP_REG_OVL_RDMA_BUF_HIGH(n)		(0x0220 + 4 * (n))
++#define OVL_RDMA_PRE_ULTRA_HIGH_DIS			BIT(31)
+ #define DISP_REG_OVL_ADDR_MT2701		0x0040
+ #define DISP_REG_OVL_CLRFMT_EXT			0x02d0
+ #define OVL_CON_CLRFMT_BIT_DEPTH_MASK(n)		(GENMASK(1, 0) << (4 * (n)))
+@@ -150,6 +160,8 @@ struct mtk_disp_ovl_data {
+ 	const u32 *formats;
+ 	size_t num_formats;
+ 	bool supports_clrfmt_ext;
++	/* MT6885: program the BSP's fetch "golden settings" (lk's otherwise) */
++	bool bsp_golden;
+ };
+ 
+ /*
+@@ -261,6 +273,15 @@ void mtk_ovl_start(struct device *dev)
+ {
+ 	struct mtk_disp_ovl *ovl = dev_get_drvdata(dev);
+ 
++	if (ovl->data->bsp_golden) {
++		writel_relaxed(readl(ovl->regs + DISP_REG_OVL_DATAPATH_CON) |
++			       OVL_OUTPUT_CLAMP,
++			       ovl->regs + DISP_REG_OVL_DATAPATH_CON);
++		writel_relaxed(readl(ovl->regs + DISP_REG_OVL_RDMA_BURST_CON1) |
++			       OVL_RDMA_BURST16_EN,
++			       ovl->regs + DISP_REG_OVL_RDMA_BURST_CON1);
++	}
++
+ 	if (ovl->data->smi_id_en) {
+ 		unsigned int reg;
+ 
+@@ -310,6 +331,33 @@ static void mtk_ovl_set_bit_depth(struct device *dev, int idx, u32 format,
+ 			   OVL_CON_CLRFMT_BIT_DEPTH_MASK(idx));
+ }
+ 
++/*
++ * BSP mtk_ovl_cal_golden_setting() for MT6885 (not DC mode): request
++ * thresholds of the layer fetch engines. lk programs the same values; a
++ * power cycle of the display domain resets them.
++ */
++static void mtk_ovl_golden_setting(struct mtk_disp_ovl *ovl,
++				   struct cmdq_pkt *cmdq_pkt)
++{
++	unsigned int i;
++
++	for (i = 0; i < ovl->data->layer_nr; i++) {
++		/* issue 255, urgent issue 127, request on ultra */
++		mtk_ddp_write(cmdq_pkt, 255 | 127 << 16 | BIT(29), &ovl->cmdq_reg,
++			      ovl->regs, DISP_REG_OVL_RDMA_GMC_S2(i));
++		mtk_ddp_write(cmdq_pkt, 0, &ovl->cmdq_reg, ovl->regs,
++			      DISP_REG_OVL_RDMA_BUF_LOW(i));
++		mtk_ddp_write(cmdq_pkt, OVL_RDMA_PRE_ULTRA_HIGH_DIS, &ovl->cmdq_reg,
++			      ovl->regs, DISP_REG_OVL_RDMA_BUF_HIGH(i));
++	}
++	mtk_ddp_write(cmdq_pkt, 0xf1ff7777, &ovl->cmdq_reg, ovl->regs,
++		      DISP_REG_OVL_RDMA_GREQ_NUM);
++	mtk_ddp_write(cmdq_pkt, 0x7777, &ovl->cmdq_reg, ovl->regs,
++		      DISP_REG_OVL_RDMA_GREQ_URG_NUM);
++	mtk_ddp_write(cmdq_pkt, 0x8040, &ovl->cmdq_reg, ovl->regs,
++		      DISP_REG_OVL_RDMA_ULTRA_SRC);
++}
++
+ void mtk_ovl_config(struct device *dev, unsigned int w,
+ 		    unsigned int h, unsigned int vrefresh,
+ 		    unsigned int bpc, struct cmdq_pkt *cmdq_pkt)
+@@ -329,6 +377,9 @@ void mtk_ovl_config(struct device *dev, unsigned int w,
+ 
+ 	mtk_ddp_write(cmdq_pkt, 0x1, &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_RST);
+ 	mtk_ddp_write(cmdq_pkt, 0x0, &ovl->cmdq_reg, ovl->regs, DISP_REG_OVL_RST);
++
++	if (ovl->data->bsp_golden)
++		mtk_ovl_golden_setting(ovl, cmdq_pkt);
+ }
+ 
+ unsigned int mtk_ovl_layer_nr(struct device *dev)
+@@ -708,6 +759,20 @@ static const struct mtk_disp_ovl_data mt8183_ovl_2l_driver_data = {
+ 	.num_formats = ARRAY_SIZE(mt8173_formats),
+ };
+ 
++static const struct mtk_disp_ovl_data mt6885_ovl_driver_data = {
++	.addr = DISP_REG_OVL_ADDR_MT8173,
++	.gmc_bits = 10,
++	.layer_nr = 4,
++	.fmt_rgb565_is_0 = true,
++	.smi_id_en = true,
++	.blend_modes = BIT(DRM_MODE_BLEND_PREMULTI) |
++		       BIT(DRM_MODE_BLEND_COVERAGE) |
++		       BIT(DRM_MODE_BLEND_PIXEL_NONE),
++	.formats = mt8173_formats,
++	.num_formats = ARRAY_SIZE(mt8173_formats),
++	.bsp_golden = true,
++};
++
+ static const struct mtk_disp_ovl_data mt8192_ovl_driver_data = {
+ 	.addr = DISP_REG_OVL_ADDR_MT8173,
+ 	.gmc_bits = 10,
+@@ -760,6 +825,8 @@ static const struct of_device_id mtk_disp_ovl_driver_dt_match[] = {
+ 	  .data = &mt8183_ovl_driver_data},
+ 	{ .compatible = "mediatek,mt8183-disp-ovl-2l",
+ 	  .data = &mt8183_ovl_2l_driver_data},
++	{ .compatible = "mediatek,mt6885-disp-ovl",
++	  .data = &mt6885_ovl_driver_data},
+ 	{ .compatible = "mediatek,mt8192-disp-ovl",
+ 	  .data = &mt8192_ovl_driver_data},
+ 	{ .compatible = "mediatek,mt8192-disp-ovl-2l",
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_rdma.c b/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
+index 3fe31dfba..e53162eb7 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
+@@ -6,6 +6,7 @@
+ #include <drm/drm_fourcc.h>
+ 
+ #include <linux/clk.h>
++#include <linux/math64.h>
+ #include <linux/component.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -45,7 +46,21 @@
+ #define MEM_MODE_INPUT_SWAP				BIT(8)
+ #define DISP_RDMA_MEM_SRC_PITCH			0x002c
+ #define DISP_RDMA_MEM_GMC_SETTING_0		0x0030
++#define DISP_REG_RDMA_MEM_GMC_S0		0x0030
++#define DISP_REG_RDMA_MEM_GMC_S1		0x0034
+ #define DISP_REG_RDMA_MEM_GMC_SETTING_2	0x003c
++#define DISP_REG_RDMA_TH_FOR_SODI		0x00a8
++#define DISP_REG_RDMA_TH_FOR_DVFS		0x00ac
++#define DISP_REG_RDMA_SRAM_SEL			0x00b0
++#define DISP_REG_RDMA_DVFS_PRE			0x00d0
++#define DISP_REG_RDMA_DVFS_ULTRA		0x00d4
++#define DISP_REG_RDMA_LEAVE_DRS			0x00d8
++#define DISP_REG_RDMA_ENTER_DRS			0x00dc
++#define DISP_REG_RDMA_MEM_GMC_S3		0x00e8
++#define DISP_REG_RDMA_GREQ_URG_NUM_SEL		0x01a8
++#define RDMA_LAYER_SMI_ID_EN				BIT(29)
++#define RDMA_VALID_TH_FORCE_PRE_ULTRA			BIT(30)
++#define RDMA_VALID_TH_BLOCK_ULTRA			BIT(30)
+ #define DISP_REG_RDMA_FIFO_CON			0x0040
+ #define RDMA_FIFO_UNDERFLOW_EN				BIT(31)
+ #define RDMA_FIFO_PSEUDO_SIZE(bytes)			(((bytes) / 16) << 16)
+@@ -73,6 +88,8 @@ struct mtk_disp_rdma_data {
+ 	unsigned int fifo_size;
+ 	const u32 *formats;
+ 	size_t num_formats;
++	/* MT6885: BSP fetch "golden settings" from the mode (lk's otherwise) */
++	bool bsp_golden;
+ };
+ 
+ /*
+@@ -183,6 +200,67 @@ void mtk_rdma_stop(struct device *dev)
+ 	rdma_update_bits(dev, DISP_REG_RDMA_GLOBAL_CON, RDMA_ENGINE_EN, 0);
+ }
+ 
++/*
++ * BSP mtk_rdma_cal_golden_setting() for MT6885, command mode: the fetch
++ * thresholds are microseconds of output at the mode's pixel rate (3 bytes
++ * per pixel, FIFO entries of 16 bytes). A pipe stalls rather than
++ * underflows in command mode: no output threshold, no underflow output.
++ */
++static void mtk_rdma_golden_setting(struct mtk_disp_rdma *rdma, unsigned int width,
++				    unsigned int height, unsigned int vrefresh,
++				    unsigned int fifo, struct cmdq_pkt *cmdq_pkt)
++{
++	/* FIFO depth filled per us at the 208 MHz mmsys clock */
++	const s64 fill_rate = 96 * 208 * 3 / 16;
++	u64 rate = (u64)width * height * (vrefresh ?: 60) * 3;
++	u32 pre_lo, pre_hi, ultra_lo, issue;
++	s64 sodi_hi;
++
++	rate = div_u64(rate, 1000) * 125;
++	rate = div_u64(rate, 16 * 1000);
++#define RDMA_TH(us)	((u32)DIV_ROUND_UP_ULL(rate * (us), 1000))
++
++	pre_lo = RDMA_TH(245);
++	pre_hi = RDMA_TH(255);
++	ultra_lo = RDMA_TH(230);
++	issue = fifo - pre_lo >= 256 ? 256 : fifo - pre_lo;
++	sodi_hi = DIV_ROUND_UP_ULL(max_t(s64, (s64)fifo * 1000 -
++					 (fill_rate - (s64)rate) * 12, 0), 1000);
++	if (sodi_hi < pre_hi)
++		sodi_hi = pre_hi;
++	if (sodi_hi >= fifo)
++		sodi_hi = fifo - 1;
++
++	mtk_ddp_write(cmdq_pkt, pre_lo | pre_hi << 16 | RDMA_VALID_TH_FORCE_PRE_ULTRA,
++		      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_MEM_GMC_S0);
++	mtk_ddp_write(cmdq_pkt, ultra_lo | pre_lo << 16 | RDMA_VALID_TH_BLOCK_ULTRA,
++		      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_MEM_GMC_S1);
++	mtk_ddp_write(cmdq_pkt, issue, &rdma->cmdq_reg, rdma->regs,
++		      DISP_REG_RDMA_MEM_GMC_SETTING_2);
++	mtk_ddp_write(cmdq_pkt, fifo << 16, &rdma->cmdq_reg, rdma->regs,
++		      DISP_REG_RDMA_FIFO_CON);
++	mtk_ddp_write(cmdq_pkt, RDMA_TH(230 + 50) | (u32)sodi_hi << 16,
++		      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_TH_FOR_SODI);
++	mtk_ddp_write(cmdq_pkt, pre_lo | (pre_lo + 1) << 16, &rdma->cmdq_reg,
++		      rdma->regs, DISP_REG_RDMA_TH_FOR_DVFS);
++	mtk_ddp_write(cmdq_pkt, 0, &rdma->cmdq_reg, rdma->regs,
++		      DISP_REG_RDMA_SRAM_SEL);
++	mtk_ddp_write(cmdq_pkt, RDMA_TH(245 + 40) | RDMA_TH(255 + 40) << 16,
++		      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_DVFS_PRE);
++	mtk_ddp_write(cmdq_pkt, RDMA_TH(230 + 40) | RDMA_TH(245 + 40) << 16,
++		      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_DVFS_ULTRA);
++	mtk_ddp_write(cmdq_pkt, RDMA_TH(245 + 20) | RDMA_TH(245 + 20) << 16,
++		      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_LEAVE_DRS);
++	mtk_ddp_write(cmdq_pkt, RDMA_TH(245 + 40) | RDMA_TH(245 + 40) << 16,
++		      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_ENTER_DRS);
++	mtk_ddp_write(cmdq_pkt, RDMA_TH(113) | RDMA_TH(117) << 16,
++		      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_MEM_GMC_S3);
++	mtk_ddp_write_mask(cmdq_pkt, RDMA_LAYER_SMI_ID_EN, &rdma->cmdq_reg,
++			   rdma->regs, DISP_REG_RDMA_GREQ_URG_NUM_SEL,
++			   RDMA_LAYER_SMI_ID_EN);
++#undef RDMA_TH
++}
++
+ void mtk_rdma_config(struct device *dev, unsigned int width,
+ 		     unsigned int height, unsigned int vrefresh,
+ 		     unsigned int bpc, struct cmdq_pkt *cmdq_pkt)
+@@ -208,6 +286,12 @@ void mtk_rdma_config(struct device *dev, unsigned int width,
+ 	 * output threshold to 70% of max fifo size to make sure the
+ 	 * threhold will not overflow
+ 	 */
++	if (rdma->data->bsp_golden) {
++		mtk_rdma_golden_setting(rdma, width, height, vrefresh,
++					rdma_fifo_size / 16, cmdq_pkt);
++		return;
++	}
++
+ 	/*
+ 	 * A command-mode sink (DSI with a GRAM panel) is not timed, so a
+ 	 * fetch shortfall should stall the pipe, not emit filler pixels:
+@@ -407,6 +491,13 @@ static const struct mtk_disp_rdma_data mt8173_rdma_driver_data = {
+ 	.num_formats = ARRAY_SIZE(mt8173_formats),
+ };
+ 
++static const struct mtk_disp_rdma_data mt6885_rdma_driver_data = {
++	.fifo_size = 2240 * 16,
++	.formats = mt8173_formats,
++	.num_formats = ARRAY_SIZE(mt8173_formats),
++	.bsp_golden = true,
++};
++
+ static const struct mtk_disp_rdma_data mt8183_rdma_driver_data = {
+ 	.fifo_size = 5 * SZ_1K,
+ 	.formats = mt8173_formats,
+@@ -422,6 +513,8 @@ static const struct mtk_disp_rdma_data mt8195_rdma_driver_data = {
+ static const struct of_device_id mtk_disp_rdma_driver_dt_match[] = {
+ 	{ .compatible = "mediatek,mt2701-disp-rdma",
+ 	  .data = &mt2701_rdma_driver_data},
++	{ .compatible = "mediatek,mt6885-disp-rdma",
++	  .data = &mt6885_rdma_driver_data},
+ 	{ .compatible = "mediatek,mt8173-disp-rdma",
+ 	  .data = &mt8173_rdma_driver_data},
+ 	{ .compatible = "mediatek,mt8183-disp-rdma",
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index c1aa0eb42..170adc60d 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -105,6 +105,12 @@
+ #define CMDQ_SIZE_SEL		BIT(15)
+ 
+ #define DSI_HSTX_CKL_WC		0x64
++
++/* command mode: DCS command of the continuation packets of a frame */
++#define DSI_MEM_CONTI		0x90
++/* ULPS wake-up period (BSP: data rate in kbps / 8192 + 1) */
++#define DSI_TIME_CON0		0xa0
++#define DSI_WAKEUP_PRD			GENMASK(15, 0)
+ #define HSTX_CKL_WC			GENMASK(15, 2)
+ 
+ #define DSI_RX_DATA0		0x74
+@@ -835,6 +841,10 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 
+ 	mtk_dsi_ps_control(dsi, true);
+ 	if (dsi->cmd_mode) {
++		/* the rest of each frame goes as write_memory_continue */
++		writel(MIPI_DCS_WRITE_MEMORY_CONTINUE, dsi->regs + DSI_MEM_CONTI);
++		mtk_dsi_mask(dsi, DSI_TIME_CON0, DSI_WAKEUP_PRD,
++			     dsi->data_rate / 1000 / 8192 + 1);
+ 		if (!dsi->dsc && dsi->driver_data->has_size_ctl)
+ 			writel(FIELD_PREP(DSI_HEIGHT, dsi->vm.vactive) |
+ 			       FIELD_PREP(DSI_WIDTH, dsi->vm.hactive),
+@@ -1490,6 +1500,7 @@ static const struct mtk_dsi_driver_data mt6885_dsi_driver_data = {
+ 	.reg_cmdq_off = 0x200,
+ 	.reg_vm_cmd_off = 0x130,
+ 	.reg_shadow_dbg_off = 0x190,
++	.has_shadow_ctl = true,
+ 	.has_size_ctl = true,
+ 	.mmsys_cmd_trig_off = 0xf0,
+ };
+diff --git a/drivers/memory/mtk-smi.c b/drivers/memory/mtk-smi.c
+index 2b294f82a..35d6e399e 100644
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -121,6 +121,12 @@ static const char * const mtk_smi_common_clks[] = {"apb", "smi", "gals0", "gals1
+ #define MTK_SMI_SUB_COM_GALS_REQ_CLK_NR 3
+ 
+ struct mtk_smi_common_plat {
++	/*
++	 * Keep the clocks on through the noirq phase of a system suspend: the
++	 * power domain's bus protection (applied by genpd after that) only
++	 * gets its acks with the SMI running.
++	 */
++	bool		clk_on_for_pd_off;
+ 	enum mtk_smi_type	type;
+ 	bool			has_gals;
+ 	u32			bus_sel; /* Balance some larbs to enter mmu0 or mmu1 */
+@@ -808,6 +814,14 @@ static const struct mtk_smi_common_plat mtk_smi_common_mt6893 = {
+ 		    F_MMU1_LARB(5) | F_MMU1_LARB(7),
+ };
+ 
++static const struct mtk_smi_common_plat mtk_smi_common_mt6885 = {
++	.type     = MTK_SMI_GEN2,
++	.has_gals = true,
++	.bus_sel  = F_MMU1_LARB(1) | F_MMU1_LARB(2) | F_MMU1_LARB(4) |
++		    F_MMU1_LARB(5) | F_MMU1_LARB(7),
++	.clk_on_for_pd_off = true,
++};
++
+ static const struct mtk_smi_common_plat mtk_smi_common_mt8183 = {
+ 	.type     = MTK_SMI_GEN2,
+ 	.has_gals = true,
+@@ -870,7 +884,7 @@ static const struct of_device_id mtk_smi_common_of_ids[] = {
+ 	{.compatible = "mediatek,mt2712-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt6779-smi-common", .data = &mtk_smi_common_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-common", .data = &mtk_smi_common_mt6795},
+-	{.compatible = "mediatek,mt6885-smi-common", .data = &mtk_smi_common_mt6893},
++	{.compatible = "mediatek,mt6885-smi-common", .data = &mtk_smi_common_mt6885},
+ 	{.compatible = "mediatek,mt6893-smi-common", .data = &mtk_smi_common_mt6893},
+ 	{.compatible = "mediatek,mt8167-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt8173-smi-common", .data = &mtk_smi_common_gen2},
+@@ -980,10 +994,34 @@ static int __maybe_unused mtk_smi_common_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
++static int __maybe_unused mtk_smi_common_suspend_noirq(struct device *dev)
++{
++	struct mtk_smi *common = dev_get_drvdata(dev);
++
++	if (!common->plat->clk_on_for_pd_off)
++		return 0;
++	return clk_bulk_prepare_enable(common->clk_num, common->clks);
++}
++
++static int __maybe_unused mtk_smi_common_resume_noirq(struct device *dev)
++{
++	struct mtk_smi *common = dev_get_drvdata(dev);
++
++	/*
++	 * Runtime-suspended here: this drops the clocks to off, which is what
++	 * a power-cycled domain has in its gates; runtime resume ungates.
++	 */
++	if (common->plat->clk_on_for_pd_off)
++		clk_bulk_disable_unprepare(common->clk_num, common->clks);
++	return 0;
++}
++
+ static const struct dev_pm_ops smi_common_pm_ops = {
+ 	SET_RUNTIME_PM_OPS(mtk_smi_common_suspend, mtk_smi_common_resume, NULL)
+ 	SET_LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
+ 				     pm_runtime_force_resume)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(mtk_smi_common_suspend_noirq,
++				      mtk_smi_common_resume_noirq)
+ };
+ 
+ static struct platform_driver mtk_smi_common_driver = {
+diff --git a/drivers/pmdomain/mediatek/mt6885-pm-domains.h b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+index ec1a449a3..ad30756b0 100644
+--- a/drivers/pmdomain/mediatek/mt6885-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+@@ -52,13 +52,18 @@
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWB_2ND	BIT(21)
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC	BIT(22)
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC_2ND	BIT(23)
+-/* BSP spm_mtcmos_ctrl_dis(): DIS_PROT_STEP1_0, STEP2_0, STEP2_1, STEP2_2 */
+-#define MT6885_TOP_AXI_PROT_EN_MM_DISP		(BIT(0) | BIT(6) | BIT(8) | BIT(10) | \
+-						 BIT(12) | BIT(14) | BIT(16) | BIT(20) | \
+-						 BIT(24) | BIT(26))
++/*
++ * BSP spm_mtcmos_ctrl_dis(): DIS_PROT_STEP1_0, STEP2_0, STEP2_1, STEP2_2,
++ * without the MM bits of the CAM subtree it also lists (0/1 CAM, 20/21
++ * CAM_RAWB): those domains are DISP's children, are off (and protected by
++ * their own bp_cfg) before DISP goes down, and releasing their bits with
++ * DISP's power-up while they are still off hangs the bus.
++ */
++#define MT6885_TOP_AXI_PROT_EN_MM_DISP		(BIT(6) | BIT(8) | BIT(10) | BIT(12) | \
++						 BIT(14) | BIT(16) | BIT(24) | BIT(26))
+ #define MT6885_TOP_AXI_PROT_EN_DISP		BIT(6)
+-#define MT6885_TOP_AXI_PROT_EN_MM_DISP_2ND	(BIT(1) | BIT(7) | BIT(9) | BIT(15) | \
+-						 BIT(17) | BIT(21) | BIT(25) | BIT(27))
++#define MT6885_TOP_AXI_PROT_EN_MM_DISP_2ND	(BIT(7) | BIT(9) | BIT(15) | BIT(17) | \
++						 BIT(25) | BIT(27))
+ #define MT6885_TOP_AXI_PROT_EN_VDNR_DISP	BIT(21)
+ 
+ static enum scpsys_bus_prot_block scpsys_bus_prot_blocks_mt6885[] = {
+@@ -218,18 +223,20 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 		.pwr_sta2nd_offs = 0x0170,
+ 		.sram_pdn_bits = GENMASK(8, 8),
+ 		.sram_pdn_ack_bits = GENMASK(12, 12),
+-		/*
+-		 * No bus protection yet: releasing the BSP DIS masks (they
+-		 * overlap CAM's MM bits) while CAM is off hung the boot.
+-		 * TODO: model them before the domain is ever powered off.
+-		 *
+-		 * Always on: a power cycle (s2idle) also loses everything lk
+-		 * set up and mediatek-drm does not program yet (OVL/RDMA fetch
+-		 * thresholds, PQ shadow and window registers, DSI extras): the
+-		 * pipe then stalls after resume. The display blocks and SMI are
+-		 * still clock-gated while the screen is off.
+-		 */
+-		.caps = MTK_SCPD_ALWAYS_ON,
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_DISP,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_DISP,
++				    MT6885_TOP_AXI_PROT_EN_SET, MT6885_TOP_AXI_PROT_EN_CLR,
++				    MT6885_TOP_AXI_PROT_EN_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_DISP_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_VDNR_DISP,
++				    MT6885_TOP_AXI_PROT_EN_VDNR_SET, MT6885_TOP_AXI_PROT_EN_VDNR_CLR,
++				    MT6885_TOP_AXI_PROT_EN_VDNR_STA1),
++		},
+ 	},
+ 	[MT6885_POWER_DOMAIN_CAM] = {
+ 		.name = "cam",
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.c b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+index d98ce4a0a..d6a7237a0 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+@@ -259,9 +259,10 @@ static int scpsys_bus_protect_set(struct scpsys_domain *pd,
+ 
+ static int scpsys_bus_protect_enable(struct scpsys_domain *pd, u8 flags)
+ {
+-	for (int i = 0; i < SPM_MAX_BUS_PROT_DATA; i++) {
++	int i, ret;
++
++	for (i = 0; i < SPM_MAX_BUS_PROT_DATA; i++) {
+ 		const struct scpsys_bus_prot_data *bpd = &pd->data->bp_cfg[i];
+-		int ret;
+ 
+ 		if (!bpd->bus_prot_set_clr_mask)
+ 			break;
+@@ -275,10 +276,31 @@ static int scpsys_bus_protect_enable(struct scpsys_domain *pd, u8 flags)
+ 		else
+ 			ret = scpsys_bus_protect_set(pd, bpd);
+ 		if (ret)
+-			return ret;
++			goto err_release;
+ 	}
+ 
+ 	return 0;
++
++err_release:
++	dev_err(pd->scpsys->dev, "%s: bus protection step %d (set 0x%x mask 0x%x) no ack\n",
++		pd->genpd.name, i, pd->data->bp_cfg[i].bus_prot_set,
++		pd->data->bp_cfg[i].bus_prot_set_clr_mask);
++	/*
++	 * Undo the steps already taken (and this one): the domain stays on
++	 * and its masters must keep their path to the bus.
++	 */
++	for (; i >= 0; i--) {
++		const struct scpsys_bus_prot_data *bpd = &pd->data->bp_cfg[i];
++
++		if ((bpd->flags & BUS_PROT_IGNORE_SUBCLK) !=
++		    (flags & BUS_PROT_IGNORE_SUBCLK))
++			continue;
++		if (bpd->flags & BUS_PROT_INVERTED)
++			scpsys_bus_protect_set(pd, bpd);
++		else
++			scpsys_bus_protect_clear(pd, bpd);
++	}
++	return ret;
+ }
+ 
+ static int scpsys_bus_protect_disable(struct scpsys_domain *pd, u8 flags)
+@@ -797,8 +819,12 @@ static int scpsys_power_off_internal(struct scpsys_domain *pd)
+ 			return ret;
+ 	} else if (!MTK_SCPD_CAPS(pd, MTK_SCPD_SIMPLE_PWRSEQ)) {
+ 		ret = scpsys_sram_disable(pd);
+-		if (ret < 0)
++		if (ret < 0) {
++			/* the domain stays on: give its masters the bus back */
++			dev_err(scpsys->dev, "%s: SRAM power down failed\n", pd->genpd.name);
++			scpsys_bus_protect_disable(pd, 0);
+ 			return ret;
++		}
+ 	}
+ 
+ 	if (pd->data->ext_buck_iso_offs && MTK_SCPD_CAPS(pd, MTK_SCPD_EXT_BUCK_ISO))

@@ -1,0 +1,16 @@
+diff --git a/drivers/gpu/drm/panfrost/panfrost_devfreq.c b/drivers/gpu/drm/panfrost/panfrost_devfreq.c
+index 74b31c777..04f279558 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_devfreq.c
++++ b/drivers/gpu/drm/panfrost/panfrost_devfreq.c
+@@ -241,6 +241,11 @@ int panfrost_devfreq_init(struct panfrost_device *pfdev)
+ 	}
+ 	pfdevfreq->devfreq = devfreq;
+ 
++	/* follow OPPs that SVS disables for its init at Vboot */
++	ret = devm_devfreq_register_opp_notifier(dev, devfreq);
++	if (ret)
++		DRM_DEV_INFO(dev, "Failed to register OPP notifier\n");
++
+ 	cooling = devfreq_cooling_em_register(devfreq, NULL);
+ 	if (IS_ERR(cooling))
+ 		DRM_DEV_INFO(dev, "Failed to register cooling device\n");

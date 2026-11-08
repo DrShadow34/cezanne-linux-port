@@ -1,0 +1,107 @@
+usb: mtu3: optional MAC-level VBUS force (mediatek,force-vbus)
+
+cezanne senses VBUS in the charger IC; without VBUS_FRC_EN|VBUS_ON the
+MAC enumerates on EP0 but bulk QMU transfers never complete.
+diff --git a/drivers/usb/mtu3/mtu3.h b/drivers/usb/mtu3/mtu3.h
+index ba5a63669..ea94df6bf 100644
+--- a/drivers/usb/mtu3/mtu3.h
++++ b/drivers/usb/mtu3/mtu3.h
+@@ -266,6 +266,8 @@ struct ssusb_mtk {
+ 	int u3_ports;
+ 	int u2p_dis_msk;
+ 	int u3p_dis_msk;
++	bool force_vbus;
++	bool kept_powered;
+ 	struct dentry *dbgfs_root;
+ 	/* usb wakeup for host mode */
+ 	bool uwk_en;
+diff --git a/drivers/usb/mtu3/mtu3_core.c b/drivers/usb/mtu3/mtu3_core.c
+index a40bf5bad..0d3ca1123 100644
+--- a/drivers/usb/mtu3/mtu3_core.c
++++ b/drivers/usb/mtu3/mtu3_core.c
+@@ -659,8 +659,11 @@ static void mtu3_regs_init(struct mtu3 *mtu)
+ 
+ 	/* U2/U3 detected by HW */
+ 	mtu3_writel(mbase, U3D_DEVICE_CONF, 0);
+-	/* vbus detected by HW */
+-	mtu3_clrbits(mbase, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++	/* vbus detected by HW, unless the board senses it elsewhere */
++	if (mtu->ssusb->force_vbus)
++		mtu3_setbits(mbase, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++	else
++		mtu3_clrbits(mbase, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
+ 	/* use new QMU format when HW version >= 0x1003 */
+ 	if (mtu->gen2cp)
+ 		mtu3_writel(mbase, U3D_QFCR, ~0x0);
+@@ -1048,6 +1051,10 @@ int ssusb_gadget_suspend(struct ssusb_mtk *ssusb, pm_message_t msg)
+ 	mtu3_dev_suspend(mtu);
+ 	synchronize_irq(mtu->irq);
+ 
++	/* a forced VBUS keeps the MAC awake and the IP never reaches sleep */
++	if (ssusb->force_vbus && !PMSG_IS_AUTO(msg))
++		mtu3_clrbits(mtu->mac_base, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++
+ 	return 0;
+ }
+ 
+@@ -1058,6 +1065,9 @@ int ssusb_gadget_resume(struct ssusb_mtk *ssusb, pm_message_t msg)
+ 	if (!mtu->gadget_driver)
+ 		return 0;
+ 
++	if (ssusb->force_vbus && !PMSG_IS_AUTO(msg))
++		mtu3_setbits(mtu->mac_base, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);
++
+ 	mtu3_dev_resume(mtu);
+ 
+ 	/* Restore soft connect for system resume */
+diff --git a/drivers/usb/mtu3/mtu3_plat.c b/drivers/usb/mtu3/mtu3_plat.c
+index b4f4c776a..a25a416ef 100644
+--- a/drivers/usb/mtu3/mtu3_plat.c
++++ b/drivers/usb/mtu3/mtu3_plat.c
+@@ -12,6 +12,7 @@
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+ #include <linux/platform_device.h>
++#include <linux/suspend.h>
+ #include <linux/pm_wakeirq.h>
+ #include <linux/reset.h>
+ 
+@@ -272,6 +273,7 @@ static int get_ssusb_rscs(struct platform_device *pdev, struct ssusb_mtk *ssusb)
+ 		ssusb->dr_mode = USB_DR_MODE_OTG;
+ 
+ 	of_property_read_u32(node, "mediatek,u3p-dis-msk", &ssusb->u3p_dis_msk);
++	ssusb->force_vbus = of_property_read_bool(node, "mediatek,force-vbus");
+ 
+ 	if (ssusb->dr_mode == USB_DR_MODE_PERIPHERAL)
+ 		goto out;
+@@ -539,6 +541,18 @@ static int mtu3_suspend_common(struct device *dev, pm_message_t msg)
+ 	}
+ 
+ 	ret = wait_for_ip_sleep(ssusb);
++	/*
++	 * Boards sensing VBUS outside the PHY: with a cable in, the IP never
++	 * reports sleep, and gating its clocks then hangs the bus. Undo the
++	 * gadget suspend and leave the controller powered (s2idle only).
++	 */
++	if (ret && ssusb->force_vbus && !PMSG_IS_AUTO(msg) &&
++	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
++		dev_info(dev, "IP busy with VBUS present, staying powered\n");
++		resume_ip_and_ports(ssusb, msg);
++		ssusb->kept_powered = true;
++		return 0;
++	}
+ 	if (ret)
+ 		goto sleep_err;
+ 
+@@ -561,6 +575,11 @@ static int mtu3_resume_common(struct device *dev, pm_message_t msg)
+ 
+ 	dev_dbg(dev, "%s\n", __func__);
+ 
++	if (ssusb->kept_powered) {
++		ssusb->kept_powered = false;
++		return 0;
++	}
++
+ 	ssusb_wakeup_set(ssusb, false);
+ 	ret = clk_bulk_prepare_enable(BULK_CLKS_CNT, ssusb->clks);
+ 	if (ret)

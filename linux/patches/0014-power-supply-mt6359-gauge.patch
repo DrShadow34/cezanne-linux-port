@@ -1,0 +1,622 @@
+diff --git a/drivers/mfd/mt6397-core.c b/drivers/mfd/mt6397-core.c
+index 9ec951996..4e279a915 100644
+--- a/drivers/mfd/mt6397-core.c
++++ b/drivers/mfd/mt6397-core.c
+@@ -237,6 +237,10 @@ static const struct mfd_cell mt6359_devs[] = {
+ 		.name = "mt6359-auxadc",
+ 		.of_compatible = "mediatek,mt6359-auxadc"
+ 	},
++	{
++		.name = "mt6359-gauge",
++		.of_compatible = "mediatek,mt6359-gauge"
++	},
+ 	{ .name = "mt6359-regulator", },
+ 	{
+ 		.name = "mt6359-rtc",
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index b89ef40df..9c79823c5 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -705,6 +705,13 @@ config CHARGER_MP2629
+ 	  Battery charger. This driver provides Battery charger power management
+ 	  functions on the systems.
+ 
++config BATTERY_MT6359
++	tristate "MediaTek MT6359 fuel gauge"
++	depends on MFD_MT6397 && MEDIATEK_MT6359_AUXADC
++	help
++	  Say Y here to report the battery state from the coulomb counter
++	  of the MediaTek MT6359 PMIC.
++
+ config CHARGER_MT6360
+ 	tristate "Mediatek MT6360 Charger Driver"
+ 	depends on MFD_MT6360
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index f3c0d1006..dbeafa919 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -92,6 +92,7 @@ obj-$(CONFIG_CHARGER_MAX8971)	+= max8971_charger.o
+ obj-$(CONFIG_CHARGER_MAX8997)	+= max8997_charger.o
+ obj-$(CONFIG_CHARGER_MAX8998)	+= max8998_charger.o
+ obj-$(CONFIG_CHARGER_MP2629)	+= mp2629_charger.o
++obj-$(CONFIG_BATTERY_MT6359)	+= mt6359-gauge.o
+ obj-$(CONFIG_CHARGER_MT6360)	+= mt6360_charger.o
+ obj-$(CONFIG_CHARGER_MT6370)	+= mt6370-charger.o
+ obj-$(CONFIG_CHARGER_QCOM_SMBB)	+= qcom_smbb.o
+diff --git a/drivers/power/supply/mt6359-gauge.c b/drivers/power/supply/mt6359-gauge.c
+new file mode 100644
+index 000000000..530922a71
+--- /dev/null
++++ b/drivers/power/supply/mt6359-gauge.c
+@@ -0,0 +1,571 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MediaTek MT6359 fuel gauge (battery power supply).
++ *
++ * The MT6359 has a coulomb counter on the battery sense resistor (FGADC).
++ * This driver reads the instantaneous current and the accumulated charge
++ * from it, and battery voltage plus NTC temperature from the AUXADC.
++ *
++ * State of charge is a much simpler scheme than the vendor "GM3.0"
++ * daemon: it starts from the open-circuit voltage (IR compensated through
++ * the battery profile resistance) and then integrates the coulomb counter.
++ * A slow OCV correction keeps it from drifting. The profile is the vendor
++ * one for 25 degrees C (rows of DOD in 0.1 mAh, OCV in 0.1 mV and
++ * resistance in 0.1 mOhm).
++ *
++ * Register layout and units from the MediaTek 4.14 BSP (mt6359_gauge.c,
++ * mtk_battery.c); 5 mOhm sense resistor, as on all boards the BSP knows.
++ */
++#include <linux/delay.h>
++#include <linux/devm-helpers.h>
++#include <linux/iio/consumer.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++#define MT6359_FGADC_CON0		0x0d08
++#define MT6359_FG_ON			BIT(0)
++#define MT6359_FGADC_CON1		0x0d0a
++#define MT6359_FG_SW_READ_PRE		BIT(0)
++#define MT6359_FG_SW_CLEAR		BIT(3)
++#define MT6359_FG_LATCHDATA_ST		BIT(15)
++#define MT6359_FGADC_CAR_CON0		0x0d16
++#define MT6359_FGADC_CAR_CON1		0x0d18
++#define MT6359_FGADC_CUR_CON0		0x0d8a
++
++/* one FG_CURRENT LSB is 610.352 uA, one FG_CAR LSB 0.085 uAh (5 mOhm) */
++#define MT6359_CUR_LSB_NA		610352
++#define MT6359_CAR_LSB_NAH		85
++
++/* AUXADC full scale is 1.8 V; BATADC is 15 bit, BAT_TEMP and VBIF 12 bit */
++#define AUXADC_VREF_MV			1800
++
++/* 100 kOhm NTC on a 100 kOhm pull-up from VBIF (2.8 V) */
++#define NTC_PULLUP_OHM			100000
++/* sense resistor plus NTC trace, seen in series with the NTC (mOhm) */
++#define NTC_COMP_MOHM			10
++
++#define GAUGE_INTERVAL			(10 * HZ)
++/* weight of the OCV estimate per update: 1/32, about 5 min time constant */
++#define OCV_CORR_SHIFT			5
++#define OCV_CORR_MAX_UA			1000000
++
++#define CHG_TEMP_HOT			500
++#define CHG_TEMP_HOT_RESUME		470
++#define CHG_TEMP_COLD			0
++#define CHG_TEMP_COLD_RESUME		20
++
++static const struct {
++	int temp;	/* degrees C */
++	int ohm;
++} ntc_table[] = {
++	{ -40, 4251000 }, { -35, 3005000 }, { -30, 2149000 }, { -25, 1554000 },
++	{ -20, 1135000 }, { -15, 837800 }, { -10, 624100 }, { -5, 469100 },
++	{ 0, 355600 }, { 5, 271800 }, { 10, 209400 }, { 15, 162500 },
++	{ 20, 127000 }, { 25, 100000 }, { 30, 79230 }, { 35, 63180 },
++	{ 40, 50680 }, { 45, 40900 }, { 50, 33190 }, { 55, 27090 },
++	{ 60, 22220 }, { 65, 18320 }, { 70, 15180 },
++};
++
++struct mt6359_gauge_row {
++	u32 dod;	/* 0.1 mAh */
++	u32 ocv;	/* 0.1 mV */
++	u32 r;		/* 0.1 mOhm */
++};
++
++struct mt6359_gauge {
++	struct device *dev;
++	struct regmap *regmap;
++	struct iio_channel *vbat_chan;
++	struct iio_channel *temp_chan;
++	struct iio_channel *vbif_chan;
++	struct power_supply *psy;
++	struct power_supply *chg;
++	struct delayed_work work;
++	struct mutex lock;
++
++	const struct mt6359_gauge_row *prof;
++	int prof_rows;
++	s64 qmax;		/* uAh, full profile range */
++	s64 q_empty;		/* uAh remaining at the empty voltage */
++	s64 q_full;		/* uAh remaining at the full (100 %) point */
++	u32 design_uah;
++
++	bool valid;
++	s32 car_last;
++	s64 car_total;		/* uAh since probe */
++	s64 q;			/* uAh remaining */
++	int volt_uv;
++	int ocv_uv;
++	int curr_ua;
++	int temp;		/* 0.1 degrees C */
++	int capacity;
++	int status;
++	bool chg_inhibit;
++};
++
++static int lerp(int x, int x0, int x1, int y0, int y1)
++{
++	if (x1 == x0)
++		return y0;
++	return y0 + (s64)(x - x0) * (y1 - y0) / (x1 - x0);
++}
++
++/* remaining charge (uAh) for an open-circuit voltage */
++static s64 gauge_ocv_to_q(struct mt6359_gauge *g, int ocv_uv)
++{
++	const struct mt6359_gauge_row *p = g->prof;
++	int v = ocv_uv / 100, i;
++
++	if (v >= p[0].ocv)
++		return g->qmax;
++	for (i = 1; i < g->prof_rows; i++) {
++		if (v >= p[i].ocv)
++			return g->qmax - 100LL * lerp(v, p[i - 1].ocv, p[i].ocv,
++						      p[i - 1].dod, p[i].dod);
++	}
++	return 0;
++}
++
++/* battery resistance (uOhm) at a given remaining charge */
++static int gauge_q_to_r(struct mt6359_gauge *g, s64 q)
++{
++	const struct mt6359_gauge_row *p = g->prof;
++	int dod = (g->qmax - q) / 100, i;
++
++	for (i = 1; i < g->prof_rows; i++) {
++		if (dod <= p[i].dod)
++			return 100 * lerp(dod, p[i - 1].dod, p[i].dod,
++					  p[i - 1].r, p[i].r);
++	}
++	return 100 * p[g->prof_rows - 1].r;
++}
++
++static int gauge_latch(struct mt6359_gauge *g, s16 *cur, s32 *car)
++{
++	struct regmap *map = g->regmap;
++	unsigned int st, lo, hi, c;
++	int ret;
++
++	regmap_set_bits(map, MT6359_FGADC_CON1, MT6359_FG_SW_READ_PRE);
++	ret = regmap_read_poll_timeout(map, MT6359_FGADC_CON1, st,
++				       st & MT6359_FG_LATCHDATA_ST, 100, 20000);
++	if (!ret) {
++		regmap_read(map, MT6359_FGADC_CUR_CON0, &c);
++		regmap_read(map, MT6359_FGADC_CAR_CON0, &lo);
++		regmap_read(map, MT6359_FGADC_CAR_CON1, &hi);
++		*cur = (s16)c;
++		*car = (s32)((hi << 16) | (lo & 0xffff));
++	}
++
++	regmap_set_bits(map, MT6359_FGADC_CON1, MT6359_FG_SW_CLEAR);
++	regmap_clear_bits(map, MT6359_FGADC_CON1, MT6359_FG_SW_READ_PRE);
++	regmap_read_poll_timeout(map, MT6359_FGADC_CON1, st,
++				 !(st & MT6359_FG_LATCHDATA_ST), 100, 20000);
++	regmap_clear_bits(map, MT6359_FGADC_CON1, MT6359_FG_SW_CLEAR);
++
++	return ret;
++}
++
++static int gauge_adc_mv(struct iio_channel *chan, int num, int den, int bits)
++{
++	int raw, ret;
++
++	ret = iio_read_channel_raw(chan, &raw);
++	if (ret < 0)
++		return ret;
++	return ((s64)raw * AUXADC_VREF_MV * num / den) >> bits;
++}
++
++static int gauge_read_temp(struct mt6359_gauge *g, int curr_ua, int *temp)
++{
++	int vt, vbif, ohm, i;
++
++	vt = gauge_adc_mv(g->temp_chan, 5, 2, 12);
++	if (vt < 0)
++		return vt;
++	vbif = gauge_adc_mv(g->vbif_chan, 5, 2, 12);
++	if (vbif < 0)
++		return vbif;
++
++	/* drop across the sense path shifts the NTC ground */
++	vt -= curr_ua / 1000 * NTC_COMP_MOHM / 1000;
++	if (vt <= 0 || vt >= vbif)
++		return -ERANGE;
++	ohm = (s64)NTC_PULLUP_OHM * vt / (vbif - vt);
++
++	if (ohm >= ntc_table[0].ohm) {
++		*temp = ntc_table[0].temp * 10;
++		return 0;
++	}
++	for (i = 1; i < ARRAY_SIZE(ntc_table); i++) {
++		if (ohm >= ntc_table[i].ohm) {
++			*temp = lerp(ohm, ntc_table[i - 1].ohm, ntc_table[i].ohm,
++				     ntc_table[i - 1].temp * 10,
++				     ntc_table[i].temp * 10);
++			return 0;
++		}
++	}
++	*temp = ntc_table[ARRAY_SIZE(ntc_table) - 1].temp * 10;
++	return 0;
++}
++
++static int gauge_charger_prop(struct mt6359_gauge *g,
++			      enum power_supply_property psp, int *val)
++{
++	union power_supply_propval pv;
++	int ret;
++
++	if (!g->chg) {
++		g->chg = devm_power_supply_get_by_reference(g->dev,
++							    "power-supplies");
++		if (IS_ERR_OR_NULL(g->chg)) {
++			g->chg = NULL;
++			return -ENODEV;
++		}
++	}
++	ret = power_supply_get_property(g->chg, psp, &pv);
++	if (!ret)
++		*val = pv.intval;
++	return ret;
++}
++
++/* stop drawing from the charger outside the safe battery temperature */
++static void gauge_charge_guard(struct mt6359_gauge *g, bool online)
++{
++	union power_supply_propval pv;
++	bool inhibit = g->chg_inhibit;
++
++	if (!g->chg)
++		return;
++	if (g->temp >= CHG_TEMP_HOT || g->temp < CHG_TEMP_COLD)
++		inhibit = true;
++	else if (g->temp <= CHG_TEMP_HOT_RESUME && g->temp >= CHG_TEMP_COLD_RESUME)
++		inhibit = false;
++	if (!online || inhibit == g->chg_inhibit)
++		return;
++
++	pv.intval = !inhibit;
++	if (!power_supply_set_property(g->chg, POWER_SUPPLY_PROP_ONLINE, &pv)) {
++		g->chg_inhibit = inhibit;
++		dev_warn(g->dev, "battery at %d.%d C, charging %s\n",
++			 g->temp / 10, abs(g->temp % 10),
++			 inhibit ? "suspended" : "resumed");
++	}
++}
++
++/* returns true when capacity or status changed */
++static bool gauge_update(struct mt6359_gauge *g)
++{
++	int vbat, temp, r, online = 0, cap, status;
++	s64 q_ocv;
++	s16 cur;
++	s32 car;
++
++	if (gauge_latch(g, &cur, &car)) {
++		dev_warn_ratelimited(g->dev, "FG latch timeout\n");
++		return false;
++	}
++	vbat = gauge_adc_mv(g->vbat_chan, 7, 2, 15);
++	if (vbat < 0)
++		return false;
++
++	g->curr_ua = div_s64((s64)cur * MT6359_CUR_LSB_NA, 1000);
++	g->volt_uv = vbat * 1000;
++	if (!gauge_read_temp(g, g->curr_ua, &temp))
++		g->temp = temp;
++
++	r = gauge_q_to_r(g, g->valid ? g->q : gauge_ocv_to_q(g, g->volt_uv));
++	g->ocv_uv = g->volt_uv - div_s64((s64)g->curr_ua * r, 1000000);
++	q_ocv = gauge_ocv_to_q(g, g->ocv_uv);
++
++	if (!g->valid) {
++		g->q = q_ocv;
++		g->valid = true;
++	} else {
++		s64 dq = div_s64((s64)(car - g->car_last) * MT6359_CAR_LSB_NAH, 1000);
++
++		g->car_total += dq;
++		g->q += dq;
++		if (abs(g->curr_ua) < OCV_CORR_MAX_UA)
++			g->q += (q_ocv - g->q) >> OCV_CORR_SHIFT;
++	}
++	g->car_last = car;
++
++	gauge_charger_prop(g, POWER_SUPPLY_PROP_ONLINE, &online);
++	gauge_charge_guard(g, online);
++
++	/*
++	 * The charger's own "done" is not trusted for the charge level: on a
++	 * 500 mA port the system load pulls the charge current under the
++	 * termination current long before the battery is full.
++	 */
++	g->q = clamp_t(s64, g->q, 0, g->qmax);
++
++	cap = DIV_ROUND_CLOSEST_ULL(100 * max_t(s64, g->q - g->q_empty, 0),
++				    g->q_full - g->q_empty);
++	cap = min(cap, 100);
++
++	if (!online)
++		status = POWER_SUPPLY_STATUS_DISCHARGING;
++	else if (cap == 100)
++		status = POWER_SUPPLY_STATUS_FULL;
++	else if (g->curr_ua > 0)
++		status = POWER_SUPPLY_STATUS_CHARGING;
++	else
++		status = POWER_SUPPLY_STATUS_NOT_CHARGING;
++
++	if (cap == g->capacity && status == g->status)
++		return false;
++	g->capacity = cap;
++	g->status = status;
++	return true;
++}
++
++static void gauge_work(struct work_struct *work)
++{
++	struct mt6359_gauge *g = container_of(work, struct mt6359_gauge,
++					      work.work);
++
++	bool changed;
++
++	mutex_lock(&g->lock);
++	changed = gauge_update(g);
++	mutex_unlock(&g->lock);
++	if (changed)
++		power_supply_changed(g->psy);
++	queue_delayed_work(system_freezable_wq, &g->work, GAUGE_INTERVAL);
++}
++
++static int gauge_get_property(struct power_supply *psy,
++			      enum power_supply_property psp,
++			      union power_supply_propval *val)
++{
++	struct mt6359_gauge *g = power_supply_get_drvdata(psy);
++	int ret = 0;
++
++	mutex_lock(&g->lock);
++	if (!g->valid) {
++		mutex_unlock(&g->lock);
++		return -EAGAIN;
++	}
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = g->status;
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		if (g->temp >= CHG_TEMP_HOT)
++			val->intval = POWER_SUPPLY_HEALTH_OVERHEAT;
++		else if (g->temp < CHG_TEMP_COLD)
++			val->intval = POWER_SUPPLY_HEALTH_COLD;
++		else
++			val->intval = POWER_SUPPLY_HEALTH_GOOD;
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		break;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LIPO;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		val->intval = g->volt_uv;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
++		val->intval = g->ocv_uv;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		val->intval = g->curr_ua;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		val->intval = g->capacity;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
++		if (g->status == POWER_SUPPLY_STATUS_FULL)
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
++		else if (g->capacity <= 2)
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
++		else if (g->capacity <= 10)
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
++		else
++			val->intval = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = g->design_uah;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++		val->intval = g->q_full - g->q_empty;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_NOW:
++		val->intval = clamp_t(s64, g->q - g->q_empty, 0,
++				      g->q_full - g->q_empty);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
++		val->intval = g->car_total;
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		val->intval = g->temp;
++		break;
++	default:
++		ret = -EINVAL;
++	}
++	mutex_unlock(&g->lock);
++	return ret;
++}
++
++static void gauge_external_power_changed(struct power_supply *psy)
++{
++	struct mt6359_gauge *g = power_supply_get_drvdata(psy);
++
++	mod_delayed_work(system_freezable_wq, &g->work, HZ / 2);
++}
++
++static const enum power_supply_property gauge_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_OCV,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_CHARGE_NOW,
++	POWER_SUPPLY_PROP_CHARGE_COUNTER,
++	POWER_SUPPLY_PROP_TEMP,
++};
++
++static const struct power_supply_desc gauge_desc = {
++	.name = "battery",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = gauge_props,
++	.num_properties = ARRAY_SIZE(gauge_props),
++	.get_property = gauge_get_property,
++	.external_power_changed = gauge_external_power_changed,
++};
++
++static int gauge_parse_profile(struct mt6359_gauge *g)
++{
++	struct device_node *np = g->dev->of_node;
++	struct mt6359_gauge_row *prof;
++	u32 empty_mv, full_pct;
++	int n, i;
++
++	n = of_property_count_u32_elems(np, "mediatek,battery-profile");
++	if (n < 6 || n % 3)
++		return dev_err_probe(g->dev, -EINVAL, "bad battery profile\n");
++	prof = devm_kcalloc(g->dev, n / 3, sizeof(*prof), GFP_KERNEL);
++	if (!prof)
++		return -ENOMEM;
++	of_property_read_u32_array(np, "mediatek,battery-profile", (u32 *)prof, n);
++	g->prof = prof;
++	g->prof_rows = n / 3;
++
++	for (i = 1; i < g->prof_rows; i++) {
++		if (prof[i].dod <= prof[i - 1].dod || prof[i].ocv > prof[i - 1].ocv)
++			return dev_err_probe(g->dev, -EINVAL,
++					     "profile row %d not monotonic\n", i);
++	}
++	g->qmax = 100LL * prof[g->prof_rows - 1].dod;
++
++	if (of_property_read_u32(np, "mediatek,empty-microvolt", &empty_mv))
++		empty_mv = 3400000;
++	if (of_property_read_u32(np, "mediatek,full-percent", &full_pct))
++		full_pct = 100;
++	if (of_property_read_u32(np, "charge-full-design-microamp-hours",
++				 &g->design_uah))
++		g->design_uah = g->qmax;
++
++	g->q_empty = gauge_ocv_to_q(g, empty_mv);
++	g->q_full = div_s64(g->qmax * full_pct, 100);
++	if (g->q_full <= g->q_empty)
++		return dev_err_probe(g->dev, -EINVAL, "bad empty/full points\n");
++	return 0;
++}
++
++static int mt6359_gauge_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct power_supply_config cfg = {};
++	struct mt6359_gauge *g;
++	unsigned int con0;
++	int ret;
++
++	g = devm_kzalloc(dev, sizeof(*g), GFP_KERNEL);
++	if (!g)
++		return -ENOMEM;
++	g->dev = dev;
++	g->capacity = -1;
++	mutex_init(&g->lock);
++
++	/* PMIC wrapper regmap, parent of the MT6397 MFD */
++	g->regmap = dev_get_regmap(dev->parent->parent, NULL);
++	if (!g->regmap)
++		return dev_err_probe(dev, -ENODEV, "no regmap\n");
++
++	g->vbat_chan = devm_iio_channel_get(dev, "vbat");
++	if (IS_ERR(g->vbat_chan))
++		return dev_err_probe(dev, PTR_ERR(g->vbat_chan), "vbat channel\n");
++	g->temp_chan = devm_iio_channel_get(dev, "temp");
++	if (IS_ERR(g->temp_chan))
++		return dev_err_probe(dev, PTR_ERR(g->temp_chan), "temp channel\n");
++	g->vbif_chan = devm_iio_channel_get(dev, "vbif");
++	if (IS_ERR(g->vbif_chan))
++		return dev_err_probe(dev, PTR_ERR(g->vbif_chan), "vbif channel\n");
++
++	ret = gauge_parse_profile(g);
++	if (ret)
++		return ret;
++
++	/* the bootloader leaves the gauge running; never seen otherwise */
++	ret = regmap_read(g->regmap, MT6359_FGADC_CON0, &con0);
++	if (ret)
++		return ret;
++	if (!(con0 & MT6359_FG_ON))
++		return dev_err_probe(dev, -ENODEV, "fuel gauge is off\n");
++
++	mutex_lock(&g->lock);
++	gauge_update(g);
++	mutex_unlock(&g->lock);
++
++	ret = devm_delayed_work_autocancel(dev, &g->work, gauge_work);
++	if (ret)
++		return ret;
++
++	cfg.drv_data = g;
++	cfg.fwnode = dev_fwnode(dev);
++	g->psy = devm_power_supply_register(dev, &gauge_desc, &cfg);
++	if (IS_ERR(g->psy))
++		return dev_err_probe(dev, PTR_ERR(g->psy), "register\n");
++
++	queue_delayed_work(system_freezable_wq, &g->work, GAUGE_INTERVAL);
++
++	dev_info(dev, "%d mV, %d mA, %d.%d C, %d%%\n", g->volt_uv / 1000,
++		 g->curr_ua / 1000, g->temp / 10, abs(g->temp % 10),
++		 g->capacity);
++	return 0;
++}
++
++static const struct of_device_id mt6359_gauge_of_match[] = {
++	{ .compatible = "mediatek,mt6359-gauge" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt6359_gauge_of_match);
++
++static struct platform_driver mt6359_gauge_driver = {
++	.driver = {
++		.name = "mt6359-gauge",
++		.of_match_table = mt6359_gauge_of_match,
++	},
++	.probe = mt6359_gauge_probe,
++};
++module_platform_driver(mt6359_gauge_driver);
++
++MODULE_DESCRIPTION("MediaTek MT6359 fuel gauge driver");
++MODULE_LICENSE("GPL");

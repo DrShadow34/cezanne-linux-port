@@ -1,0 +1,2890 @@
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 6772b43..00f5f8b 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -10,6 +10,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <stdint.h>
+ 
+ #include "libcamera/internal/matrix.h"
+@@ -25,6 +26,17 @@ struct DebayerParams {
+ 	float gamma = 1.0;
+ 	float contrastExp = 1.0;
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
++
++	/* Lens shading: gain grid over the sensor, R G B per point */
++	static constexpr unsigned int kLscMaxPoints = 17 * 17;
++	unsigned int lscWidth = 0;
++	unsigned int lscHeight = 0;
++	std::array<float, kLscMaxPoints * 3> lscGains = {};
++
++	/* Distortion, output -> raw: see the Lens algorithm of the simple IPA */
++	bool distortion = false;
++	std::array<float, 4> distortionK = {};
++	std::array<float, 2> distortionCentre = {};
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index 4f72dce..810a3d9 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -23,6 +23,7 @@
+ #include <libcamera/base/thread.h>
+ 
+ #include <libcamera/geometry.h>
++#include <libcamera/transform.h>
+ #include <libcamera/pixel_format.h>
+ 
+ #include <libcamera/ipa/soft_ipa_interface.h>
+@@ -65,7 +66,10 @@ public:
+ 
+ 	int configure(const StreamConfiguration &inputCfg,
+ 		      const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-		      const ipa::soft::IPAConfigInfo &configInfo);
++		      const ipa::soft::IPAConfigInfo &configInfo,
++		      Transform transform = Transform::Identity);
++
++	bool supportsTransform(Transform t) const;
+ 
+ 	int exportBuffers(const Stream *stream, unsigned int count,
+ 			  std::vector<std::unique_ptr<FrameBuffer>> *buffers);
+@@ -87,6 +91,7 @@ public:
+ 	Signal<uint32_t, uint32_t> ispStatsReady;
+ 	Signal<uint32_t, const ControlList &> metadataReady;
+ 	Signal<const ControlList &> setSensorControls;
++	Signal<int32_t> setLensPosition;
+ 
+ private:
+ 	void saveIspParams();
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index d9d0d9b..17d827b 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -43,6 +43,47 @@ struct SwIspStats {
+ 	 * \brief A histogram of luminance values of all the sampled pixels
+ 	 */
+ 	Histogram yHistogram;
++	/**
++	 * \brief Number of sampled pixels with a colour channel at or near
++	 * the sensor's saturation level
++	 */
++	uint32_t clipped;
++
++	/**
++	 * \brief Size of the autofocus sharpness grid
++	 */
++	static constexpr unsigned int kAfGridWidth = 16;
++	static constexpr unsigned int kAfGridHeight = 12;
++	static constexpr unsigned int kAfGridSize = kAfGridWidth * kAfGridHeight;
++	/**
++	 * \brief True if afSharpness / afBrightness hold data for this frame
++	 */
++	bool afValid;
++	/**
++	 * \brief Per-tile sums of squared differences of horizontally
++	 * neighbouring same-colour pixels (sparse rows), row-major
++	 */
++	std::array<uint64_t, kAfGridSize> afSharpness;
++	/**
++	 * \brief Per-tile sums of the pixel values sampled for afSharpness
++	 */
++	std::array<uint64_t, kAfGridSize> afBrightness;
++
++	/**
++	 * \brief True if the awb* grid holds data for this frame
++	 */
++	bool awbValid;
++	/**
++	 * \brief Per-tile colour sums of unsaturated sampled 2x2 blocks (8-bit
++	 * values, black level included) over the same grid as autofocus
++	 */
++	std::array<uint32_t, kAfGridSize> awbR;
++	std::array<uint32_t, kAfGridSize> awbG;
++	std::array<uint32_t, kAfGridSize> awbB;
++	/**
++	 * \brief Per-tile number of blocks summed in awbR / awbG / awbB
++	 */
++	std::array<uint32_t, kAfGridSize> awbCount;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 5518709..709f8c9 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -58,6 +58,10 @@ public:
+ 	void finishFrame(uint32_t frame, uint32_t bufferId);
+ 	void processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuffer &input);
+ 
++	/* Autofocus sharpness grid on every frame (8-bit unpacked Bayer only) */
++	void setAfEnabled(bool enable) { afWanted_ = enable; }
++	bool afEnabled() const { return afWanted_ && afSupported_; }
++
+ 	void processLine0(uint32_t frame, unsigned int y, const uint8_t *src[], unsigned int statsBufferIndex = 0)
+ 	{
+ 		if (frame % kStatPerNumFrames)
+@@ -103,6 +107,12 @@ private:
+ 	void statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats);
+ 
+ 	void processBayerFrame2(MappedFrameBuffer &in);
++	void processAf(MappedFrameBuffer &in);
++	template<typename T>
++	void processAfT(MappedFrameBuffer &in);
++	void processAwbGrid(MappedFrameBuffer &in);
++	template<typename T>
++	void processAwbGridT(MappedFrameBuffer &in);
+ 
+ 	processFrameFn processFrame_;
+ 
+@@ -121,6 +131,13 @@ private:
+ 	unsigned int stride_;
+ 	unsigned int sumShift_;
+ 
++	bool afSupported_ = false;
++	/* autofocus / white balance grid: bits beyond 8 per pixel (0 or 2) */
++	unsigned int gridShift_ = 0;
++	bool afWanted_ = false;
++	/* 8-bit unpacked Bayer: red and blue offsets in a 2x2 block */
++	unsigned int redX_ = 0, redY_ = 0;
++
+ 	std::vector<SwIspStats> stats_;
+ 	SharedMemObject<SwIspStats> sharedStats_;
+ 	Benchmark bench_;
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index 77328c5..96b0c26 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -17,7 +17,8 @@ interface IPASoftInterface {
+ 	     libcamera.SharedFD fdStats,
+ 	     libcamera.SharedFD fdParams,
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+-	     libcamera.ControlInfoMap sensorControls)
++	     libcamera.ControlInfoMap sensorControls,
++	     libcamera.ControlInfoMap lensControls)
+ 		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
+ 	start() => (int32 ret);
+ 	stop();
+@@ -35,4 +36,5 @@ interface IPASoftEventInterface {
+ 	setSensorControls(libcamera.ControlList sensorControls);
+ 	setIspParams();
+ 	metadataReady(uint32 frame, libcamera.ControlList metadata);
++	setLensPosition(int32 position);
+ };
+diff --git a/src/gstreamer/gstlibcamerapool.cpp b/src/gstreamer/gstlibcamerapool.cpp
+index 8278144..34226da 100644
+--- a/src/gstreamer/gstlibcamerapool.cpp
++++ b/src/gstreamer/gstlibcamerapool.cpp
+@@ -48,6 +48,14 @@ gst_libcamera_pool_pop_buffer(GstLibcameraPool *self)
+ 	return buf;
+ }
+ 
++bool
++gst_libcamera_pool_is_empty(GstLibcameraPool *self)
++{
++	GLibLocker lock(GST_OBJECT(self));
++
++	return self->queue->empty();
++}
++
+ static GstFlowReturn
+ gst_libcamera_pool_acquire_buffer(GstBufferPool *pool, GstBuffer **buffer,
+ 				  [[maybe_unused]] GstBufferPoolAcquireParams *params)
+diff --git a/src/gstreamer/gstlibcamerapool.h b/src/gstreamer/gstlibcamerapool.h
+index 02ee4dd..0097f4a 100644
+--- a/src/gstreamer/gstlibcamerapool.h
++++ b/src/gstreamer/gstlibcamerapool.h
+@@ -26,4 +26,6 @@ GstLibcameraPool *gst_libcamera_pool_new(GstLibcameraAllocator *allocator,
+ 
+ libcamera::Stream *gst_libcamera_pool_get_stream(GstLibcameraPool *self);
+ 
++bool gst_libcamera_pool_is_empty(GstLibcameraPool *self);
++
+ libcamera::FrameBuffer *gst_libcamera_buffer_get_frame_buffer(GstBuffer *buffer);
+diff --git a/src/gstreamer/gstlibcamerasrc.cpp b/src/gstreamer/gstlibcamerasrc.cpp
+index 9061f91..9807e35 100644
+--- a/src/gstreamer/gstlibcamerasrc.cpp
++++ b/src/gstreamer/gstlibcamerasrc.cpp
+@@ -21,7 +21,9 @@
+ 
+ #include "gstlibcamerasrc.h"
+ 
++#include <algorithm>
+ #include <atomic>
++#include <deque>
+ #include <queue>
+ #include <tuple>
+ #include <utility>
+@@ -122,7 +124,7 @@ struct GstLibcameraSrcState {
+ 	 * gst_pad_query()).
+ 	 */
+ 	GMutex lock_;
+-	std::queue<std::unique_ptr<RequestWrap>> queuedRequests_;
++	std::deque<std::unique_ptr<RequestWrap>> queuedRequests_;
+ 	std::queue<std::unique_ptr<RequestWrap>> completedRequests_;
+ 
+ 	ControlList initControls_;
+@@ -186,9 +188,6 @@ int GstLibcameraSrcState::queueRequest()
+ 	if (!request)
+ 		return -ENOMEM;
+ 
+-	/* Apply controls */
+-	controls_.applyControls(request);
+-
+ 	std::unique_ptr<RequestWrap> wrap =
+ 		std::make_unique<RequestWrap>(std::move(request));
+ 
+@@ -212,10 +211,26 @@ int GstLibcameraSrcState::queueRequest()
+ 
+ 	GST_TRACE_OBJECT(src_, "Requesting buffers");
+ 
++	/*
++	 * Apply controls only now: a request dropped for lack of buffers
++	 * (-ENOBUFS, common while streaming) took the pending controls with it,
++	 * and a control set once (e.g. an autofocus window) was lost.
++	 */
++	controls_.applyControls(wrap->request_);
++
+ 	{
+ 		GLibLocker locker(&lock_);
+-		cam_->queueRequest(wrap->request_.get());
+-		queuedRequests_.push(std::move(wrap));
++		/*
++		 * A request the camera refuses (e.g. while it is being stopped
++		 * and restarted) never completes: tracking it would pair every
++		 * later completion with the wrong wrap.
++		 */
++		int ret = cam_->queueRequest(wrap->request_.get());
++		if (ret < 0) {
++			GST_WARNING_OBJECT(src_, "Failed to queue request: %d", ret);
++			return ret;
++		}
++		queuedRequests_.push_back(std::move(wrap));
+ 	}
+ 
+ 	/* The RequestWrap will be deleted in the completion handler. */
+@@ -232,14 +247,26 @@ GstLibcameraSrcState::requestCompleted(Request *request)
+ 	{
+ 		GLibLocker locker(&lock_);
+ 
+-		controls_.readMetadata(request);
++		/*
++		 * Normally the front one. Never take a different wrap: freeing
++		 * a request the camera still owns corrupts the heap.
++		 */
++		auto it = std::find_if(queuedRequests_.begin(), queuedRequests_.end(),
++				       [request](const auto &w) {
++					       return w->request_.get() == request;
++				       });
++		if (it == queuedRequests_.end()) {
++			GST_WARNING_OBJECT(src_, "Completed request %p is not ours", request);
++			return;
++		}
++		if (it != queuedRequests_.begin())
++			GST_WARNING_OBJECT(src_, "Request completed out of order");
++		wrap = std::move(*it);
++		queuedRequests_.erase(it);
+ 
+-		wrap = std::move(queuedRequests_.front());
+-		queuedRequests_.pop();
++		controls_.readMetadata(request);
+ 	}
+ 
+-	g_return_if_fail(wrap->request_.get() == request);
+-
+ 	if ((request->status() == Request::RequestCancelled)) {
+ 		GST_DEBUG_OBJECT(src_, "Request was cancelled");
+ 		return;
+@@ -962,6 +989,14 @@ gst_libcamera_src_close(GstLibcameraSrc *self)
+ 
+ 	state->config_.reset();
+ 
++	/*
++	 * The Camera outlives this element's use of it (the camera manager is
++	 * shared): without this, reopening a camera (switching back to it)
++	 * adds a second handler, and every completed request is handled twice
++	 * - freed by the first call, used by the second.
++	 */
++	state->cam_->requestCompleted.disconnect(state, &GstLibcameraSrcState::requestCompleted);
++
+ 	ret = state->cam_->release();
+ 	if (ret) {
+ 		GST_ELEMENT_WARNING(self, RESOURCE, BUSY,
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 9457d62..fd4012d 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -642,6 +642,18 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx477", CameraSensorHelperImx477)
+ 
++class CameraSensorHelperImx682 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx682()
++	{
++		/* 64 at 10 bits */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 0, 1024, -1, 1024 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx682", CameraSensorHelperImx682)
++
+ class CameraSensorHelperImx678 : public CameraSensorHelper
+ {
+ public:
+@@ -665,6 +677,54 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx708", CameraSensorHelperImx708)
+ 
++class CameraSensorHelperS5k3t2 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k3t2()
++	{
++		/* 64 at 10 bits; analogue gain code 32 = 1x, linear */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k3t2", CameraSensorHelperS5k3t2)
++
++class CameraSensorHelperS5k5e9 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k5e9()
++	{
++		/* 64 at 10 bits; analogue gain code 32 = 1x, linear */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k5e9", CameraSensorHelperS5k5e9)
++
++class CameraSensorHelperHi1337 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperHi1337()
++	{
++		/* 64 at 10 bits; analogue gain = (code + 16) / 16 */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 16, 0, 16 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("hi1337", CameraSensorHelperHi1337)
++
++class CameraSensorHelperOv02b1b : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv02b1b()
++	{
++		/* 64 at 10 bits; analogue gain code 16 = 1x, linear */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 16 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov02b1b", CameraSensorHelperOv02b1b)
++
+ class CameraSensorHelperOv01a10 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/ipa/simple/algorithms/adjust.cpp b/src/ipa/simple/algorithms/adjust.cpp
+index 8bf39c4..4faa649 100644
+--- a/src/ipa/simple/algorithms/adjust.cpp
++++ b/src/ipa/simple/algorithms/adjust.cpp
+@@ -24,12 +24,15 @@ constexpr float kDefaultSaturation = 1.0f;
+ 
+ LOG_DEFINE_CATEGORY(IPASoftAdjust)
+ 
+-int Adjust::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningData)
++int Adjust::init(IPAContext &context, const ValueNode &tuningData)
+ {
++	defaultGamma_ = tuningData["gamma"].get<float>(kDefaultGamma);
++	defaultContrast_ = tuningData["contrast"].get<float>(kDefaultContrast);
++
+ 	context.ctrlMap[&controls::Gamma] =
+-		ControlInfo(0.1f, 10.0f, kDefaultGamma);
++		ControlInfo(0.1f, 10.0f, defaultGamma_);
+ 	context.ctrlMap[&controls::Contrast] =
+-		ControlInfo(0.0f, 2.0f, kDefaultContrast);
++		ControlInfo(0.0f, 2.0f, defaultContrast_);
+ 	if (context.ccmEnabled)
+ 		context.ctrlMap[&controls::Saturation] =
+ 			ControlInfo(0.0f, 2.0f, kDefaultSaturation);
+@@ -39,8 +42,10 @@ int Adjust::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningDa
+ int Adjust::configure(IPAContext &context,
+ 		      [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+-	context.activeState.knobs.gamma = kDefaultGamma;
+-	context.activeState.knobs.contrast = std::optional<float>();
++	context.activeState.knobs.gamma = defaultGamma_;
++	context.activeState.knobs.contrast = defaultContrast_ != kDefaultContrast
++						     ? std::optional<float>(defaultContrast_)
++						     : std::optional<float>();
+ 	context.activeState.knobs.saturation = std::optional<float>();
+ 
+ 	return 0;
+diff --git a/src/ipa/simple/algorithms/adjust.h b/src/ipa/simple/algorithms/adjust.h
+index 49c1f26..ad2a2d9 100644
+--- a/src/ipa/simple/algorithms/adjust.h
++++ b/src/ipa/simple/algorithms/adjust.h
+@@ -43,6 +43,10 @@ public:
+ 
+ private:
+ 	void applySaturation(Matrix<float, 3, 3> &ccm, float saturation);
++
++	/* the sensor's default gamma and contrast, from the tuning file */
++	float defaultGamma_ = kDefaultGamma;
++	float defaultContrast_ = 1.0f;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git a/src/ipa/simple/algorithms/af.cpp b/src/ipa/simple/algorithms/af.cpp
+new file mode 100644
+index 0000000..6e70d04
+--- /dev/null
++++ b/src/ipa/simple/algorithms/af.cpp
+@@ -0,0 +1,483 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Contrast-detection autofocus for the software ISP
++ *
++ * The statistics carry a grid of per-tile sharpness values (squared
++ * differences of neighbouring same-colour pixels) computed on every frame.
++ * A scan moves the lens over its whole range in coarse steps, stops once the
++ * sharpness has clearly passed a peak, then rescans around the best coarse
++ * position in fine steps.  Every lens move waits kSettleFrames frames before
++ * the next measurement: the move is issued after a frame was processed, so
++ * the next frame is already being read out.
++ *
++ * The metric is normalised by the squared mean brightness of the metered
++ * tiles so that exposure changes during a scan do not look like focus
++ * changes.  Lens positions are reported in dioptres assuming a linear map of
++ * the VCM range to 0 .. kMaxDioptres (uncalibrated).
++ */
++
++#include "af.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <libcamera/base/log.h>
++
++#include <libcamera/control_ids.h>
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftAf)
++
++namespace {
++
++constexpr unsigned int kSettleFrames = 4;
++constexpr unsigned int kSettleFramesLong = 6;
++constexpr unsigned int kCoarseSteps = 16;
++constexpr unsigned int kFineDivider = 4;
++constexpr float kMaxDioptres = 12.0f;
++/* stop the coarse scan after this many steps below kDropRatio * best */
++constexpr unsigned int kDropSteps = 3;
++constexpr double kDropRatio = 0.6;
++/* a peak lower than this times the scan minimum: nothing to focus on */
++constexpr double kMinPeakRatio = 1.15;
++/* continuous mode: rescan after the metric stays this far off for a while */
++constexpr double kChangeRatio = 0.5;
++constexpr unsigned int kChangeFrames = 20;
++/* first scan after start: let the AGC converge */
++constexpr unsigned int kStartupFrames = 20;
++/* local search: a step this much below the best counts as past the peak */
++constexpr double kLocalDropRatio = 0.92;
++/*
++ * The AGC raising the gain during a scan raises the noise in the sharpness
++ * measure: a dim macro scan climbed with the gain (9.8x -> 16x) to the far
++ * end past the real peak, and the gain followed the lens (the magnified
++ * frame has more of a dark edge).  Scans start once exposure x gain held
++ * within kEvSteady for kEvStableFrames frames, and hold the AGC until done.
++ */
++constexpr double kEvSteady = 0.03;
++constexpr unsigned int kEvStableFrames = 4;
++constexpr unsigned int kEvMaxWaitFrames = 60;
++/* window below this share of the frame's average contrast: whole frame */
++constexpr double kMinWindowContrast = 0.25;
++
++} /* namespace */
++
++int Af::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningData)
++{
++	if (!context.lens.present) {
++		LOG(IPASoftAf, Info) << "No focus lens, autofocus disabled";
++		return 0;
++	}
++
++	min_ = context.lens.min;
++	max_ = context.lens.max;
++	step_ = std::max<int32_t>((max_ - min_) / kCoarseSteps, 1);
++
++	context.ctrlMap[&controls::AfMode] =
++		ControlInfo(controls::AfModeValues, controls::AfModeContinuous);
++	context.ctrlMap[&controls::AfTrigger] =
++		ControlInfo(controls::AfTriggerValues, controls::AfTriggerStart);
++	context.ctrlMap[&controls::AfMetering] =
++		ControlInfo(controls::AfMeteringValues, controls::AfMeteringAuto);
++	context.ctrlMap[&controls::AfWindows] =
++		ControlInfo(Rectangle{}, Rectangle(65535, 65535, 65535, 65535),
++			    Rectangle{});
++	context.ctrlMap[&controls::LensPosition] =
++		ControlInfo(0.0f, kMaxDioptres, dioptres(context.lens.def));
++
++	return 0;
++}
++
++int Af::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	if (!context.lens.present)
++		return 0;
++
++	sensorSize_ = context.sensorInfo.outputSize;
++	focusedValue_ = 0.0;
++	changedFrames_ = 0;
++
++	/* Same sensor mode (e.g. a still capture): keep the focus and mode */
++	if (context.configuration.keepState) {
++		/* frame numbers restart with the new session */
++		measureFrame_ = kSettleFramesLong;
++		return 0;
++	}
++
++	/* Platform default: continuous, the applications rarely ask for it */
++	mode_ = controls::AfModeContinuous;
++	windowsMetering_ = false;
++	windows_.clear();
++
++	context.activeState.af.position = context.lens.def;
++	context.activeState.af.dirty = true;
++	startScan(context);
++	measureFrame_ = kStartupFrames;
++
++	return 0;
++}
++
++void Af::queueRequest(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		      [[maybe_unused]] IPAFrameContext &frameContext,
++		      const ControlList &controls)
++{
++	if (!context.lens.present)
++		return;
++
++	const auto &mode = controls.get(controls::AfMode);
++	if (mode && *mode != mode_) {
++		mode_ = *mode;
++		LOG(IPASoftAf, Debug) << "AfMode " << mode_;
++		if (mode_ == controls::AfModeContinuous)
++			startScan(context);
++		else
++			phase_ = Phase::Idle;
++	}
++
++	bool refocus = false;
++	const auto &metering = controls.get(controls::AfMetering);
++	if (metering) {
++		bool windows = *metering == controls::AfMeteringWindows;
++		refocus |= windows != windowsMetering_;
++		windowsMetering_ = windows;
++	}
++
++	const auto &windows = controls.get(controls::AfWindows);
++	if (windows) {
++		std::vector<Rectangle> w(windows->begin(), windows->end());
++		refocus |= windowsMetering_ && w != windows_;
++		windows_ = std::move(w);
++		LOG(IPASoftAf, Debug) << "AfWindows " << windows_.size()
++				      << (windows_.empty() ? "" : " " + windows_[0].toString());
++	}
++
++	/* a new metering area in continuous mode: refocus there */
++	if (refocus && mode_ == controls::AfModeContinuous)
++		startLocalScan(context);
++
++	const auto &trigger = controls.get(controls::AfTrigger);
++	if (trigger && mode_ == controls::AfModeAuto) {
++		if (*trigger == controls::AfTriggerStart)
++			startScan(context);
++		else
++			phase_ = Phase::Idle;
++	}
++
++	const auto &lensPosition = controls.get(controls::LensPosition);
++	if (lensPosition && mode_ == controls::AfModeManual) {
++		context.activeState.af.position = position(*lensPosition);
++		context.activeState.af.dirty = true;
++	}
++}
++
++/* Sharpness of the metered tiles, normalised by their mean brightness */
++double Af::measure(const IPAContext &context, const SwIspStats *stats) const
++{
++	constexpr unsigned int gw = SwIspStats::kAfGridWidth;
++	constexpr unsigned int gh = SwIspStats::kAfGridHeight;
++	std::vector<bool> use(SwIspStats::kAfGridSize, false);
++	bool any = false;
++
++	if (windowsMetering_ && sensorSize_.width && sensorSize_.height) {
++		for (const Rectangle &r : windows_) {
++			if (r.width == 0 || r.height == 0)
++				continue;
++			int x0 = std::clamp<int>(r.x * gw / sensorSize_.width, 0, gw - 1);
++			int y0 = std::clamp<int>(r.y * gh / sensorSize_.height, 0, gh - 1);
++			int x1 = std::clamp<int>((r.x + r.width - 1) * gw / sensorSize_.width, 0, gw - 1);
++			int y1 = std::clamp<int>((r.y + r.height - 1) * gh / sensorSize_.height, 0, gh - 1);
++			for (int y = y0; y <= y1; y++)
++				for (int x = x0; x <= x1; x++)
++					use[y * gw + x] = any = true;
++		}
++	}
++	if (!any) {
++		/* centre third of the frame */
++		for (unsigned int y = gh / 3; y < gh - gh / 3; y++)
++			for (unsigned int x = gw / 3; x < gw - gw / 3; x++)
++				use[y * gw + x] = true;
++	}
++
++	double sharp = 0.0, bright = 0.0, allSharp = 0.0, allBright = 0.0;
++	unsigned int n = 0;
++	for (unsigned int i = 0; i < SwIspStats::kAfGridSize; i++) {
++		allSharp += stats->afSharpness[i];
++		allBright += stats->afBrightness[i];
++		if (!use[i])
++			continue;
++		sharp += stats->afSharpness[i];
++		bright += stats->afBrightness[i];
++		n++;
++	}
++	/*
++	 * A window with hardly any structure (plain surface in the middle of
++	 * a close-up) measures noise: use the whole frame then.
++	 */
++	if (sharp < allSharp * n / SwIspStats::kAfGridSize * kMinWindowContrast) {
++		sharp = allSharp;
++		bright = allBright;
++	}
++	if (bright <= 0.0)
++		return 0.0;
++
++	/* relative within a scan: sharpness over the squared brightness */
++	(void)context;
++	return sharp / (bright * bright) * 1e12;
++}
++
++void Af::startScan(IPAContext &context)
++{
++	phase_ = Phase::Coarse;
++	bestValue_ = 0.0;
++	bestPos_ = min_;
++	lastValue_ = 0.0;
++	minValue_ = 0.0;
++	drops_ = 0;
++	local_ = false;
++	remeasure_ = true;
++	target_ = min_;
++	measureFrame_ = 0;
++	context.activeState.af.position = target_;
++	context.activeState.af.dirty = true;
++	LOG(IPASoftAf, Debug) << "Scan start";
++}
++
++/*
++ * A new metering window (tap to focus) usually needs a small lens move: climb
++ * from the current position, towards infinity first, turn round if the first
++ * step loses sharpness, and finish with a short fine scan.  About a third of a
++ * full scan.
++ */
++void Af::startLocalScan(IPAContext &context)
++{
++	phase_ = Phase::Local;
++	bestValue_ = 0.0;
++	lastValue_ = 0.0;
++	minValue_ = 0.0;
++	drops_ = 0;
++	localDrops_ = 0;
++	local_ = true;
++	reversed_ = false;
++	dir_ = 1;
++	target_ = std::clamp(context.activeState.af.position, min_, max_);
++	localStart_ = target_;
++	bestPos_ = target_;
++	measureFrame_ = 0;
++	LOG(IPASoftAf, Debug) << "Local scan from " << target_;
++}
++
++void Af::moveTo(IPAContext &context, int32_t pos, uint32_t frame)
++{
++	pos = std::clamp(pos, min_, max_);
++	/* large jumps ring for a while */
++	unsigned int settle = std::abs(pos - target_) > 2 * step_
++			      ? kSettleFramesLong : kSettleFrames;
++	target_ = pos;
++	context.activeState.af.position = target_;
++	context.activeState.af.dirty = true;
++	measureFrame_ = frame + settle;
++}
++
++void Af::scanStep(IPAContext &context, uint32_t frame, double value)
++{
++	/*
++	 * The scan's first position comes from wherever the lens was (or from
++	 * a lens just powered up with the stream): its first sample can still
++	 * show the old position, sharper or not, and once won the scan with
++	 * 2.6 times the value of every later sample.  Measure it again.
++	 */
++	if (remeasure_) {
++		remeasure_ = false;
++		moveTo(context, target_, frame);
++		return;
++	}
++
++	if (minValue_ == 0.0 || value < minValue_)
++		minValue_ = value;
++	if (value > bestValue_) {
++		bestValue_ = value;
++		bestPos_ = target_;
++		drops_ = 0;
++	} else if (value < bestValue_ * kDropRatio &&
++		   !(phase_ == Phase::Fine && target_ < bestPos_)) {
++		/* the fine scan climbs towards the coarse peak first */
++		drops_++;
++	}
++	lastValue_ = value;
++
++	if (phase_ == Phase::Local) {
++		bool worse = value < bestValue_ * kLocalDropRatio;
++		if (worse)
++			localDrops_++;
++		else if (target_ == bestPos_)
++			localDrops_ = 0;
++		bool edge = (dir_ > 0 && target_ >= max_) ||
++			    (dir_ < 0 && target_ <= min_);
++		bool firstStepWorse = worse && bestPos_ == localStart_ && !reversed_;
++		if (!(localDrops_ >= 2 || edge || firstStepWorse)) {
++			moveTo(context, target_ + dir_ * step_, frame);
++			return;
++		}
++		if (!reversed_ && bestPos_ == localStart_) {
++			reversed_ = true;
++			dir_ = -dir_;
++			localDrops_ = 0;
++			moveTo(context, localStart_ + dir_ * step_, frame);
++			return;
++		}
++		/* fine scan over half a coarse step either side of the peak */
++		phase_ = Phase::Fine;
++		fineEnd_ = std::min(bestPos_ + step_ / 2, max_);
++		drops_ = 0;
++		moveTo(context, std::max(bestPos_ - step_ / 2, min_), frame);
++		return;
++	}
++
++	if (phase_ == Phase::Coarse) {
++		bool done = target_ >= max_ || drops_ >= kDropSteps;
++		if (!done) {
++			moveTo(context, target_ + step_, frame);
++			return;
++		}
++		/* fine scan around the coarse peak */
++		phase_ = Phase::Fine;
++		fineEnd_ = std::min(bestPos_ + step_, max_);
++		drops_ = 0;
++		moveTo(context, std::max(bestPos_ - step_, min_), frame);
++		return;
++	}
++
++	/* Fine */
++	int32_t fineStep = std::max<int32_t>(step_ / kFineDivider, 1);
++	if (target_ < fineEnd_ && drops_ < kDropSteps) {
++		moveTo(context, target_ + fineStep, frame);
++		return;
++	}
++
++	/* a local search only sees the top of the curve: no contrast check */
++	phase_ = local_ || bestValue_ >= minValue_ * kMinPeakRatio
++		 ? Phase::Focused : Phase::Failed;
++	/* reference: measured once the lens is back at the peak */
++	focusedValue_ = 0.0;
++	changedFrames_ = 0;
++	moveTo(context, bestPos_, frame);
++	LOG(IPASoftAf, Debug)
++		<< (phase_ == Phase::Focused ? "Focused" : "Failed")
++		<< " at " << bestPos_ << ", value " << bestValue_;
++}
++
++void Af::process(IPAContext &context, const uint32_t frame,
++		 IPAFrameContext &frameContext,
++		 const SwIspStats *stats, ControlList &metadata)
++{
++	if (!context.lens.present)
++		return;
++
++	/* a scan started from a request: let the first lens move settle */
++	if (measureFrame_ == 0 &&
++	    (phase_ == Phase::Local || phase_ == Phase::Coarse || phase_ == Phase::Fine))
++		measureFrame_ = frame + kSettleFramesLong;
++
++	double ev = frameContext.sensor.exposure * frameContext.sensor.gain;
++	if (lastEv_ > 0.0 && std::abs(ev / lastEv_ - 1.0) <= kEvSteady)
++		evStableFrames_++;
++	else
++		evStableFrames_ = 0;
++	lastEv_ = ev;
++
++	bool scanning = phase_ == Phase::Local || phase_ == Phase::Coarse ||
++			phase_ == Phase::Fine;
++	if (scanning && frame >= measureFrame_ && bestValue_ == 0.0 &&
++	    !context.activeState.af.holdAgc) {
++		/* wait for the AGC (bounded) before the first step, then hold it */
++		if (evStableFrames_ < kEvStableFrames &&
++		    frame < measureFrame_ + kEvMaxWaitFrames &&
++		    ++evWaitFrames_ < kEvMaxWaitFrames)
++			return;
++		evWaitFrames_ = 0;
++		context.activeState.af.holdAgc = true;
++	}
++	if (!scanning)
++		context.activeState.af.holdAgc = false;
++
++	if (stats->afValid && frame >= measureFrame_) {
++		double value = measure(context, stats);
++
++		LOG(IPASoftAf, Debug)
++			<< "pos " << target_ << " value " << value
++			<< " exposure " << frameContext.sensor.exposure
++			<< " gain " << frameContext.sensor.gain;
++
++		switch (phase_) {
++		case Phase::Local:
++		case Phase::Coarse:
++		case Phase::Fine:
++			scanStep(context, frame, value);
++			break;
++		case Phase::Focused:
++		case Phase::Failed:
++			if (mode_ != controls::AfModeContinuous)
++				break;
++			if (focusedValue_ == 0.0) {
++				focusedValue_ = value;
++				break;
++			}
++			/* refocus once the scene has changed for a while */
++			if (focusedValue_ > 0.0 &&
++			    (value < focusedValue_ * kChangeRatio ||
++			     value > focusedValue_ / kChangeRatio))
++				changedFrames_++;
++			else
++				changedFrames_ = 0;
++			if (changedFrames_ >= kChangeFrames) {
++				startScan(context);
++				measureFrame_ = frame + kSettleFramesLong;
++			}
++			break;
++		case Phase::Idle:
++			break;
++		}
++	}
++
++	int32_t state;
++	switch (phase_) {
++	case Phase::Local:
++	case Phase::Coarse:
++	case Phase::Fine:
++		state = controls::AfStateScanning;
++		break;
++	case Phase::Focused:
++		state = controls::AfStateFocused;
++		break;
++	case Phase::Failed:
++		state = controls::AfStateFailed;
++		break;
++	default:
++		state = controls::AfStateIdle;
++		break;
++	}
++	metadata.set(controls::AfState, state);
++	metadata.set(controls::LensPosition, dioptres(context.activeState.af.position));
++}
++
++float Af::dioptres(int32_t pos) const
++{
++	if (max_ <= min_)
++		return 0.0f;
++	return static_cast<float>(pos - min_) * kMaxDioptres / (max_ - min_);
++}
++
++int32_t Af::position(float d) const
++{
++	d = std::clamp(d, 0.0f, kMaxDioptres);
++	return min_ + static_cast<int32_t>(std::lround(d * (max_ - min_) / kMaxDioptres));
++}
++
++REGISTER_IPA_ALGORITHM(Af, "Af")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/af.h b/src/ipa/simple/algorithms/af.h
+new file mode 100644
+index 0000000..3690e91
+--- /dev/null
++++ b/src/ipa/simple/algorithms/af.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Contrast-detection autofocus for the software ISP
++ */
++
++#pragma once
++
++#include <vector>
++
++#include <libcamera/geometry.h>
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Af : public Algorithm
++{
++public:
++	Af() = default;
++	~Af() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
++	void queueRequest(IPAContext &context, const uint32_t frame,
++			  IPAFrameContext &frameContext,
++			  const ControlList &controls) override;
++	void process(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     const SwIspStats *stats,
++		     ControlList &metadata) override;
++
++private:
++	enum class Phase {
++		Idle,		/* manual, or auto mode before a trigger */
++		Local,		/* hill climb from the current position */
++		Coarse,		/* full range, large steps */
++		Fine,		/* around the coarse peak, small steps */
++		Focused,
++		Failed,
++	};
++
++	double measure(const IPAContext &context, const SwIspStats *stats) const;
++	void startScan(IPAContext &context);
++	void startLocalScan(IPAContext &context);
++	void moveTo(IPAContext &context, int32_t position, uint32_t frame);
++	void scanStep(IPAContext &context, uint32_t frame, double value);
++	float dioptres(int32_t position) const;
++	int32_t position(float dioptres) const;
++
++	int32_t min_ = 0;
++	int32_t max_ = 0;
++	int32_t step_ = 0;
++
++	int mode_ = 0;
++	bool windowsMetering_ = false;
++	std::vector<Rectangle> windows_;
++	Size sensorSize_;
++
++	Phase phase_ = Phase::Idle;
++	int32_t target_ = 0;
++	uint32_t measureFrame_ = 0;	/* first frame taken with the lens settled */
++	int32_t bestPos_ = 0;
++	double bestValue_ = 0.0;
++	double lastValue_ = 0.0;
++	/* exposure x gain: scans wait for the AGC and restart when it moves */
++	double lastEv_ = 0.0;
++	unsigned int evStableFrames_ = 0;
++	unsigned int evWaitFrames_ = 0;
++	double minValue_ = 0.0;
++	unsigned int drops_ = 0;
++	int32_t fineEnd_ = 0;
++	int32_t localStart_ = 0;
++	int32_t dir_ = 1;
++	bool reversed_ = false;
++	bool remeasure_ = false;
++	bool local_ = false;	/* the scan started as Local */
++	unsigned int localDrops_ = 0;
++
++	double focusedValue_ = 0.0;	/* continuous mode: reference after a scan */
++	unsigned int changedFrames_ = 0;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index a13a755..e967586 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -59,19 +59,46 @@ static constexpr float kExpProportionalGain = 0.04;
+  * Maximum multiplicative step per frame, to bound the correction when the
+  * scene changes dramatically.
+  */
+-static constexpr float kExpMaxStep = 0.15;
++static constexpr float kExpMaxStep = 0.3;
++
++/*
++ * Highlight protection: when more than kClippedMax of the sampled pixels
++ * have a saturated colour channel, lower the exposure even though the mean
++ * is on target (bright screens and lamps in a dark room), down to an MSV of
++ * kExposureMinMSV. Between kClippedHold and kClippedMax the exposure is not
++ * raised, for hysteresis.
++ */
++static constexpr float kClippedMax = 0.02;
++static constexpr float kClippedHold = 0.01;
++static constexpr float kExposureMinMSV = 1.4;
++/* stay this far below the exposure that clipped; forget it below kClippedGone */
++static constexpr double kCeilingMargin = 0.93;
++static constexpr float kClippedGone = 0.001;
+ 
+ Agc::Agc()
+ {
+ }
+ 
+-void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
++void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			 double exposureMSV, double clipped)
+ {
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
+ 
+ 	double error = kExposureOptimal - exposureMSV;
+ 
++	const double product = exposure * again;
++	if (clipped > kClippedMax && exposureMSV > kExposureMinMSV) {
++		error = std::min(error, -std::min(clipped / kClippedMax, 2.5));
++		ceiling_ = product;
++	} else if (clipped > kClippedHold && error > 0) {
++		error = 0;
++	} else if (clipped < kClippedGone) {
++		ceiling_ = 0.0;
++	}
++	if (error > 0 && ceiling_ > 0 && product >= ceiling_ * kCeilingMargin)
++		error = 0;
++
+ 	if (std::abs(error) <= kExposureSatisfactory)
+ 		return;
+ 
+@@ -80,7 +107,9 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 	 * determines the direction: positive error means too dark (increase),
+ 	 * negative means too bright (decrease).
+ 	 */
+-	float step = std::clamp(static_cast<float>(error) * kExpProportionalGain,
++	/* larger steps when far off (a torch switched on), gentle near */
++	float step = std::clamp(static_cast<float>(error) * kExpProportionalGain *
++					(1.0f + std::abs(static_cast<float>(error))),
+ 				-kExpMaxStep, kExpMaxStep);
+ 	float factor = 1.0f + step;
+ 
+@@ -115,11 +144,21 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 	again = std::clamp(again, context.configuration.agc.againMin,
+ 			   context.configuration.agc.againMax);
+ 
++	/* an increase stops short of the ceiling */
++	const double limit = ceiling_ * kCeilingMargin;
++	if (factor > 1.0f && ceiling_ > 0 && exposure * again > limit) {
++		if (again > context.configuration.agc.again10)
++			again = std::max(limit / exposure, context.configuration.agc.againMin);
++		else
++			exposure = std::max(static_cast<int32_t>(limit / again),
++					    context.configuration.agc.exposureMin);
++	}
++
+ 	context.activeState.agc.exposure = exposure;
+ 	context.activeState.agc.again = again;
+ 
+ 	LOG(IPASoftExposure, Debug)
+-		<< "exposureMSV " << exposureMSV
++		<< "exposureMSV " << exposureMSV << " clipped " << clipped
+ 		<< " error " << error << " factor " << factor
+ 		<< " exp " << exposure << " again " << again;
+ }
+@@ -145,10 +184,11 @@ void Agc::process(IPAContext &context,
+ 		context.activeState.agc.valid = true;
+ 	}
+ 
+-	if (!stats->valid) {
++	if (!stats->valid || context.activeState.af.holdAgc) {
+ 		/*
+ 		 * Use the new exposure and gain values calculated the last time
+-		 * there were valid stats.
++		 * there were valid stats; or the autofocus is scanning, and
++		 * an exposure change would change the noise in its measure.
+ 		 */
+ 		frameContext.sensor.exposure = context.activeState.agc.exposure;
+ 		frameContext.sensor.gain = context.activeState.agc.again;
+@@ -188,8 +228,16 @@ void Agc::process(IPAContext &context,
+ 		num += exposureBins[i] * (i + 1);
+ 	}
+ 
+-	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+-	updateExposure(context, frameContext, exposureMSV);
++	/* black frame (e.g. right after a restart): nothing to measure */
++	if (denom == 0)
++		return;
++
++	float exposureMSV = static_cast<float>(num) / denom;
++	unsigned int samples = 0;
++	for (uint32_t v : histogram)
++		samples += v;
++	double clipped = samples ? static_cast<double>(stats->clipped) / samples : 0.0;
++	updateExposure(context, frameContext, exposureMSV, clipped);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+diff --git a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+index 112d9f5..8d383e0 100644
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -25,7 +25,15 @@ public:
+ 		     ControlList &metadata) override;
+ 
+ private:
+-	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			    double exposureMSV, double clipped);
++
++	/*
++	 * Exposure x gain at which highlights last clipped too much: the
++	 * exposure does not climb back over it (no pumping between the two),
++	 * until clipping is gone.
++	 */
++	double ceiling_ = 0.0;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git a/src/ipa/simple/algorithms/awb.cpp b/src/ipa/simple/algorithms/awb.cpp
+index 05155c8..3e7496d 100644
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "awb.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <numeric>
+ #include <stdint.h>
+ 
+@@ -23,11 +25,53 @@ LOG_DEFINE_CATEGORY(IPASoftAwb)
+ 
+ namespace ipa::soft::algorithms {
+ 
++namespace {
++
++/* width of a tile's vote around the locus, in log(R/G), log(B/G) */
++constexpr double kVoteSigma = 0.08;
++/* share of each new estimate in the gains (stats come every 4 frames) */
++constexpr double kSmoothing = 0.3;
++/* tiles darker than this (8-bit, black removed) do not vote */
++constexpr double kMinTileGreen = 3.0;
++
++} /* namespace */
++
++int Awb::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	/*
++	 * Optional locus: the raw R/G and B/G of a neutral surface under
++	 * illuminants of known colour temperature.  With it, every tile of the
++	 * statistics grid votes for the illuminants under which it would be
++	 * neutral, brighter tiles more (white-patch prior), instead of the
++	 * whole frame averaging to grey.
++	 */
++	locus_.clear();
++	for (const auto &p : tuningData["locus"].asList()) {
++		auto ct = p["ct"].get<double>();
++		auto r = p["r"].get<double>();
++		auto b = p["b"].get<double>();
++		if (!ct || !r || !b || *r <= 0 || *b <= 0) {
++			LOG(IPASoftAwb, Error) << "Invalid locus point";
++			return -EINVAL;
++		}
++		locus_.push_back({ *ct, *r, *b });
++	}
++	std::sort(locus_.begin(), locus_.end(),
++		  [](const LocusPoint &a, const LocusPoint &b) { return a.ct < b.ct; });
++	if (locus_.size() == 1) {
++		LOG(IPASoftAwb, Error) << "The locus needs at least two points";
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+ 	auto &gains = context.activeState.awb.gains;
+ 	gains = { { 1.0, 1.0, 1.0 } };
++	converged_ = converged_ && context.configuration.keepState;
+ 
+ 	return 0;
+ }
+@@ -43,6 +87,95 @@ void Awb::prepare(IPAContext &context,
+ 	params->gains = gains;
+ }
+ 
++bool Awb::locusAwb(IPAContext &context, const SwIspStats *stats)
++{
++	constexpr unsigned int kTiles = SwIspStats::kAfGridSize;
++	const double black = context.activeState.blc.level;
++	double lr[kTiles], lb[kTiles], weight[kTiles];
++	unsigned int n = 0;
++	double totalWeight = 0;
++	double sumR = 0, sumG = 0, sumB = 0;
++
++	for (unsigned int i = 0; i < kTiles; i++) {
++		double count = stats->awbCount[i];
++		if (count < 16)
++			continue;
++		double r = stats->awbR[i] / count - black;
++		double g = stats->awbG[i] / (2 * count) - black;
++		double b = stats->awbB[i] / count - black;
++		if (g < kMinTileGreen || r <= 0 || b <= 0)
++			continue;
++		lr[n] = std::log(r / g);
++		lb[n] = std::log(b / g);
++		weight[n] = count * g * g;
++		totalWeight += weight[n];
++		sumR += count * r;
++		sumG += count * g;
++		sumB += count * b;
++		n++;
++	}
++	if (!n)
++		return false;
++
++	/* walk the locus in small steps, keep the best supported point */
++	const double k = 1 / (2 * kVoteSigma * kVoteSigma);
++	double bestScore = -1, bestCt = 0, bestR = 0, bestB = 0;
++	for (unsigned int s = 0; s + 1 < locus_.size(); s++) {
++		const LocusPoint &p0 = locus_[s], &p1 = locus_[s + 1];
++		for (double ct = p0.ct; ct < p1.ct || (s + 2 == locus_.size() && ct <= p1.ct); ct += 50) {
++			double f = (ct - p0.ct) / (p1.ct - p0.ct);
++			double cr = std::log(p0.r + f * (p1.r - p0.r));
++			double cb = std::log(p0.b + f * (p1.b - p0.b));
++			double score = 0;
++			for (unsigned int i = 0; i < n; i++) {
++				double dr = lr[i] - cr, db = lb[i] - cb;
++				score += weight[i] * std::exp(-(dr * dr + db * db) * k);
++			}
++			if (score > bestScore) {
++				bestScore = score;
++				bestCt = ct;
++				bestR = cr;
++				bestB = cb;
++			}
++		}
++	}
++
++	/* nothing looks neutral under any of the illuminants */
++	if (bestScore < 1e-3 * totalWeight)
++		return false;
++
++	/*
++	 * Follow the supporting tiles halfway off the locus, for illuminants
++	 * slightly greener or more magenta than calibrated.  Then meet grey
++	 * world (of the unsaturated tiles) halfway: the vote alone leans to the
++	 * brightest surfaces, grey world to the dominant colour of the scene.
++	 */
++	double sr = 0, sb = 0, sw = 0;
++	for (unsigned int i = 0; i < n; i++) {
++		double dr = lr[i] - bestR, db = lb[i] - bestB;
++		double w = weight[i] * std::exp(-(dr * dr + db * db) * k);
++		sr += w * lr[i];
++		sb += w * lb[i];
++		sw += w;
++	}
++	double wr = ((bestR + sr / sw) / 2 + std::log(sumR / sumG)) / 2;
++	double wb = ((bestB + sb / sw) / 2 + std::log(sumB / sumG)) / 2;
++
++	auto &gains = context.activeState.awb.gains;
++	double gr = -wr, gb = -wb;	/* log gains */
++	if (converged_) {
++		gr = std::log(gains.r()) + kSmoothing * (gr - std::log(gains.r()));
++		gb = std::log(gains.b()) + kSmoothing * (gb - std::log(gains.b()));
++	}
++	gains = { { static_cast<float>(std::exp(gr)), 1.0f,
++		    static_cast<float>(std::exp(gb)) } };
++	converged_ = true;
++
++	/* the temperature for the colour matrices: nearest locus point */
++	context.activeState.awb.temperatureK = bestCt;
++	return true;
++}
++
+ void Awb::process(IPAContext &context,
+ 		  [[maybe_unused]] const uint32_t frame,
+ 		  IPAFrameContext &frameContext,
+@@ -58,6 +191,21 @@ void Awb::process(IPAContext &context,
+ 	if (!stats->valid)
+ 		return;
+ 
++	if (!locus_.empty()) {
++		/*
++		 * Keep the last gains when nothing can be measured: the first
++		 * frames after a restart are black.
++		 */
++		if (stats->awbValid && locusAwb(context, stats)) {
++			LOG(IPASoftAwb, Debug)
++				<< "locus gains " << context.activeState.awb.gains
++				<< "; temperature " << context.activeState.awb.temperatureK;
++		}
++		metadata.set(controls::ColourTemperature,
++			     context.activeState.awb.temperatureK);
++		return;
++	}
++
+ 	/*
+ 	 * Black level must be subtracted to get the correct AWB ratios, they
+ 	 * would be off if they were computed from the whole brightness range
+@@ -73,6 +221,10 @@ void Awb::process(IPAContext &context,
+ 	 */
+ 	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
+ 
++	/* black frame (e.g. right after a restart): keep the gains */
++	if (sum.g() < nPixels)
++		return;
++
+ 	/*
+ 	 * Calculate red and blue gains for AWB.
+ 	 * Clamp max gain at 4.0, this also avoids 0 division.
+diff --git a/src/ipa/simple/algorithms/awb.h b/src/ipa/simple/algorithms/awb.h
+index ad993f3..802b6bb 100644
+--- a/src/ipa/simple/algorithms/awb.h
++++ b/src/ipa/simple/algorithms/awb.h
+@@ -7,6 +7,8 @@
+ 
+ #pragma once
+ 
++#include <vector>
++
+ #include "algorithm.h"
+ 
+ namespace libcamera {
+@@ -19,6 +21,7 @@ public:
+ 	Awb() = default;
+ 	~Awb() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context,
+ 		     const uint32_t frame,
+@@ -29,6 +32,19 @@ public:
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
++
++private:
++	struct LocusPoint {
++		double ct;
++		double r;	/* raw R/G of a neutral surface */
++		double b;	/* raw B/G of a neutral surface */
++	};
++
++	bool locusAwb(IPAContext &context, const SwIspStats *stats);
++
++	/* neutral surfaces under the illuminants of interest, by ct */
++	std::vector<LocusPoint> locus_;
++	bool converged_ = false;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git a/src/ipa/simple/algorithms/lens.cpp b/src/ipa/simple/algorithms/lens.cpp
+new file mode 100644
+index 0000000..721c5a7
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lens.cpp
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Lens corrections: shading (vignetting, colour shading) and distortion
++ *
++ * Tuning:
++ *   - Lens:
++ *       shading:            # gain grid over the sensor (corners included),
++ *         width: 15         # row-major, R G B per point, applied after the
++ *         height: 15        # black level
++ *         gains: [ ... ]
++ *       distortion:         # output -> raw, in sensor pixels:
++ *         k: [ k1, .. k4 ]  # raw = c + (u - c) (1 + k1 r^2 + .. + k4 r^8),
++ *         centre: [ x, y ]  # r = |u - c| / half the sensor diagonal
++ *
++ * On the Redmi K30 Ultra the shading grids are the per-unit calibration in
++ * the camera modules' EEPROMs, and the ultrawide's distortion comes from a
++ * checkerboard calibration (mainline/camera/tools).
++ */
++
++#include "lens.h"
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftLens)
++
++int Lens::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	const ValueNode &shading = tuningData["shading"];
++	if (shading.isDictionary()) {
++		auto w = shading["width"].get<unsigned int>();
++		auto h = shading["height"].get<unsigned int>();
++		const auto &gains = shading["gains"].asList();
++		std::vector<float> values;
++		for (const auto &g : gains)
++			values.push_back(g.get<float>().value_or(1.0f));
++		if (!w || !h || *w * *h > DebayerParams::kLscMaxPoints ||
++		    values.size() != *w * *h * 3) {
++			LOG(IPASoftLens, Error) << "Invalid shading grid";
++			return -EINVAL;
++		}
++		shadingWidth_ = *w;
++		shadingHeight_ = *h;
++		std::copy(values.begin(), values.end(), shadingGains_.begin());
++		shading_ = true;
++	}
++
++	const ValueNode &distortion = tuningData["distortion"];
++	if (distortion.isDictionary()) {
++		unsigned int i = 0;
++		for (const auto &k : distortion["k"].asList())
++			if (i < distortionK_.size())
++				distortionK_[i++] = k.get<float>().value_or(0.0f);
++		i = 0;
++		for (const auto &c : distortion["centre"].asList())
++			if (i < distortionCentre_.size())
++				distortionCentre_[i++] = c.get<float>().value_or(0.0f);
++		distortion_ = true;
++	}
++
++	LOG(IPASoftLens, Debug)
++		<< "shading " << shading_ << " (" << shadingWidth_ << "x"
++		<< shadingHeight_ << "), distortion " << distortion_;
++	return 0;
++}
++
++void Lens::prepare([[maybe_unused]] IPAContext &context,
++		   [[maybe_unused]] const uint32_t frame,
++		   [[maybe_unused]] IPAFrameContext &frameContext,
++		   DebayerParams *params)
++{
++	params->lscWidth = shading_ ? shadingWidth_ : 0;
++	params->lscHeight = shading_ ? shadingHeight_ : 0;
++	if (shading_)
++		std::copy(shadingGains_.begin(),
++			  shadingGains_.begin() + shadingWidth_ * shadingHeight_ * 3,
++			  params->lscGains.begin());
++
++	params->distortion = distortion_;
++	params->distortionK = distortionK_;
++	params->distortionCentre = distortionCentre_;
++}
++
++REGISTER_IPA_ALGORITHM(Lens, "Lens")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/lens.h b/src/ipa/simple/algorithms/lens.h
+new file mode 100644
+index 0000000..10ebb55
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lens.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Lens corrections: shading (vignetting, colour shading) and distortion
++ */
++
++#pragma once
++
++#include <array>
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Lens : public Algorithm
++{
++public:
++	Lens() = default;
++	~Lens() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	void prepare(IPAContext &context,
++		     const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	bool shading_ = false;
++	unsigned int shadingWidth_ = 0, shadingHeight_ = 0;
++	std::array<float, DebayerParams::kLscMaxPoints * 3> shadingGains_ = {};
++
++	bool distortion_ = false;
++	std::array<float, 4> distortionK_ = {};
++	std::array<float, 2> distortionCentre_ = {};
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/meson.build b/src/ipa/simple/algorithms/meson.build
+index 73c6372..ba1ca6d 100644
+--- a/src/ipa/simple/algorithms/meson.build
++++ b/src/ipa/simple/algorithms/meson.build
+@@ -2,8 +2,10 @@
+ 
+ soft_simple_ipa_algorithms = files([
+     'adjust.cpp',
++    'af.cpp',
+     'awb.cpp',
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'lens.cpp',
+ ])
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 8ccfacb..0796dca 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -33,9 +33,17 @@ struct IPASessionConfiguration {
+ 	struct {
+ 		std::optional<uint8_t> level;
+ 	} black;
++	/* same sensor mode as the previous session: keep converged state */
++	bool keepState;
+ };
+ 
+ struct IPAActiveState {
++	struct {
++		int32_t position;	/* VCM code */
++		bool dirty;		/* to be sent to the lens */
++		bool holdAgc = false;	/* AGC frozen during a focus scan */
++	} af;
++
+ 	struct {
+ 		int32_t exposure;
+ 		double again;
+@@ -85,6 +93,10 @@ struct IPAContext {
+ 	}
+ 
+ 	IPACameraSensorInfo sensorInfo;
++	struct {
++		bool present = false;
++		int32_t min, max, def;
++	} lens;
+ 	IPASessionConfiguration configuration;
+ 	IPAActiveState activeState;
+ 	FCQueue<IPAFrameContext> frameContexts;
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 629e1a3..a334732 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -56,6 +56,7 @@ public:
+ 		 const SharedFD &fdParams,
+ 		 const IPACameraSensorInfo &sensorInfo,
+ 		 const ControlInfoMap &sensorControls,
++		 const ControlInfoMap &lensControls,
+ 		 ControlInfoMap *ipaControls,
+ 		 bool *ccmEnabled) override;
+ 	int configure(const IPAConfigInfo &configInfo) override;
+@@ -96,6 +97,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 			const SharedFD &fdParams,
+ 			const IPACameraSensorInfo &sensorInfo,
+ 			const ControlInfoMap &sensorControls,
++			const ControlInfoMap &lensControls,
+ 			ControlInfoMap *ipaControls,
+ 			bool *ccmEnabled)
+ {
+@@ -108,6 +110,14 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 
+ 	context_.sensorInfo = sensorInfo;
+ 
++	auto focus = lensControls.find(V4L2_CID_FOCUS_ABSOLUTE);
++	if (focus != lensControls.end()) {
++		context_.lens.present = true;
++		context_.lens.min = focus->second.min().get<int32_t>();
++		context_.lens.max = focus->second.max().get<int32_t>();
++		context_.lens.def = focus->second.def().get<int32_t>();
++	}
++
+ 	/* Load the tuning data file */
+ 	File file(settings.configurationFile);
+ 	if (!file.open(File::OpenModeFlag::ReadOnly)) {
+@@ -206,10 +216,23 @@ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ 	const ControlInfo &exposureInfo = sensorInfoMap_.find(V4L2_CID_EXPOSURE)->second;
+ 	const ControlInfo &gainInfo = sensorInfoMap_.find(V4L2_CID_ANALOGUE_GAIN)->second;
+ 
++	/*
++	 * A reconfiguration that keeps the sensor mode (only the output size
++	 * changes, e.g. from the preview to a still capture) carries over the
++	 * converged exposure, white balance and focus, so that the first
++	 * frames of the new session are usable.
++	 */
++	const IPAActiveState previous = context_.activeState;
++	const bool keepState =
++		previous.agc.valid &&
++		context_.configuration.agc.exposureMin == exposureInfo.min().get<int32_t>() &&
++		context_.configuration.agc.exposureMax == exposureInfo.max().get<int32_t>();
++
+ 	/* Clear the IPA context before the streaming session. */
+ 	context_.configuration = {};
+ 	context_.activeState = {};
+ 	context_.frameContexts.clear();
++	context_.configuration.keepState = keepState;
+ 
+ 	context_.configuration.agc.lineDuration =
+ 		context_.sensorInfo.minLineLength * 1.0s / context_.sensorInfo.pixelRate;
+@@ -255,6 +278,14 @@ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ 			return ret;
+ 	}
+ 
++	if (keepState) {
++		context_.activeState.agc = previous.agc;
++		context_.activeState.blc = previous.blc;
++		context_.activeState.awb = previous.awb;
++		context_.activeState.af = previous.af;
++		context_.activeState.af.dirty = true;
++	}
++
+ 	LOG(IPASoft, Info)
+ 		<< "Exposure " << context_.configuration.agc.exposureMin << "-"
+ 		<< context_.configuration.agc.exposureMax
+@@ -301,6 +332,18 @@ void IPASoftSimple::processStats(const uint32_t frame,
+ {
+ 	IPAFrameContext &frameContext = context_.frameContexts.get(frame);
+ 
++	/*
++	 * No sensor values for the frame (e.g. stats of the previous session
++	 * arriving around a stop/start when switching cameras): complete the
++	 * request without running the algorithms.
++	 */
++	if (sensorControls.get(V4L2_CID_EXPOSURE).type() != ControlTypeInteger32 ||
++	    sensorControls.get(V4L2_CID_ANALOGUE_GAIN).type() != ControlTypeInteger32) {
++		LOG(IPASoft, Warning) << "Frame " << frame << ": sensor controls missing";
++		metadataReady.emit(frame, ControlList(controls::controls));
++		return;
++	}
++
+ 	frameContext.sensor.exposure =
+ 		sensorControls.get(V4L2_CID_EXPOSURE).get<int32_t>();
+ 	int32_t again = sensorControls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
+@@ -311,11 +354,9 @@ void IPASoftSimple::processStats(const uint32_t frame,
+ 		algo->process(context_, frame, frameContext, stats_, metadata);
+ 	metadataReady.emit(frame, metadata);
+ 
+-	/* Sanity check */
+-	if (!sensorControls.contains(V4L2_CID_EXPOSURE) ||
+-	    !sensorControls.contains(V4L2_CID_ANALOGUE_GAIN)) {
+-		LOG(IPASoft, Error) << "Control(s) missing";
+-		return;
++	if (context_.lens.present && context_.activeState.af.dirty) {
++		context_.activeState.af.dirty = false;
++		setLensPosition.emit(context_.activeState.af.position);
+ 	}
+ 
+ 	ControlList ctrls(sensorInfoMap_);
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index e26f438..7c7ac9d 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <algorithm>
++#include <deque>
+ #include <iterator>
+ #include <list>
+ #include <map>
+@@ -34,6 +35,7 @@
+ 
+ #include "libcamera/internal/camera.h"
+ #include "libcamera/internal/camera_manager.h"
++#include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/camera_sensor_properties.h"
+ #include "libcamera/internal/converter.h"
+@@ -267,6 +269,12 @@ static const SimplePipelineInfo supportedDevices[] = {
+ 	{ "sun6i-csi", {}, false },
+ };
+ 
++/* width and height swapped (transposition) */
++static Size transposedSize(const Size &size)
++{
++	return { size.height, size.width };
++}
++
+ bool isRaw(const StreamConfiguration &cfg)
+ {
+ 	return libcamera::PixelFormatInfo::info(cfg.pixelFormat).colourEncoding ==
+@@ -354,7 +362,7 @@ public:
+ 		Request *request;
+ 		std::map<const Stream *, FrameBuffer *> outputs;
+ 	};
+-	std::queue<RequestOutputs> conversionQueue_;
++	std::deque<RequestOutputs> conversionQueue_;
+ 	bool useConversion_;
+ 
+ 	std::unique_ptr<Converter> converter_;
+@@ -388,6 +396,7 @@ public:
+ 
+ 	bool needConversion() const { return needConversion_; }
+ 	const Transform &combinedTransform() const { return combinedTransform_; }
++	const Transform &ispTransform() const { return ispTransform_; }
+ 
+ private:
+ 	static constexpr unsigned int kNumBuffersDefault = 4;
+@@ -404,6 +413,8 @@ private:
+ 	const SimpleCameraData::Configuration *pipeConfig_;
+ 	bool needConversion_;
+ 	Transform combinedTransform_;
++	/* rotation/flips done by the software ISP on processed streams */
++	Transform ispTransform_;
+ };
+ 
+ class SimplePipelineHandler : public PipelineHandler
+@@ -626,6 +637,11 @@ int SimpleCameraData::init()
+ 			swIsp_->ispStatsReady.connect(this, &SimpleCameraData::ispStatsReady);
+ 			swIsp_->metadataReady.connect(this, &SimpleCameraData::metadataReady);
+ 			swIsp_->setSensorControls.connect(this, &SimpleCameraData::setSensorControls);
++			swIsp_->setLensPosition.connect(this, [this](int32_t position) {
++				CameraLens *lens = sensor_->focusLens();
++				if (lens)
++					lens->setFocusPosition(position);
++			});
+ 		}
+ 	}
+ 
+@@ -885,9 +901,14 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 	 * point converting an erroneous buffer.
+ 	 */
+ 	if (buffer->metadata().status != FrameMetadata::FrameSuccess) {
+-		if (!useConversion_ || rawStream_) {
++		/*
++		 * A raw stream buffer belongs to a request; with the software
++		 * ISP the capture buffers can also be internal ones (no request,
++		 * e.g. cancelled when stopping), which take the conversion path.
++		 */
++		Request *request = buffer->request();
++		if (request && (!useConversion_ || rawStream_)) {
+ 			/* No conversion, just complete the request. */
+-			Request *request = buffer->request();
+ 			pipe->completeBuffer(request, buffer);
+ 			SimpleFrameInfo *info = frameInfo_.find(request->sequence());
+ 			if (info)
+@@ -895,6 +916,8 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 			tryCompleteRequest(request);
+ 			return;
+ 		}
++		if (!useConversion_)
++			return;
+ 
+ 		/*
+ 		 * The converter or Software ISP is in use. Requeue the internal
+@@ -907,14 +930,14 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 		if (conversionQueue_.empty())
+ 			return;
+ 
+-		const RequestOutputs &outputs = conversionQueue_.front();
++		RequestOutputs outputs = std::move(conversionQueue_.front());
++		conversionQueue_.pop_front();
+ 		for (auto &[stream, buf] : outputs.outputs)
+ 			pipe->completeBuffer(outputs.request, buf);
+ 		SimpleFrameInfo *info = frameInfo_.find(outputs.request->sequence());
+ 		if (info)
+ 			info->metadataRequired = false;
+ 		tryCompleteRequest(outputs.request);
+-		conversionQueue_.pop();
+ 
+ 		return;
+ 	}
+@@ -966,7 +989,7 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 			swIsp_->queueBuffers(request->sequence(), buffer,
+ 					     conversionQueue_.front().outputs);
+ 
+-		conversionQueue_.pop();
++		conversionQueue_.pop_front();
+ 		return;
+ 	}
+ 
+@@ -979,7 +1002,7 @@ void SimpleCameraData::clearIncompleteRequests()
+ {
+ 	while (!conversionQueue_.empty()) {
+ 		pipe()->cancelRequest(conversionQueue_.front().request);
+-		conversionQueue_.pop();
++		conversionQueue_.pop_front();
+ 	}
+ }
+ 
+@@ -997,6 +1020,16 @@ void SimpleCameraData::tryCompleteRequest(Request *request)
+ 	if (info->metadataRequired && !info->metadataProcessed)
+ 		return;
+ 
++	/*
++	 * A request can complete while still waiting for a capture buffer
++	 * (e.g. its raw buffer completed with an error when stopping): drop it
++	 * from the queue, or clearIncompleteRequests() completes it again
++	 * after the application freed it.
++	 */
++	std::erase_if(conversionQueue_, [request](const RequestOutputs &o) {
++		return o.request == request;
++	});
++
+ 	frameInfo_.destroy(info->frame);
+ 	pipe()->completeRequest(request);
+ }
+@@ -1143,9 +1176,31 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+ 
+ 	Orientation requestedOrientation = orientation;
+ 	combinedTransform_ = sensor->computeTransform(&orientation);
++
++	/*
++	 * What the sensor cannot do (a transposition for sensors mounted at 90
++	 * or 270 degrees, or flips without sensor flip controls), the software
++	 * ISP can do on processed streams.  A raw stream next to them stays in
++	 * the sensor orientation (properties::Rotation tells how to turn it).
++	 */
++	ispTransform_ = Transform::Identity;
++	if (orientation != requestedOrientation && data_->swIsp_) {
++		Transform remaining = requestedOrientation / orientation;
++
++		if (data_->swIsp_->supportsTransform(remaining)) {
++			ispTransform_ = remaining;
++			orientation = requestedOrientation;
++		}
++	}
+ 	if (orientation != requestedOrientation)
+ 		status = Adjusted;
+ 
++	/* processed sizes are checked in sensor orientation */
++	const bool ispTranspose = !!(ispTransform_ & Transform::Transpose);
++	auto toSensor = [ispTranspose](const Size &size) {
++		return ispTranspose ? transposedSize(size) : size;
++	};
++
+ 	/* Cap the number of entries to the available streams. */
+ 	if (config_.size() > data_->streams_.size()) {
+ 		config_.resize(data_->streams_.size());
+@@ -1159,7 +1214,7 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+ 		if (isRaw(cfg))
+ 			maxRawStreamSize.expandTo(cfg.size);
+ 		else
+-			maxProcessedStreamSize.expandTo(cfg.size);
++			maxProcessedStreamSize.expandTo(toSensor(cfg.size));
+ 	}
+ 
+ 	LOG(SimplePipeline, Debug)
+@@ -1334,7 +1389,7 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+ 			}
+ 		}
+ 
+-		if (!raw && !pipeConfig_->outputSizes.contains(cfg.size)) {
++		if (!raw && !pipeConfig_->outputSizes.contains(toSensor(cfg.size))) {
+ 			Size adjustedSize = pipeConfig_->captureSize;
+ 			/*
+ 			 * The converter (when present) may not be able to output
+@@ -1343,7 +1398,9 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+ 			 * the smaller valid output size closest to the requested.
+ 			 */
+ 			if (!pipeConfig_->outputSizes.contains(adjustedSize))
+-				adjustedSize = adjustSize(cfg.size, pipeConfig_->outputSizes);
++				adjustedSize = adjustSize(toSensor(cfg.size),
++							  pipeConfig_->outputSizes);
++			adjustedSize = toSensor(adjustedSize);
+ 			LOG(SimplePipeline, Debug)
+ 				<< "Adjusting size from " << cfg.size
+ 				<< " to " << adjustedSize;
+@@ -1353,7 +1410,8 @@ CameraConfiguration::Status SimpleCameraConfiguration::validate()
+ 
+ 		/* \todo Create a libcamera core class to group format and size */
+ 		if (cfg.pixelFormat != pipeConfig_->captureFormat ||
+-		    cfg.size != pipeConfig_->captureSize)
++		    cfg.size != pipeConfig_->captureSize ||
++		    ispTransform_ != Transform::Identity)
+ 			needConversion_ = true;
+ 
+ 		/* Set the stride and frameSize. */
+@@ -1483,6 +1541,25 @@ SimplePipelineHandler::generateConfiguration(Camera *camera, Span<const StreamRo
+ 	 *
+ 	 * \todo Implement a better way to pick the default format
+ 	 */
++	/*
++	 * Processed streams come out upright (the default orientation); when
++	 * the software ISP transposes them for that, list transposed sizes.
++	 */
++	if (data->swIsp_) {
++		Orientation orientation = Orientation::Rotate0;
++		data->sensor_->computeTransform(&orientation);
++		Transform remaining = Orientation::Rotate0 / orientation;
++
++		if (!!(remaining & Transform::Transpose) &&
++		    data->swIsp_->supportsTransform(remaining)) {
++			for (auto &[format, sizes] : processedFormats)
++				for (SizeRange &range : sizes)
++					range = SizeRange(transposedSize(range.min),
++							  transposedSize(range.max),
++							  range.vStep, range.hStep);
++		}
++	}
++
+ 	for (StreamRole role : roles) {
+ 		const auto &formats = (role == StreamRole::Raw ? rawFormats : processedFormats);
+ 		StreamConfiguration cfg{ StreamFormats{ formats } };
+@@ -1605,7 +1682,8 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
+ 	} else {
+ 		ipa::soft::IPAConfigInfo configInfo;
+ 		configInfo.sensorControls = data->sensor_->controls();
+-		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
++		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo,
++					       config->ispTransform());
+ 	}
+ }
+ 
+@@ -1760,7 +1838,7 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+ 
+ 	data->frameInfo_.create(request, metadataRequired);
+ 	if (data->useConversion_) {
+-		data->conversionQueue_.push({ request, std::move(buffers) });
++		data->conversionQueue_.push_back({ request, std::move(buffers) });
+ 		if (data->swIsp_)
+ 			data->swIsp_->queueRequest(request->sequence(), request->controls());
+ 	}
+@@ -1880,16 +1958,6 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+ 		}
+ 	}
+ 
+-	if (info.swIspEnabled) {
+-		/*
+-		 * When the software ISP is enabled, the simple pipeline handler
+-		 * exposes the raw stream, giving a total of two streams. This
+-		 * is mutually exclusive with the presence of a converter.
+-		 */
+-		ASSERT(!converter_);
+-		numStreams = 2;
+-	}
+-
+ 	swIspEnabled_ = info.swIspEnabled;
+ 	const GlobalConfiguration &configuration = cameraManager()->_d()->configuration();
+ 	for (const ValueNode &entry :
+@@ -1905,6 +1973,16 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+ 		}
+ 	}
+ 
++	if (swIspEnabled_ && !converter_) {
++		/*
++		 * When the software ISP is enabled, the simple pipeline handler
++		 * exposes the raw stream, giving a total of two streams. This
++		 * is mutually exclusive with the presence of a converter. Count
++		 * after the configuration file override, which can enable it.
++		 */
++		numStreams = 2;
++	}
++
+ 	/* Locate the sensors. */
+ 	std::vector<MediaEntity *> sensors = locateSensors(media.get());
+ 	if (sensors.empty()) {
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index 2804315..0938906 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -309,6 +309,23 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 				.hblankDelay = 3
+ 			},
+ 		} },
++		{ "imx682", {
++			/* 0.8 um pixels, 2x2 binned in the only mode */
++			.unitCellSize = { 1600, 1600 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++				{ controls::draft::TestPatternModeColorBarsFadeToGray, 3 },
++				{ controls::draft::TestPatternModePn9, 4 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
+ 		{ "imx678", {
+ 			.unitCellSize = { 2000, 2000 },
+ 			.testPatternModes = {},
+@@ -335,6 +352,57 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 				.hblankDelay = 3
+ 			},
+ 		} },
++		{ "s5k3t2", {
++			/* 0.8 um pixels, 2x2 binned in the only mode */
++			.unitCellSize = { 1600, 1600 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeSolidColor, 1 },
++				{ controls::draft::TestPatternModeColorBars, 2 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
++		{ "s5k5e9", {
++			/* 1.12 um pixels */
++			.unitCellSize = { 1120, 1120 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeColorBars, 1 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
++		{ "hi1337", {
++			/* 1.12 um pixels */
++			.unitCellSize = { 1120, 1120 },
++			.testPatternModes = {},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
++		{ "ov02b1b", {
++			/* 1.75 um pixels, monochrome */
++			.unitCellSize = { 1750, 1750 },
++			.testPatternModes = {},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
+ 		{ "ov2685", {
+ 			.unitCellSize = { 1750, 1750 },
+ 			.testPatternModes = {
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index 10c5e94..187193a 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -29,6 +29,21 @@ uniform mat3            ccm;
+ uniform vec3            blacklevel;
+ uniform float           gamma;
+ uniform float           contrastExp;
++uniform vec2            tex_step;
++uniform vec2            tex_size;
++uniform vec2            tex_bayer_first_red;
++uniform float           stride_factor;
++/** 1.0: snap every sample to the same site of its 2x2 Bayer quad */
++uniform float           snap;
++/** lens distortion, output -> raw (simple IPA's Lens algorithm) */
++uniform float           distortion;
++uniform vec4            dist_k;
++uniform vec2            dist_centre;
++uniform float           dist_radius;
++/** lens shading gain grid */
++uniform float           lsc_enable;
++uniform sampler2D       lsc_tex;
++uniform vec2            lsc_size;
+ 
+ float apply_contrast(float value)
+ {
+@@ -39,30 +54,31 @@ float apply_contrast(float value)
+         return 1.0 - 0.5 * pow((1.0 - value) / 0.5, contrastExp);
+ }
+ 
+-void main(void) {
+-    vec3 rgb;
++#if defined(RAW10P)
++#define pixel(p) p.r / 4.0 + p.g * 64.0
++#define fetch(x, y) pixel(texture2D(tex_y, vec2(x, y)))
++#elif defined(RAW12P)
++#define pixel(p) p.r / 16.0 + p.g * 16.0
++#define fetch(x, y) pixel(texture2D(tex_y, vec2(x, y)))
++#else
++#define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
++#endif
+ 
+-    #if defined(RAW10P)
+-    #define pixel(p) p.r / 4.0 + p.g * 64.0
+-    #define fetch(x, y) pixel(texture2D(tex_y, vec2(x, y)))
+-    #elif defined(RAW12P)
+-    #define pixel(p) p.r / 16.0 + p.g * 16.0
+-    #define fetch(x, y) pixel(texture2D(tex_y, vec2(x, y)))
+-    #else
+-    #define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
+-    #endif
+-
+-    float C = fetch(center.x, center.y); // ( 0, 0)
++/* Malvar-He-Cutler demosaic at the texel c (.xy texture, .zw pixel + first red) */
++vec3 demosaic(vec4 c, vec4 xc, vec4 yc)
++{
++    vec3 rgb;
++    float C = fetch(c.x, c.y); // ( 0, 0)
+     const vec4 kC = vec4( 4.0,  6.0,  5.0,  5.0) / 8.0;
+ 
+     // Determine which of four types of pixels we are on.
+-    vec2 alternate = mod(floor(center.zw), 2.0);
++    vec2 alternate = mod(floor(c.zw), 2.0);
+ 
+     vec4 Dvec = vec4(
+-        fetch(xCoord[1], yCoord[1]),  // (-1,-1)
+-        fetch(xCoord[1], yCoord[2]),  // (-1, 1)
+-        fetch(xCoord[2], yCoord[1]),  // ( 1,-1)
+-        fetch(xCoord[2], yCoord[2])); // ( 1, 1)
++        fetch(xc[1], yc[1]),  // (-1,-1)
++        fetch(xc[1], yc[2]),  // (-1, 1)
++        fetch(xc[2], yc[1]),  // ( 1,-1)
++        fetch(xc[2], yc[2])); // ( 1, 1)
+ 
+     vec4 PATTERN = (kC.xyz * C).xyzz;
+ 
+@@ -73,16 +89,16 @@ void main(void) {
+     Dvec.x  += Dvec.y;
+ 
+     vec4 value = vec4(
+-        fetch(center.x, yCoord[0]),   // ( 0,-2)
+-        fetch(center.x, yCoord[1]),   // ( 0,-1)
+-        fetch(xCoord[0], center.y),   // (-2, 0)
+-        fetch(xCoord[1], center.y));  // (-1, 0)
++        fetch(c.x, yc[0]),   // ( 0,-2)
++        fetch(c.x, yc[1]),   // ( 0,-1)
++        fetch(xc[0], c.y),   // (-2, 0)
++        fetch(xc[1], c.y));  // (-1, 0)
+ 
+     vec4 temp = vec4(
+-        fetch(center.x, yCoord[3]),   // ( 0, 2)
+-        fetch(center.x, yCoord[2]),   // ( 0, 1)
+-        fetch(xCoord[3], center.y),   // ( 2, 0)
+-        fetch(xCoord[2], center.y));  // ( 1, 0)
++        fetch(c.x, yc[3]),   // ( 0, 2)
++        fetch(c.x, yc[2]),   // ( 0, 1)
++        fetch(xc[3], c.y),   // ( 2, 0)
++        fetch(xc[2], c.y));  // ( 1, 0)
+ 
+     // Even the simplest compilers should be able to constant-fold these to
+     // avoid the division.
+@@ -128,6 +144,61 @@ void main(void) {
+         ((alternate.x == 0.0) ?
+             vec3(PATTERN.w, C, PATTERN.z) :
+             vec3(PATTERN.yx, C));
++    return rgb;
++}
++
++/* the texel at integer raw pixel q, with its neighbours' coordinates */
++vec3 demosaicAt(vec2 q)
++{
++    vec2 t = (q + 0.5) / tex_size;
++    vec4 c = vec4(t.x * stride_factor, t.y, q + 0.5 + tex_bayer_first_red);
++    vec4 xc = c.x + vec4(-2.0 * tex_step.x, -tex_step.x, tex_step.x, 2.0 * tex_step.x);
++    vec4 yc = c.y + vec4(-2.0 * tex_step.y, -tex_step.y, tex_step.y, 2.0 * tex_step.y);
++    return demosaic(c, xc, yc);
++}
++
++void main(void) {
++    vec3 rgb;
++
++
++    vec4 c = center;
++    vec4 xc = xCoord;
++    vec4 yc = yCoord;
++    vec2 lscPos;
++    if (snap > 0.5) {
++        /*
++         * The even site of the quad, at its exact texel centre: stepping
++         * back by tex_step (1 / (size - 1)) crossed two texels near a
++         * texel's edge and put single wrong-colour lines in the picture.
++         */
++        vec2 p = floor(c.zw);
++        p -= mod(p, 2.0);
++        vec2 t = (p - tex_bayer_first_red + 0.5) / tex_size;
++        c = vec4(t.x * stride_factor, t.y, p + 0.5);
++        xc = c.x + vec4(-2.0 * tex_step.x, -tex_step.x, tex_step.x, 2.0 * tex_step.x);
++        yc = c.y + vec4(-2.0 * tex_step.y, -tex_step.y, tex_step.y, 2.0 * tex_step.y);
++    }
++
++    if (distortion > 0.5) {
++        /*
++         * Distortion: the raw position of this output pixel, demosaiced
++         * at the four raw pixels around it and blended (resampling the
++         * Bayer data directly would mix colour sites)
++         */
++        vec2 p = center.zw - tex_bayer_first_red - 0.5;
++        vec2 v = p - dist_centre;
++        float r2 = dot(v, v) / (dist_radius * dist_radius);
++        p = dist_centre + v * (1.0 + r2 * (dist_k.x + r2 * (dist_k.y + r2 * (dist_k.z + r2 * dist_k.w))));
++        vec2 q = floor(p);
++        vec2 f = p - q;
++        rgb = mix(mix(demosaicAt(q), demosaicAt(q + vec2(1.0, 0.0)), f.x),
++                  mix(demosaicAt(q + vec2(0.0, 1.0)), demosaicAt(q + vec2(1.0, 1.0)), f.x),
++                  f.y);
++        lscPos = p;
++    } else {
++        rgb = demosaic(c, xc, yc);
++        lscPos = c.zw - tex_bayer_first_red - 0.5;
++    }
+ 
+     /*
+      * \todo: Black level normalising, AWB and digital gain could be
+@@ -135,6 +206,12 @@ void main(void) {
+      */
+     rgb = (rgb - blacklevel) / (1.0 - blacklevel);
+ 
++    /* Lens shading: gain grid (texels = grid points), 1 + 3 x texture */
++    if (lsc_enable > 0.5) {
++        vec2 g = lscPos / tex_size * (lsc_size - 1.0) / lsc_size + 0.5 / lsc_size;
++        rgb *= 1.0 + 3.0 * texture2D(lsc_tex, g).rgb;
++    }
++
+     /* Apply AWB gains, and saturate each channel at sensor range */
+     rgb = clamp(rgb * awb, vec3(0.0), vec3(1.0));
+ 
+diff --git a/src/libcamera/software_isp/debayer.h b/src/libcamera/software_isp/debayer.h
+index 28f1b85..425b579 100644
+--- a/src/libcamera/software_isp/debayer.h
++++ b/src/libcamera/software_isp/debayer.h
+@@ -19,6 +19,7 @@
+ 
+ #include <libcamera/geometry.h>
+ #include <libcamera/stream.h>
++#include <libcamera/transform.h>
+ 
+ #include "libcamera/internal/bayer_format.h"
+ #include "libcamera/internal/dma_buf_allocator.h"
+@@ -56,6 +57,13 @@ public:
+ 
+ 	virtual const SharedFD &getStatsFD() = 0;
+ 
++	/*
++	 * Rotation/flips applied to the processed output (set before
++	 * configure()); output sizes are given after the transform.
++	 */
++	virtual bool supportsTransform(Transform t) const { return t == Transform::Identity; }
++	void setTransform(Transform t) { transform_ = t; }
++
+ 	unsigned int frameSize() { return outputConfig_.frameSize; }
+ 
+ 	Signal<FrameBuffer *> inputBufferReady;
+@@ -81,6 +89,7 @@ public:
+ 	PixelFormat outputPixelFormat_;
+ 	bool swapRedBlueGains_;
+ 	Benchmark bench_;
++	Transform transform_ = Transform::Identity;
+ 
+ private:
+ 	virtual Size patternSize(PixelFormat inputFormat) = 0;
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 02651fe..ed4de86 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <assert.h>
++#include <cmath>
+ #include <memory>
+ #include <stdlib.h>
+ #include <string>
+@@ -36,6 +37,12 @@ namespace libcamera {
+  * Implements an EGL shader based debayering solution.
+  */
+ 
++/* width and height swapped (transposition) */
++static Size transposedSize(const Size &size)
++{
++	return { size.height, size.width };
++}
++
+ /**
+  * \brief Construct a DebayerEGL object
+  * \param[in] stats Statistics processing object
+@@ -127,6 +134,14 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	textureUniformStrideFactor_ = glGetUniformLocation(programId_, "stride_factor");
+ 	textureUniformBayerFirstRed_ = glGetUniformLocation(programId_, "tex_bayer_first_red");
+ 	textureUniformProjMatrix_ = glGetUniformLocation(programId_, "proj_matrix");
++	textureUniformSnap_ = glGetUniformLocation(programId_, "snap");
++	distortionUniform_ = glGetUniformLocation(programId_, "distortion");
++	distortionKUniform_ = glGetUniformLocation(programId_, "dist_k");
++	distortionCentreUniform_ = glGetUniformLocation(programId_, "dist_centre");
++	distortionRadiusUniform_ = glGetUniformLocation(programId_, "dist_radius");
++	lscEnableUniform_ = glGetUniformLocation(programId_, "lsc_enable");
++	lscTextureUniform_ = glGetUniformLocation(programId_, "lsc_tex");
++	lscSizeUniform_ = glGetUniformLocation(programId_, "lsc_size");
+ 
+ 	LOG(Debayer, Debug) << "vertexIn " << attributeVertex_ << " textureIn " << attributeTexture_
+ 			    << " tex_y " << textureUniformBayerDataIn_
+@@ -319,8 +334,11 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 	SizeRange outSizeRange = sizes(inputCfg.pixelFormat, inputCfg.size);
+ 	std::tie(outputConfig_.stride, outputConfig_.frameSize) =
+ 		strideAndFrameSize(outputCfg.pixelFormat, outputCfg.size);
++	/* the output size is after transform_; checks work before it */
++	const bool transpose = !!(transform_ & Transform::Transpose);
++	const Size outSize = transpose ? transposedSize(outputCfg.size) : outputCfg.size;
+ 
+-	if (!outSizeRange.contains(outputCfg.size) || outputConfig_.stride != outputCfg.stride) {
++	if (!outSizeRange.contains(outSize) || outputConfig_.stride != outputCfg.stride) {
+ 		LOG(Debayer, Error)
+ 			<< "Invalid output size/stride: "
+ 			<< "\n  " << outputCfg.size << " (" << outSizeRange << ")"
+@@ -330,20 +348,21 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 
+ 	outputPixelFormat_ = outputCfg.pixelFormat;
+ 	outputSize_ = outputCfg.size;
+-	nativeOutputSize_ = outSizeRange.max;
++	nativeOutputSize_ = transpose ? transposedSize(outSizeRange.max) : outSizeRange.max;
+ 
+-	window_.x = ((inputCfg.size.width - outputCfg.size.width) / 2) &
++	window_.x = ((inputCfg.size.width - outSize.width) / 2) &
+ 		    ~(inputConfig_.patternSize.width - 1);
+-	window_.y = ((inputCfg.size.height - outputCfg.size.height) / 2) &
++	window_.y = ((inputCfg.size.height - outSize.height) / 2) &
+ 		    ~(inputConfig_.patternSize.height - 1);
+-	window_.width = outputCfg.size.width;
+-	window_.height = outputCfg.size.height;
++	window_.width = outSize.width;
++	window_.height = outSize.height;
+ 
+ 	/*
+-	 * Don't pass x,y from window_ since process() already adjusts for it.
+-	 * But crop the window to 2/3 of its width and height for speedup.
++	 * The shader scales the whole native area to the output, and process()
++	 * hands the stats the full input buffer: measure all of that area, not
++	 * an output-sized corner of it.
+ 	 */
+-	stats_->setWindow(Rectangle(window_.size()));
++	stats_->setWindow(Rectangle(outSizeRange.max));
+ 
+ 	inputBufferCount_ = inputCfg.bufferCount;
+ 	outputBufferCount_ = outputCfg.bufferCount;
+@@ -425,12 +444,26 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 		{ +1.0f, +1.0f },
+ 		{ +1.0f, -1.0f },
+ 	};
+-	static const GLfloat tcoordinates[4][2] = {
+-		{ 0.0f, 0.0f },
+-		{ 0.0f, 1.0f },
+-		{ 1.0f, 1.0f },
+-		{ 1.0f, 0.0f },
+-	};
++	/*
++	 * Input (texture) position sampled at each output corner. The output
++	 * is the input with transform_ applied (flips, then transposition),
++	 * so walk it backwards: undo the transposition, then the flips.
++	 */
++	/* glVertexAttribPointer() keeps the pointer until the draw: a member */
++	GLfloat (&tcoordinates)[4][2] = tcoordinates_;
++	for (unsigned int i = 0; i < 4; i++) {
++		GLfloat x = (vcoordinates[i][0] + 1.0f) / 2.0f;
++		GLfloat y = (vcoordinates[i][1] + 1.0f) / 2.0f;
++
++		if (!!(transform_ & Transform::Transpose))
++			std::swap(x, y);
++		if (!!(transform_ & Transform::HFlip))
++			x = 1.0f - x;
++		if (!!(transform_ & Transform::VFlip))
++			y = 1.0f - y;
++		tcoordinates[i][0] = x;
++		tcoordinates[i][1] = y;
++	}
+ 
+ 	/* vertexIn - bayer_8.vert */
+ 	glEnableVertexAttribArray(attributeVertex_);
+@@ -462,6 +495,57 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	glUniform2fv(textureUniformStep_, 1, Step);
+ 	glUniform1f(textureUniformStrideFactor_, Stride);
+ 	glUniformMatrix4fv(textureUniformProjMatrix_, 1, GL_FALSE, projMatrix);
++	/*
++	 * Scaled down by 1.5 or more: sample one Bayer site of each 2x2 quad.
++	 * Otherwise neighbouring output pixels land on different sites, whose
++	 * interpolated colours differ slightly: colour stripes beating at
++	 * 1 / (1 - frac(scale / 2)) pixels (every 9 for the ultrawide).
++	 */
++	glUniform1f(textureUniformSnap_,
++		    outputSize_.width * 3 <= nativeOutputSize_.width * 2 ? 1.0f : 0.0f);
++
++	/* lens distortion (output -> raw, in raw pixels) */
++	glUniform1f(distortionUniform_, params.distortion ? 1.0f : 0.0f);
++	glUniform4f(distortionKUniform_, params.distortionK[0], params.distortionK[1],
++		    params.distortionK[2], params.distortionK[3]);
++	glUniform2f(distortionCentreUniform_, params.distortionCentre[0],
++		    params.distortionCentre[1]);
++	glUniform1f(distortionRadiusUniform_,
++		    std::hypot(static_cast<float>(width_), static_cast<float>(height_)) / 2);
++
++	/*
++	 * Lens shading: the gain grid as a small RGBA8 texture (1 + 3 x
++	 * value: gains 1-4), linear filtering between the grid points;
++	 * uploaded when it changes.
++	 */
++	unsigned int lscPoints = params.lscWidth * params.lscHeight;
++	glUniform1f(lscEnableUniform_, lscPoints ? 1.0f : 0.0f);
++	if (lscPoints) {
++		std::vector<uint8_t> texels(lscPoints * 4, 255);
++		for (unsigned int i = 0; i < lscPoints; i++)
++			for (unsigned int ch = 0; ch < 3; ch++) {
++				float v = (params.lscGains[i * 3 + ch] - 1.0f) / 3.0f;
++				texels[i * 4 + ch] = static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
++			}
++		glActiveTexture(GL_TEXTURE3);
++		if (!lscTexture_) {
++			glGenTextures(1, &lscTexture_);
++			glBindTexture(GL_TEXTURE_2D, lscTexture_);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++		}
++		glBindTexture(GL_TEXTURE_2D, lscTexture_);
++		if (texels != lscTexels_) {
++			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, params.lscWidth, params.lscHeight,
++				     0, GL_RGBA, GL_UNSIGNED_BYTE, texels.data());
++			lscTexels_ = std::move(texels);
++		}
++		glUniform1i(lscTextureUniform_, 3);
++		glUniform2f(lscSizeUniform_, params.lscWidth, params.lscHeight);
++		glActiveTexture(GL_TEXTURE0);
++	}
+ 
+ 	LOG(Debayer, Debug) << "vertexIn " << attributeVertex_ << " textureIn " << attributeTexture_
+ 			    << " tex_y " << textureUniformBayerDataIn_
+@@ -607,7 +691,11 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
+ 	egl_.attachTextureToFBO(*eglImageOut);
+ 	setShaderVariableValues(*eglImageIn, params);
+ 
+-	glViewport(0, 0, width_, height_);
++	/* the native output size: the input size, transposed with the image */
++	if (!!(transform_ & Transform::Transpose))
++		glViewport(0, 0, height_, width_);
++	else
++		glViewport(0, 0, width_, height_);
+ 	glClear(GL_COLOR_BUFFER_BIT);
+ 	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
+ 
+@@ -643,7 +731,7 @@ void DebayerEGL::process(uint32_t frame, FrameBuffer *input, FrameBuffer *output
+ 	metadata.planes()[0].bytesused = output->planes()[0].length;
+ 
+ 	/* Calculate stats for the whole frame */
+-	if (frame % SwStatsCpu::kStatPerNumFrames) {
++	if (frame % SwStatsCpu::kStatPerNumFrames && !stats_->afEnabled()) {
+ 		stats_->finishFrame(frame, 0);
+ 	} else {
+ 		if (!inMapped) {
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index d6223f3..17d8429 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -58,10 +58,14 @@ public:
+ 	void stop() override;
+ 
+ 	const SharedFD &getStatsFD() override { return stats_->getStatsFD(); }
++	/* any flips and transposition: texture coordinates of the output quad */
++	bool supportsTransform([[maybe_unused]] Transform t) const override { return true; }
+ 
+ 	SizeRange sizes(PixelFormat inputFormat, const Size &inputSize) override;
+ 
+ private:
++	/* texture coordinates of the output quad corners, see transform_ */
++	GLfloat tcoordinates_[4][2];
+ 	static int getInputConfig(PixelFormat inputFormat, DebayerInputConfig &config);
+ 	static int getOutputConfig(PixelFormat outputFormat, DebayerOutputConfig &config);
+ 	int initBayerShaders(PixelFormat inputFormat, PixelFormat outputFormat);
+@@ -93,6 +97,17 @@ private:
+ 	GLint textureUniformStrideFactor_;
+ 	GLint textureUniformBayerFirstRed_;
+ 	GLint textureUniformProjMatrix_;
++	GLint textureUniformSnap_;
++	GLint distortionUniform_;
++	GLint distortionKUniform_;
++	GLint distortionCentreUniform_;
++	GLint distortionRadiusUniform_;
++	GLint lscEnableUniform_;
++	GLint lscTextureUniform_;
++	GLint lscSizeUniform_;
++	/* lens shading grid texture and what it holds */
++	GLuint lscTexture_ = 0;
++	std::vector<uint8_t> lscTexels_;
+ 
+ 	GLint textureUniformBayerDataIn_;
+ 
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index c73a16c..21f3ed0 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -24,6 +24,8 @@
+ #include <libcamera/stream.h>
+ 
+ #include "libcamera/internal/bayer_format.h"
++#include "libcamera/internal/camera_lens.h"
++#include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/framebuffer.h"
+ #include "libcamera/internal/software_isp/debayer_params.h"
+ 
+@@ -82,8 +84,12 @@ LOG_DEFINE_CATEGORY(SoftwareIsp)
+ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 			 ControlInfoMap *ipaControls)
+ 	: ispWorkerThread_("SWIspWorker"),
+-	  dmaHeap_(DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap |
+-		   DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap |
++	  /*
++	   * The output only goes to the GPU and to applications: no need for
++	   * contiguous memory, which the capture hardware may need and which
++	   * fragments with large frequent allocations.
++	   */
++	  dmaHeap_(DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap |
+ 		   DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf)
+ {
+ 	if (!dmaHeap_.isValid()) {
+@@ -105,6 +111,9 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 		return;
+ 	}
+ 	stats->statsReady.connect(this, &SoftwareIsp::statsReady);
++	/* sharpness statistics for the IPA's autofocus */
++	CameraLens *lens = const_cast<CameraSensor *>(sensor)->focusLens();
++	stats->setAfEnabled(lens != nullptr);
+ 
+ #if HAVE_DEBAYER_EGL
+ 	const GlobalConfiguration &configuration = cm._d()->configuration();
+@@ -162,6 +171,7 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 			 sharedParams_.fd(),
+ 			 sensorInfo,
+ 			 sensor->controls(),
++			 lens ? lens->controls() : ControlInfoMap{},
+ 			 ipaControls,
+ 			 &ccmEnabled_);
+ 	if (ret) {
+@@ -176,6 +186,10 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 					    metadataReady.emit(frame, metadata);
+ 				    });
+ 	ipa_->setSensorControls.connect(this, &SoftwareIsp::setSensorCtrls);
++	ipa_->setLensPosition.connect(this,
++				      [this](int32_t position) {
++					      setLensPosition.emit(position);
++				      });
+ 
+ 	debayer_->moveToThread(&ispWorkerThread_);
+ }
+@@ -274,20 +288,35 @@ uint32_t SoftwareIsp::preferredInputStride(const PixelFormat &inputFormat, const
+ 	return debayer_->preferredInputStride(inputFormat, size);
+ }
+ 
++/**
++ * \brief Check whether the processed output can be flipped/transposed
++ * \param[in] t The transform from the sensor image to the output image
++ * \return True if configure() accepts \a t
++ */
++bool SoftwareIsp::supportsTransform(Transform t) const
++{
++	return debayer_ && debayer_->supportsTransform(t);
++}
++
+ /**
+  * \brief Configure the SoftwareIsp object according to the passed in parameters
+  * \param[in] inputCfg The input configuration
+  * \param[in] outputCfgs The output configurations
+  * \param[in] configInfo The IPA configuration data, received from the pipeline
+  * handler
++ * \param[in] transform Flips/transposition from the sensor image to the
++ * output, see supportsTransform(); output sizes are after it
+  * \return 0 on success, a negative errno on failure
+  */
+ int SoftwareIsp::configure(const StreamConfiguration &inputCfg,
+ 			   const std::vector<std::reference_wrapper<const StreamConfiguration>> &outputCfgs,
+-			   const ipa::soft::IPAConfigInfo &configInfo)
++			   const ipa::soft::IPAConfigInfo &configInfo,
++			   Transform transform)
+ {
+ 	ASSERT(ipa_ && debayer_);
+ 
++	debayer_->setTransform(transform);
++
+ 	int ret = ipa_->configure(configInfo);
+ 	if (ret < 0)
+ 		return ret;
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 7fb77ce..0888a87 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -11,6 +11,9 @@
+ 
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
++#include <algorithm>
++#include <stdlib.h>
++
+ #include <libcamera/base/log.h>
+ 
+ #include <libcamera/stream.h>
+@@ -170,6 +173,8 @@ SwStatsCpu::SwStatsCpu(const CameraManager &cm)
+ static constexpr unsigned int kRedYMul = 77; /* 0.299 * 256 */
+ static constexpr unsigned int kGreenYMul = 150; /* 0.587 * 256 */
+ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
++/* 8-bit level from which a channel counts as clipped */
++static constexpr unsigned int kClipLevel = 248;
+ 
+ #define SWSTATS_START_LINE_STATS(pixel_t) \
+ 	pixel_t r, g, g2, b;              \
+@@ -179,6 +184,11 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	uint64_t sumG = 0;                \
+ 	uint64_t sumB = 0;
+ 
++/*
++ * The histogram bin is bounded: a sample beyond the format's bit depth (a
++ * corrupt frame, e.g. a buffer the capture DMA never wrote) indexed past
++ * yHistogram, and the bounds-checked std::array aborted the application.
++ */
+ #define SWSTATS_ACCUMULATE_LINE_STATS(div) \
+ 	sumR += r;                         \
+ 	sumG += g;                         \
+@@ -187,7 +197,9 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	yVal = r * kRedYMul;               \
+ 	yVal += g * kGreenYMul;            \
+ 	yVal += b * kBlueYMul;             \
+-	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
++	stats.yHistogram[std::min<uint64_t>(yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div)), \
++					    SwIspStats::kYHistogramSize - 1)]++; \
++	stats.clipped += std::max(std::max(r, g), b) >= kClipLevel * (div);
+ 
+ #define SWSTATS_FINISH_LINE_STATS() \
+ 	stats.sum_.r() += sumR;     \
+@@ -392,6 +404,7 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		s.yHistogram.fill(0);
++		s.clipped = 0;
+ 	}
+ }
+ 
+@@ -409,8 +422,10 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		sharedStats_->yHistogram.fill(0);
++		sharedStats_->clipped = 0;
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
++			sharedStats_->clipped += s.clipped;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
+@@ -469,6 +484,8 @@ int SwStatsCpu::configure(const StreamConfiguration &inputCfg, unsigned int stat
+ {
+ 	stride_ = inputCfg.stride;
+ 	stats_.resize(statsBufferCount);
++	afSupported_ = false;
++	gridShift_ = 0;
+ 
+ 	BayerFormat bayerFormat =
+ 		BayerFormat::fromPixelFormat(inputCfg.pixelFormat);
+@@ -478,12 +495,20 @@ int SwStatsCpu::configure(const StreamConfiguration &inputCfg, unsigned int stat
+ 		processFrame_ = &SwStatsCpu::processBayerFrame2;
+ 		switch (bayerFormat.bitDepth) {
+ 		case 8:
+-			stats0_ = &SwStatsCpu::statsBGGR8Line0;
+-			sumShift_ = 0;
+-			return 0;
+ 		case 10:
+-			stats0_ = &SwStatsCpu::statsBGGR10Line0;
+-			sumShift_ = 2;
++			if (bayerFormat.bitDepth == 8) {
++				stats0_ = &SwStatsCpu::statsBGGR8Line0;
++				sumShift_ = 0;
++			} else {
++				stats0_ = &SwStatsCpu::statsBGGR10Line0;
++				sumShift_ = 2;
++			}
++			afSupported_ = true;
++			gridShift_ = sumShift_;
++			redX_ = bayerFormat.order == BayerFormat::GRBG ||
++				bayerFormat.order == BayerFormat::BGGR;
++			redY_ = bayerFormat.order == BayerFormat::GBRG ||
++				bayerFormat.order == BayerFormat::BGGR;
+ 			return 0;
+ 		case 12:
+ 			stats0_ = &SwStatsCpu::statsBGGR12Line0;
+@@ -570,6 +595,10 @@ void SwStatsCpu::setWindow(const Rectangle &window)
+ 	window_.width = (window_.width > xShift_ ? window_.width - xShift_ : 0);
+ 	window_.width &= ~(patternSize_.width - 1);
+ 	window_.height &= ~(patternSize_.height - 1);
++
++	/* Large frames: one line pair in four is plenty */
++	if (ySkipMask_ == 0x02 || ySkipMask_ == 0x06)
++		ySkipMask_ = window_.height > 2000 ? 0x06 : 0x02;
+ }
+ 
+ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+@@ -604,6 +633,11 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+  */
+ void SwStatsCpu::processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuffer &input)
+ {
++	sharedStats_->afValid = false;
++	sharedStats_->awbValid = false;
++	if (afEnabled())
++		processAf(input);
++
+ 	if (frame % kStatPerNumFrames) {
+ 		finishFrame(frame, bufferId);
+ 		return;
+@@ -612,8 +646,141 @@ void SwStatsCpu::processFrame(uint32_t frame, uint32_t bufferId, MappedFrameBuff
+ 	bench_.startFrame();
+ 	startFrame(frame);
+ 	(this->*processFrame_)(input);
++	if (afSupported_)
++		processAwbGrid(input);
+ 	finishFrame(frame, bufferId);
+ 	bench_.finishFrame();
+ }
+ 
++/*
++ * Autofocus statistics: on every 8th line, a band-pass of the same-colour
++ * pixels: 2x2 same-colour blocks (rows y and y + 2, columns x and x + 2)
++ * averaged, and the squared difference of blocks 4 pixels apart above a
++ * small noise floor, summed per tile of a kAfGridWidth x kAfGridHeight grid
++ * over the statistics window, plus the sum of the sampled pixels for
++ * normalisation.  The averaging halves the noise: with plain neighbour
++ * differences a dim, high-gain scene (macro camera indoors) measured mostly
++ * noise and the scan ended at the wrong end.  The floor applies to the
++ * 4-pixel sums, so dark scenes keep their sub-LSB steps.  8-bit or 10-bit
++ * (in 16) unpacked Bayer; 10-bit sums are scaled to the 8-bit range.
++ */
++void SwStatsCpu::processAf(MappedFrameBuffer &in)
++{
++	if (gridShift_)
++		processAfT<uint16_t>(in);
++	else
++		processAfT<uint8_t>(in);
++}
++
++template<typename T>
++void SwStatsCpu::processAfT(MappedFrameBuffer &in)
++{
++	constexpr unsigned int kGw = SwIspStats::kAfGridWidth;
++	constexpr unsigned int kGh = SwIspStats::kAfGridHeight;
++	/* noise floor on 4-pixel sums: 1.5 LSB (8-bit) of an average */
++	const int kNoise = 6 << gridShift_;
++	const unsigned int stride = stride_ / sizeof(T);
++	const unsigned int w = window_.width;
++	const unsigned int h = window_.height;
++	unsigned int xs[kGw + 1];
++
++	sharedStats_->afSharpness.fill(0);
++	sharedStats_->afBrightness.fill(0);
++	if (w < 8 * kGw || h < 8 * kGh)
++		return;
++
++	for (unsigned int t = 0; t <= kGw; t++)
++		xs[t] = (t * w / kGw) & ~1u;
++
++	const T *base = reinterpret_cast<const T *>(in.planes()[0].data()) +
++			window_.y * stride + window_.x;
++	for (unsigned int y = 0; y + 2 < h; y += 8) {
++		const T *r0 = base + y * stride;
++		const T *r2 = r0 + 2 * stride;
++		unsigned int ty = y * kGh / h;
++
++		for (unsigned int tx = 0; tx < kGw; tx++) {
++			uint64_t sharp = 0, bright = 0;
++			unsigned int end = std::min(xs[tx + 1], w - 6);
++
++			for (unsigned int x = xs[tx]; x < end; x++) {
++				int a = r0[x] + r0[x + 2] + r2[x] + r2[x + 2];
++				int b = r0[x + 4] + r0[x + 6] + r2[x + 4] + r2[x + 6];
++				int d = std::abs(b - a) - kNoise;
++
++				if (d > 0)
++					sharp += d * d;
++				bright += r0[x];
++			}
++			sharedStats_->afSharpness[ty * kGw + tx] += sharp >> (2 * gridShift_);
++			sharedStats_->afBrightness[ty * kGw + tx] += bright >> gridShift_;
++		}
++	}
++	sharedStats_->afValid = true;
++}
++
++/*
++ * White balance statistics: colour sums per tile of the autofocus grid, from
++ * every fourth 2x2 block on every fourth line pair, leaving out blocks with a
++ * saturated channel (their colour is wrong).  8-bit or 10-bit (in 16)
++ * unpacked Bayer; 10-bit sums are scaled to the 8-bit range.
++ */
++void SwStatsCpu::processAwbGrid(MappedFrameBuffer &in)
++{
++	if (gridShift_)
++		processAwbGridT<uint16_t>(in);
++	else
++		processAwbGridT<uint8_t>(in);
++}
++
++template<typename T>
++void SwStatsCpu::processAwbGridT(MappedFrameBuffer &in)
++{
++	constexpr unsigned int kGw = SwIspStats::kAfGridWidth;
++	constexpr unsigned int kGh = SwIspStats::kAfGridHeight;
++	const unsigned int kSaturated = 250 << gridShift_;
++	const unsigned int stride = stride_ / sizeof(T);
++	const unsigned int x0 = window_.x & ~1u;
++	const unsigned int w = window_.width & ~1u;
++	const unsigned int h = window_.height & ~1u;
++	const unsigned int bx = redX_ ^ 1, by = redY_ ^ 1;
++
++	sharedStats_->awbR.fill(0);
++	sharedStats_->awbG.fill(0);
++	sharedStats_->awbB.fill(0);
++	sharedStats_->awbCount.fill(0);
++	if (w < 8 * kGw || h < 8 * kGh)
++		return;
++
++	const T *base = reinterpret_cast<const T *>(in.planes()[0].data()) +
++			window_.y * stride + x0;
++	std::array<uint64_t, SwIspStats::kAfGridSize> sumR{}, sumG{}, sumB{};
++	for (unsigned int y = 0; y < h; y += 8) {
++		const T *l0 = base + y * stride;
++		const T *l1 = l0 + stride;
++		const T *lr = redY_ ? l1 : l0, *lb = by ? l1 : l0;
++		unsigned int row = y * kGh / h * kGw;
++
++		for (unsigned int x = 0; x < w; x += 8) {
++			unsigned int r = lr[x + redX_];
++			unsigned int b = lb[x + bx];
++			unsigned int g = l0[x + (redY_ ? redX_ : redX_ ^ 1)] +
++					 l1[x + (redY_ ? redX_ ^ 1 : redX_)];
++			if (r >= kSaturated || b >= kSaturated || g >= 2 * kSaturated)
++				continue;
++			unsigned int i = row + x * kGw / w;
++			sumR[i] += r;
++			sumG[i] += g;
++			sumB[i] += b;
++			sharedStats_->awbCount[i]++;
++		}
++	}
++	for (unsigned int i = 0; i < SwIspStats::kAfGridSize; i++) {
++		sharedStats_->awbR[i] = sumR[i] >> gridShift_;
++		sharedStats_->awbG[i] = sumG[i] >> gridShift_;
++		sharedStats_->awbB[i] = sumB[i] >> gridShift_;
++	}
++	sharedStats_->awbValid = true;
++}
++
+ } /* namespace libcamera */

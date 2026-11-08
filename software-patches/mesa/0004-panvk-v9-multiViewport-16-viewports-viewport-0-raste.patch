@@ -1,0 +1,42 @@
+From 12d7fce94aae599340d743b9250c2b84148c0ce7 Mon Sep 17 00:00:00 2001
+From: cezanne <port@local>
+Date: Sun, 1 Nov 2026 04:22:30 +0100
+Subject: [PATCH 4/9] panvk: v9 multiViewport (16 viewports, viewport 0
+ rasterizes)
+
+D3D11 sets up to 16 viewports and DXVK requires multiViewport. Without
+shaders that write ViewportIndex (no geometry shaders,
+shaderOutputViewportIndex false) every primitive uses viewport and
+scissor 0, which the v9 draw code already programs.
+---
+ src/panfrost/vulkan/panvk_vX_physical_device.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index dc29358..c515b3f 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -318,7 +318,10 @@ panvk_per_arch(get_physical_device_features)(
+       .wideLines = true,
+       .largePoints = true,
+       .alphaToOne = false,
+-      .multiViewport = false,
++      /* v9: several viewports / scissors can be set, the rasterizer uses the
++       * first: nothing selects another (no ViewportIndex output, no geometry
++       * shaders), which is what the spec asks for. */
++      .multiViewport = PAN_ARCH == 9,
+       .samplerAnisotropy = true,
+       .textureCompressionETC2 = has_texture_compression_etc2(device),
+       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
+@@ -955,7 +958,7 @@ panvk_per_arch(get_physical_device_properties)(
+       .maxDrawIndirectCount = PAN_ARCH >= 10 ? UINT32_MAX : PAN_ARCH == 9 ? 65535 : 1,
+       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
+       .maxSamplerAnisotropy = 16,
+-      .maxViewports = 1,
++      .maxViewports = PAN_ARCH == 9 ? 16 : 1,
+       .maxViewportDimensions = {MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_DIMENSION},
+       .viewportBoundsRange = {-2.0f * MAX_FRAMEBUFFER_DIMENSION, 2.0f * MAX_FRAMEBUFFER_DIMENSION - 1.0f},
+       .viewportSubPixelBits = 0,
+-- 
+2.56.0
+

@@ -1,0 +1,8 @@
+# MT6885 sensor hub (BSP sensor/2.0: hf_manager + mtk_nanohub + nanohub)
+ccflags-y += -I$(M) -I$(M)/include -I$(M)/.. -I$(M)/../include \
+	-include $(M)/compat_sensor.h -DCONFIG_NANOHUB_MTK_IPI
+obj-m += hf-manager.o nanohub.o mtk-nanohub.o scp-iio.o
+hf-manager-y := hf_manager.o
+nanohub-y := main.o bl.o comms.o nanohub-mtk.o
+mtk-nanohub-y := mtk_nanohub.o mtk_nanohub_ipi.o sensor_list.o
+scp-iio-y := scp_iio.o

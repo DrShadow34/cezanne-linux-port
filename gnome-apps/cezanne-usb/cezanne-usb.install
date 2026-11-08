@@ -1,0 +1,17 @@
+post_install() {
+  systemctl daemon-reload 2>/dev/null || true
+  # cezanne-base's RNDIS gadget (usb-gadget.service) is now the "Developer
+  # network" mode of cezanne-usbd
+  systemctl disable --now usb-gadget.service 2>/dev/null || true
+  rm -f /etc/systemd/system/multi-user.target.wants/usb-gadget.service
+  systemctl enable --now cezanne-usbd.service 2>/dev/null || true
+}
+
+post_upgrade() {
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl try-restart cezanne-usbd.service 2>/dev/null || true
+}
+
+pre_remove() {
+  systemctl disable --now cezanne-usbd.service 2>/dev/null || true
+}

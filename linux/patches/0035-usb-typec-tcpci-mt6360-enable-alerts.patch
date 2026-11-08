@@ -1,0 +1,53 @@
+diff --git a/drivers/usb/typec/tcpm/tcpci.c b/drivers/usb/typec/tcpm/tcpci.c
+index 6717ac914..3a7559521 100644
+--- a/drivers/usb/typec/tcpm/tcpci.c
++++ b/drivers/usb/typec/tcpm/tcpci.c
+@@ -814,6 +814,17 @@ irqreturn_t tcpci_irq(struct tcpci *tcpci)
+ }
+ EXPORT_SYMBOL_GPL(tcpci_irq);
+ 
++/*
++ * tcpci_init() only computes the alert mask; the chip's TCPC_ALERT_MASK is
++ * written once the interrupt is requested. Drivers that register a port and
++ * request their own irq (not the generic tcpci i2c driver) call this then.
++ */
++int tcpci_enable_alerts(struct tcpci *tcpci)
++{
++	return tcpci_write16(tcpci, TCPC_ALERT_MASK, tcpci->alert_mask);
++}
++EXPORT_SYMBOL_GPL(tcpci_enable_alerts);
++
+ static irqreturn_t _tcpci_irq(int irq, void *dev_id)
+ {
+ 	struct tcpci_chip *chip = dev_id;
+diff --git a/drivers/usb/typec/tcpm/tcpci_mt6360.c b/drivers/usb/typec/tcpm/tcpci_mt6360.c
+index 881ffacbf..b51240738 100644
+--- a/drivers/usb/typec/tcpm/tcpci_mt6360.c
++++ b/drivers/usb/typec/tcpm/tcpci_mt6360.c
+@@ -172,6 +172,14 @@ static int mt6360_tcpc_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	/* mt6360_tcpc_init() masked all alerts: enable tcpci's now */
++	ret = tcpci_enable_alerts(mti->tcpci);
++	if (ret) {
++		dev_err(mti->dev, "Failed to enable alerts\n");
++		tcpci_unregister_port(mti->tcpci);
++		return ret;
++	}
++
+ 	device_init_wakeup(&pdev->dev, true);
+ 	platform_set_drvdata(pdev, mti);
+ 
+diff --git a/include/linux/usb/tcpci.h b/include/linux/usb/tcpci.h
+index 9b46a6bc7..71be0a2a7 100644
+--- a/include/linux/usb/tcpci.h
++++ b/include/linux/usb/tcpci.h
+@@ -233,6 +233,7 @@ struct tcpci_data {
+ struct tcpci *tcpci_register_port(struct device *dev, struct tcpci_data *data);
+ void tcpci_unregister_port(struct tcpci *tcpci);
+ irqreturn_t tcpci_irq(struct tcpci *tcpci);
++int tcpci_enable_alerts(struct tcpci *tcpci);
+ 
+ struct tcpm_port;
+ struct tcpm_port *tcpci_get_tcpm_port(struct tcpci *tcpci);

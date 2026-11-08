@@ -1,0 +1,56 @@
+drm/panfrost: unprepare the clocks in system suspend (GPU_PM_CLK_DIS)
+
+On MT6885 the core clock is MFGPLL itself, and a MediaTek PLL only
+powers down when unprepared: with clk_disable() alone it kept running
+through suspend and blocked the SPM's bus26m constraint.
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.c b/drivers/gpu/drm/panfrost/panfrost_device.c
+index 63e50d82c..1d3716cda 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.c
++++ b/drivers/gpu/drm/panfrost/panfrost_device.c
+@@ -508,13 +508,18 @@ static int panfrost_device_resume(struct device *dev)
+ 		dev_pm_opp_put(opp);
+ 	}
+ 
++	/*
++	 * Prepare too: on MediaTek the core clock can be a PLL, which only
++	 * powers down when unprepared (an MT6885 MFGPLL left running blocks
++	 * the SPM's deeper suspend modes).
++	 */
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS)) {
+-		ret = clk_enable(pfdev->clock);
++		ret = clk_prepare_enable(pfdev->clock);
+ 		if (ret)
+ 			goto err_clk;
+ 
+ 		if (pfdev->bus_clock) {
+-			ret = clk_enable(pfdev->bus_clock);
++			ret = clk_prepare_enable(pfdev->bus_clock);
+ 			if (ret)
+ 				goto err_bus_clk;
+ 		}
+@@ -528,10 +533,10 @@ static int panfrost_device_resume(struct device *dev)
+ 
+ err_resume:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS) && pfdev->bus_clock)
+-		clk_disable(pfdev->bus_clock);
++		clk_disable_unprepare(pfdev->bus_clock);
+ err_bus_clk:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS))
+-		clk_disable(pfdev->clock);
++		clk_disable_unprepare(pfdev->clock);
+ err_clk:
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_VREG_OFF))
+ 		dev_pm_opp_set_opp(dev, NULL);
+@@ -549,9 +554,9 @@ static int panfrost_device_suspend(struct device *dev)
+ 
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS)) {
+ 		if (pfdev->bus_clock)
+-			clk_disable(pfdev->bus_clock);
++			clk_disable_unprepare(pfdev->bus_clock);
+ 
+-		clk_disable(pfdev->clock);
++		clk_disable_unprepare(pfdev->clock);
+ 	}
+ 
+ 	if (pfdev->comp->pm_features & BIT(GPU_PM_VREG_OFF))

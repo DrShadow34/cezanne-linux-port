@@ -1,0 +1,7 @@
+# D-Bus activation for neard (upstream ships only the systemd unit with a
+# dbus-org.neard alias): the first call to org.neard starts neard.service.
+[D-BUS Service]
+Name=org.neard
+Exec=/bin/false
+User=root
+SystemdService=neard.service

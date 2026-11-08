@@ -1,0 +1,24 @@
+diff --git a/drivers/usb/gadget/function/f_uvc.c b/drivers/usb/gadget/function/f_uvc.c
+index d1bf3ea75..fd1c739c2 100644
+--- a/drivers/usb/gadget/function/f_uvc.c
++++ b/drivers/usb/gadget/function/f_uvc.c
+@@ -340,6 +340,19 @@ uvc_function_set_alt(struct usb_function *f, unsigned interface, unsigned alt)
+ 		if (uvc->state != UVC_STATE_STREAMING)
+ 			return 0;
+ 
++		/*
++		 * The status waits for VIDIOC_STREAMOFF. A UDC that keeps
++		 * the isoc requests the host no longer polls (mtu3; dwc3
++		 * completes them as missed) never gave the buffers back,
++		 * and GStreamer's uvcsink only handles the STREAMOFF once
++		 * v4l2sink got one. Disabling the endpoint completes the
++		 * requests (-ESHUTDOWN): their buffers come back and new
++		 * ones at once until the STREAMOFF, the pump and hw_submit
++		 * stop, as before the delayed status; set_alt(1) enables it.
++		 */
++		if (uvc->video.ep)
++			usb_ep_disable(uvc->video.ep);
++
+ 		memset(&v4l2_event, 0, sizeof(v4l2_event));
+ 		v4l2_event.type = UVC_EVENT_STREAMOFF;
+ 		v4l2_event_queue(&uvc->vdev, &v4l2_event);

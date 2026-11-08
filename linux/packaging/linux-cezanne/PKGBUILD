@@ -1,0 +1,137 @@
+# linux-cezanne: the mainline kernel for the Redmi K30 Ultra (MT6885) with all
+# of the port's modules and the boot image.
+#   kernel   v7.3.1 + mainline/patches/*.patch (they reproduce
+#            src/linux-mainline exactly) + config (= src/out-mainline/.config)
+#   modules  the in-tree ones + every out-of-tree module of mainline/modules.map,
+#            built against this kernel (no MODVERSIONS: never mix builds)
+#   boot     boot.img for the boot slot (mainline/mkboot-mainline.sh: shim + DTB
+#            from mainline/dts + Image + the nolibc init); 90-cezanne-boot.hook
+#            flashes it after saving the slot to /var/lib/cezanne/boot-prev.img
+# Built on the build PC / laptop (cross, LLVM=1, needs the project tree:
+# $startdir/../..), then uploaded to the phone's [cezanne] repo:
+#   packaging/cezanne-pkg host linux-cezanne
+# Bump pkgrel with every change: it is part of the kernel release
+# (7.3.1-cezanne<pkgrel>), so a new build never overwrites the running
+# kernel's modules.
+pkgname=linux-cezanne
+_kver=7.3.1
+pkgver=$_kver
+pkgrel=13
+pkgdesc="Mainline Linux for the Redmi K30 Ultra (cezanne, MT6885): kernel, modules, boot image"
+arch=(aarch64)
+url="https://www.kernel.org/"
+license=(GPL-2.0-only)
+depends=(coreutils kmod)
+makedepends=(clang lld llvm bc cpio perl python dtc mkbootimg android-tools)
+provides=(linux "cezanne-kernel=$pkgver")
+options=(!strip !debug !lto)
+install=linux-cezanne.install
+_localver=-cezanne$pkgrel
+_rel=$_kver$_localver
+
+_root() { realpath "$startdir/../.."; }
+_kmake() {
+  make -C "$srcdir/linux" O="$srcdir/build" ARCH=arm64 LLVM=1 \
+    LOCALVERSION="$_localver" -j"$(nproc)" "$@"
+}
+# out-of-tree module sources, without build products and captures
+_copy_src() {
+  mkdir -p "$srcdir/oot/$2"
+  tar -C "$1" -cf - --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' --exclude='*.mod' \
+    --exclude='*.mod.c' --exclude='modules.order' --exclude='Module.symvers' \
+    --exclude='.git' --exclude='dumps' --exclude='ref' --exclude='tools' --exclude='hdr' \
+    --exclude='*.dng' --exclude='*.pgm' --exclude='*.png' --exclude='*.raw*' \
+    --exclude='*.ppm' --exclude='*.log' --exclude='*.tar' . | tar -C "$srcdir/oot/$2" -xf -
+}
+
+prepare() {
+  local root p
+  root=$(_root)
+  rm -rf linux build oot
+  mkdir linux build
+  git -C "$root/src/linux-mainline" archive "v$_kver" | tar -x -C linux
+  for p in "$root"/mainline/patches/*.patch; do
+    patch -d linux -Np1 -s -i "$p"
+  done
+  cp "$startdir/config" build/.config
+  _kmake olddefconfig
+
+  local d
+  # shim: bootsel.h (-I$(src)/../shim)
+  for d in apu bootsel shim camera fingerprint haptics leds modem/ccci popup uinput \
+           vcodec/cezanne-vdec vcodec/cezanne-venc xmusb350; do
+    _copy_src "$root/mainline/$d" "mainline/$d"
+  done
+  _copy_src "$root/src/scp-port" scp-port
+  _copy_src "$root/src/connectivity" connectivity
+  _copy_src "$root/src/vtop" vtop
+}
+
+build() {
+  local o=$srcdir/oot c=$srcdir/oot/connectivity d
+  _kmake Image modules
+
+  # mainline/: our own drivers (stage-modules.sh)
+  for d in apu bootsel camera fingerprint haptics leds modem/ccci popup uinput \
+           vcodec/cezanne-vdec vcodec/cezanne-venc xmusb350; do
+    _kmake M="$o/mainline/$d" modules
+  done
+  # SCP sensor hub (sensor/ links against scp-port's symbols)
+  _kmake M="$o/scp-port" modules
+  _kmake M="$o/scp-port/sensor" KBUILD_EXTRA_SYMBOLS="$o/scp-port/Module.symvers" modules
+  # CONNSYS (mainline/connectivity/build.sh, build2.sh)
+  local base=(CONNINFRA_SRC="$c/conninfra" CONFIG_MTK_COMBO_CHIP_CONSYS_6885=y)
+  local two=(TOP="$o/vtop" GEN4M_SRC="$c/wlan-core-gen4m" CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH=y)
+  _kmake M="$c/conninfra" "${base[@]}" CONFIG_MTK_COMBO_CHIP_CONSYS_6893=n modules
+  _kmake M="$c/btif" "${base[@]}" CONFIG_MTK_COMBO_CHIP_CONSYS_6893=n modules
+  _extra() {
+    local s=
+    for d in conninfra wlan-adaptor connfem btif; do
+      [[ $c/$d != "$1" && -f $c/$d/Module.symvers ]] && s+=" $c/$d/Module.symvers"
+    done
+    echo "$s"
+  }
+  _kmake M="$c/wlan-adaptor" "${base[@]}" "${two[@]}" KBUILD_EXTRA_SYMBOLS="$(_extra "$c/wlan-adaptor")" \
+    CONNAC_VER=2_0 MODULE_NAME=wmt_chrdev_wifi_connac2 modules
+  _kmake M="$c/wlan-core-gen4m" "${base[@]}" "${two[@]}" KBUILD_EXTRA_SYMBOLS="$(_extra "$c/wlan-core-gen4m")" \
+    SEGMENT=SP MODULE_NAME=wlan_drv_gen4m_6885 KO_CODE_PATH="$c/wlan-core-gen4m" modules
+  _kmake M="$c/bt-mt66xx/6885" "${base[@]}" "${two[@]}" KBUILD_EXTRA_SYMBOLS="$(_extra "$c/bt-mt66xx/6885")" modules
+  _kmake M="$c/gps/data_link/plat/v010" "${base[@]}" "${two[@]}" KBUILD_EXTRA_SYMBOLS="$(_extra "$c/gps")" \
+    CONFIG_MTK_GPS_SUPPORT=y modules
+  _kmake M="$c/fmradio" "${base[@]}" "${two[@]}" KBUILD_EXTRA_SYMBOLS="$(_extra "$c/fmradio")" modules
+
+  # boot image for the boot slot (as boot-NN: CHOOSER=1 NO_MIUI=1 KEEP_WDT=1)
+  local root
+  root=$(_root)
+  CHOOSER=1 NO_MIUI=1 KEEP_WDT=1 KSRC="$srcdir/linux" KOUT="$srcdir/build" W="$srcdir/boot" \
+    "$root/mainline/mkboot-mainline.sh" "$root/initramfs/mainline-arch" "$srcdir/boot.img"
+}
+
+package() {
+  local root m dst src
+  root=$(_root)
+  _kmake INSTALL_MOD_PATH="$pkgdir/usr" INSTALL_MOD_STRIP=1 DEPMOD=/bin/true modules_install
+  rm -f "$pkgdir/usr/lib/modules/$_rel"/{build,source}
+
+  # out-of-tree modules at the paths of mainline/modules.map
+  while read -r dst src; do
+    [[ -z $dst || $dst == \#* ]] && continue
+    case $src in
+      src/out-mainline/*) continue ;;	# in-tree modules: installed above
+      mainline/*) m=$srcdir/oot/$src ;;
+      src/scp-port/*) m=$srcdir/oot/scp-port/${src#src/scp-port/} ;;
+      src/connectivity/*) m=$srcdir/oot/connectivity/${src#src/connectivity/} ;;
+      *) echo "modules.map: unknown source $src" >&2; return 1 ;;
+    esac
+    install -Dm644 "$m" "$pkgdir/usr/lib/modules/$_rel/$dst"
+  done < "$root/mainline/modules.map"
+  find "$pkgdir/usr/lib/modules/$_rel/extra" "$pkgdir/usr/lib/modules/$_rel/updates" \
+    -name '*.ko' -exec llvm-strip --strip-debug {} + 2>/dev/null || true
+  echo "$pkgname" > "$pkgdir/usr/lib/modules/$_rel/pkgbase"
+
+  install -Dm644 "$srcdir/boot.img" "$pkgdir/usr/lib/cezanne/boot.img"
+  install -Dm644 "$srcdir/build/arch/arm64/boot/Image" "$pkgdir/usr/lib/modules/$_rel/Image"
+  install -Dm644 "$srcdir/boot/board.dtb" "$pkgdir/usr/lib/modules/$_rel/cezanne.dtb"
+  install -Dm755 "$startdir/cezanne-flash-boot" "$pkgdir/usr/lib/cezanne/cezanne-flash-boot"
+  install -Dm644 "$startdir/90-cezanne-boot.hook" "$pkgdir/usr/share/libalpm/hooks/90-cezanne-boot.hook"
+}

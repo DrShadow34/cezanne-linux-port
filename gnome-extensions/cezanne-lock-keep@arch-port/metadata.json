@@ -1,0 +1,7 @@
+{
+  "uuid": "cezanne-lock-keep@arch-port",
+  "name": "Cezanne Lock Keep",
+  "description": "Smooth unlocking: third-party extensions disabled on the lock screen keep their stylesheet loaded, lock-safe ones keep running.",
+  "shell-version": ["51"],
+  "session-modes": ["user", "unlock-dialog"]
+}

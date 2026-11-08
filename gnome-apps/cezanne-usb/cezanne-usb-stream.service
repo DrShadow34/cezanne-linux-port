@@ -1,0 +1,8 @@
+[Unit]
+Description=USB video stream (phone screen or camera to the webcam gadget)
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/cezanne-usb-stream
+Restart=on-failure
+RestartSec=2

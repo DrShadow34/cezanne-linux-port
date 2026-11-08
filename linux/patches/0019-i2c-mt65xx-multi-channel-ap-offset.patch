@@ -1,0 +1,128 @@
+diff --git a/drivers/i2c/busses/i2c-mt65xx.c b/drivers/i2c/busses/i2c-mt65xx.c
+index 307925fb7..c1fd4950b 100644
+--- a/drivers/i2c/busses/i2c-mt65xx.c
++++ b/drivers/i2c/busses/i2c-mt65xx.c
+@@ -41,6 +41,8 @@
+ #define I2C_SOFT_RST			0x0001
+ #define I2C_HANDSHAKE_RST		0x0020
+ #define I2C_FIFO_ADDR_CLR		0x0001
++#define I2C_FIFO_ADDR_CLR_MCH		0x0004
++#define I2C_RESUME_ARBIT		(1 << 1)
+ #define I2C_DELAY_LEN			0x0002
+ #define I2C_ST_START_CON		0x8001
+ #define I2C_FS_START_CON		0x1800
+@@ -293,6 +295,8 @@ struct mtk_i2c {
+ 
+ 	/* set in i2c probe */
+ 	void __iomem *base;		/* i2c base addr */
++	void __iomem *chan0_base;	/* multi-channel: channel 0, if not ours */
++	bool arbit_wait;		/* multi-channel: last transfer failed */
+ 	void __iomem *pdmabase;		/* dma base address*/
+ 	struct clk_bulk_data clocks[I2C_MT65XX_CLK_MAX]; /* clocks for i2c */
+ 	bool have_pmic;			/* can use i2c pins from PMIC */
+@@ -557,11 +561,29 @@ static void mtk_i2c_init_hw(struct mtk_i2c *i2c)
+ 	u16 intr_stat_reg;
+ 	u16 ext_conf_val;
+ 
++	/*
++	 * Multi-channel controllers (MT6885 i2c2/4/8/9): +0 is the shadow
++	 * view the vendor driver configures through; reset it too.
++	 */
++	if (i2c->chan0_base)
++		writew(I2C_SOFT_RST,
++		       i2c->chan0_base + i2c->dev_comp->regs[OFFSET_SOFTRESET]);
++
+ 	mtk_i2c_writew(i2c, I2C_CHN_CLR_FLAG, OFFSET_START);
+ 	intr_stat_reg = mtk_i2c_readw(i2c, OFFSET_INTR_STAT);
+ 	mtk_i2c_writew(i2c, intr_stat_reg, OFFSET_INTR_STAT);
+ 
+-	if (i2c->dev_comp->apdma_sync) {
++	if (i2c->chan0_base) {
++		/*
++		 * Vendor (i2c-mtk.c) sequence: the handshake resets below
++		 * leave the AP channel of a multi-channel controller unable
++		 * to start further transfers.
++		 */
++		mtk_i2c_writew(i2c, I2C_SOFT_RST, OFFSET_SOFTRESET);
++		writel(I2C_DMA_WARM_RST, i2c->pdmabase + OFFSET_RST);
++		udelay(5);
++		writel(I2C_DMA_CLR_FLAG, i2c->pdmabase + OFFSET_RST);
++	} else if (i2c->dev_comp->apdma_sync) {
+ 		writel(I2C_DMA_WARM_RST, i2c->pdmabase + OFFSET_RST);
+ 		udelay(10);
+ 		writel(I2C_DMA_CLR_FLAG, i2c->pdmabase + OFFSET_RST);
+@@ -1055,7 +1077,9 @@ static int mtk_i2c_do_transfer(struct mtk_i2c *i2c, struct i2c_msg *msgs,
+ 	mtk_i2c_writew(i2c, restart_flag | I2C_HS_NACKERR | I2C_ACKERR |
+ 			    I2C_ARB_LOST | I2C_TRANSAC_COMP, OFFSET_INTR_STAT);
+ 
+-	mtk_i2c_writew(i2c, I2C_FIFO_ADDR_CLR, OFFSET_FIFO_ADDR_CLR);
++	mtk_i2c_writew(i2c, i2c->chan0_base ?
++		       I2C_FIFO_ADDR_CLR_MCH | I2C_FIFO_ADDR_CLR :
++		       I2C_FIFO_ADDR_CLR, OFFSET_FIFO_ADDR_CLR);
+ 
+ 	/* Enable interrupt */
+ 	mtk_i2c_writew(i2c, restart_flag | I2C_HS_NACKERR | I2C_ACKERR |
+@@ -1194,6 +1218,26 @@ static int mtk_i2c_do_transfer(struct mtk_i2c *i2c, struct i2c_msg *msgs,
+ 	}
+ 	mtk_i2c_writew(i2c, start_reg, OFFSET_START);
+ 
++	/*
++	 * Multi-channel controllers: after a NACK or timeout the next start
++	 * waits for the bus arbitration (START reads RESUME_ARBIT) forever.
++	 * Hand the bus back through channel 0 and start again (the vendor
++	 * driver does the hand-back only in its timeout path, losing one
++	 * transfer).
++	 */
++	if (i2c->chan0_base && i2c->arbit_wait) {
++		u16 st;
++
++		i2c->arbit_wait = false;
++		if (!readw_poll_timeout_atomic(i2c->base +
++				i2c->dev_comp->regs[OFFSET_START], st,
++				st & I2C_RESUME_ARBIT, 1, 50)) {
++			writew(I2C_RESUME_ARBIT, i2c->chan0_base +
++			       i2c->dev_comp->regs[OFFSET_START]);
++			mtk_i2c_writew(i2c, start_reg, OFFSET_START);
++		}
++	}
++
+ 	ret = wait_for_completion_timeout(&i2c->msg_complete,
+ 					  i2c->adap.timeout);
+ 
+@@ -1223,12 +1267,14 @@ static int mtk_i2c_do_transfer(struct mtk_i2c *i2c, struct i2c_msg *msgs,
+ 
+ 	if (ret == 0) {
+ 		dev_dbg(i2c->dev, "addr: %x, transfer timeout\n", msgs->addr);
++		i2c->arbit_wait = true;
+ 		i2c_dump_register(i2c);
+ 		mtk_i2c_init_hw(i2c);
+ 		return -ETIMEDOUT;
+ 	}
+ 
+ 	if (i2c->irq_stat & (I2C_HS_NACKERR | I2C_ACKERR)) {
++		i2c->arbit_wait = true;
+ 		dev_dbg(i2c->dev, "addr: %x, transfer ACK error\n", msgs->addr);
+ 		mtk_i2c_init_hw(i2c);
+ 		return -ENXIO;
+@@ -1387,6 +1433,7 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 	int ret = 0;
+ 	struct mtk_i2c *i2c;
+ 	int i, irq, speed_clk;
++	u32 chan_offset;
+ 
+ 	i2c = devm_kzalloc(&pdev->dev, sizeof(*i2c), GFP_KERNEL);
+ 	if (!i2c)
+@@ -1396,6 +1443,13 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 	if (IS_ERR(i2c->base))
+ 		return PTR_ERR(i2c->base);
+ 
++	/* the AP owns one channel of a multi-channel controller */
++	if (!of_property_read_u32(pdev->dev.of_node, "mediatek,channel-offset",
++				  &chan_offset) && chan_offset) {
++		i2c->chan0_base = i2c->base;
++		i2c->base += chan_offset;
++	}
++
+ 	i2c->pdmabase = devm_platform_get_and_ioremap_resource(pdev, 1, NULL);
+ 	if (IS_ERR(i2c->pdmabase))
+ 		return PTR_ERR(i2c->pdmabase);

@@ -1,0 +1,242 @@
+diff --git a/drivers/pmdomain/mediatek/mt6885-pm-domains.h b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+new file mode 100644
+index 000000000..b7d492039
+--- /dev/null
++++ b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+@@ -0,0 +1,190 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef __SOC_MEDIATEK_MT6885_PM_DOMAINS_H
++#define __SOC_MEDIATEK_MT6885_PM_DOMAINS_H
++
++#include "mtk-pm-domains.h"
++#include <dt-bindings/power/mt6885-power.h>
++
++/*
++ * MT6885 power domain support, from the MediaTek 4.14 BSP (clk-mt6885-pg.c).
++ * Same SPM layout as MT8192, but MFG1 has wider bus protection masks and an
++ * extra step in the SUB_INFRA_VDNR protection register.
++ *
++ * GPU domains stay off until the GPU driver asks for them; MFG0/MFG1 carry
++ * the VSRAM_GPU / VGPU supplies so they are enabled first (BSP order).
++ */
++
++/* infracfg_ao bus protection registers */
++#define MT6885_TOP_AXI_PROT_EN_SET		0x2a0
++#define MT6885_TOP_AXI_PROT_EN_CLR		0x2a4
++#define MT6885_TOP_AXI_PROT_EN_STA1		0x228
++#define MT6885_TOP_AXI_PROT_EN_1_SET		0x2a8
++#define MT6885_TOP_AXI_PROT_EN_1_CLR		0x2ac
++#define MT6885_TOP_AXI_PROT_EN_1_STA1		0x258
++#define MT6885_TOP_AXI_PROT_EN_2_SET		0x714
++#define MT6885_TOP_AXI_PROT_EN_2_CLR		0x718
++#define MT6885_TOP_AXI_PROT_EN_2_STA1		0x724
++#define MT6885_TOP_AXI_PROT_EN_VDNR_SET		0xbb8
++#define MT6885_TOP_AXI_PROT_EN_VDNR_CLR		0xbbc
++#define MT6885_TOP_AXI_PROT_EN_VDNR_STA1	0xbc4
++
++#define MT6885_TOP_AXI_PROT_EN_1_MFG1		GENMASK(21, 19)
++#define MT6885_TOP_AXI_PROT_EN_2_MFG1		GENMASK(6, 5)
++#define MT6885_TOP_AXI_PROT_EN_MFG1		GENMASK(22, 21)
++#define MT6885_TOP_AXI_PROT_EN_2_MFG1_2ND	BIT(7)
++#define MT6885_TOP_AXI_PROT_EN_VDNR_MFG1	(BIT(17) | BIT(19))
++#define MT6885_TOP_AXI_PROT_EN_2_AUDIO		BIT(4)
++#define MT6885_TOP_AXI_PROT_EN_CONN		BIT(13)
++#define MT6885_TOP_AXI_PROT_EN_CONN_2ND		BIT(14)
++#define MT6885_TOP_AXI_PROT_EN_2_CONN		BIT(2)
++
++static enum scpsys_bus_prot_block scpsys_bus_prot_blocks_mt6885[] = {
++	BUS_PROT_BLOCK_INFRA
++};
++
++static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
++	[MT6885_POWER_DOMAIN_MFG0] = {
++		.name = "mfg0",
++		.sta_mask = BIT(2),
++		.ctl_offs = 0x0308,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.caps = MTK_SCPD_DOMAIN_SUPPLY | MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_MFG1] = {
++		.name = "mfg1",
++		.sta_mask = BIT(3),
++		.ctl_offs = 0x030c,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR(INFRA, MT6885_TOP_AXI_PROT_EN_1_MFG1,
++				    MT6885_TOP_AXI_PROT_EN_1_SET, MT6885_TOP_AXI_PROT_EN_1_CLR,
++				    MT6885_TOP_AXI_PROT_EN_1_STA1),
++			BUS_PROT_WR(INFRA, MT6885_TOP_AXI_PROT_EN_2_MFG1,
++				    MT6885_TOP_AXI_PROT_EN_2_SET, MT6885_TOP_AXI_PROT_EN_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_2_STA1),
++			BUS_PROT_WR(INFRA, MT6885_TOP_AXI_PROT_EN_MFG1,
++				    MT6885_TOP_AXI_PROT_EN_SET, MT6885_TOP_AXI_PROT_EN_CLR,
++				    MT6885_TOP_AXI_PROT_EN_STA1),
++			BUS_PROT_WR(INFRA, MT6885_TOP_AXI_PROT_EN_2_MFG1_2ND,
++				    MT6885_TOP_AXI_PROT_EN_2_SET, MT6885_TOP_AXI_PROT_EN_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_2_STA1),
++			BUS_PROT_WR(INFRA, MT6885_TOP_AXI_PROT_EN_VDNR_MFG1,
++				    MT6885_TOP_AXI_PROT_EN_VDNR_SET, MT6885_TOP_AXI_PROT_EN_VDNR_CLR,
++				    MT6885_TOP_AXI_PROT_EN_VDNR_STA1),
++		},
++		.caps = MTK_SCPD_DOMAIN_SUPPLY | MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_MFG2] = {
++		.name = "mfg2",
++		.sta_mask = BIT(4),
++		.ctl_offs = 0x0310,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_MFG3] = {
++		.name = "mfg3",
++		.sta_mask = BIT(5),
++		.ctl_offs = 0x0314,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_MFG4] = {
++		.name = "mfg4",
++		.sta_mask = BIT(6),
++		.ctl_offs = 0x0318,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_MFG5] = {
++		.name = "mfg5",
++		.sta_mask = BIT(7),
++		.ctl_offs = 0x031c,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_MFG6] = {
++		.name = "mfg6",
++		.sta_mask = BIT(8),
++		.ctl_offs = 0x0320,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	/* same as MT8192 (BSP clk-mt6885-pg.c SYS_AUDIO) */
++	[MT6885_POWER_DOMAIN_AUDIO] = {
++		.name = "audio",
++		.sta_mask = BIT(21),
++		.ctl_offs = 0x0354,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR(INFRA, MT6885_TOP_AXI_PROT_EN_2_AUDIO,
++				    MT6885_TOP_AXI_PROT_EN_2_SET, MT6885_TOP_AXI_PROT_EN_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_2_STA1),
++		},
++		/*
++		 * Powered on demand by the AFE only: switched on at probe, it
++		 * gets switched off again when the probe defers (MFG supply),
++		 * and that power-off hung the bus.
++		 */
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	/*
++	 * BSP spm_mtcmos_ctrl_conn(): no SRAM; protection set in the order
++	 * PROT_EN bit 13, bit 14, PROT_EN_2 bit 2. The acks of 14 and PROT_EN_2
++	 * bit 2 stay up after release (the BSP does not wait for them either).
++	 * Powered by conninfra.
++	 */
++	[MT6885_POWER_DOMAIN_CONN] = {
++		.name = "conn",
++		.sta_mask = BIT(1),
++		.ctl_offs = 0x0304,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_CONN,
++				    MT6885_TOP_AXI_PROT_EN_SET, MT6885_TOP_AXI_PROT_EN_CLR,
++				    MT6885_TOP_AXI_PROT_EN_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_CONN_2ND,
++				    MT6885_TOP_AXI_PROT_EN_SET, MT6885_TOP_AXI_PROT_EN_CLR,
++				    MT6885_TOP_AXI_PROT_EN_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_2_CONN,
++				    MT6885_TOP_AXI_PROT_EN_2_SET, MT6885_TOP_AXI_PROT_EN_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_2_STA1),
++		},
++		/* stays on across system sleep while conninfra (a wakeup device) uses it */
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF | MTK_SCPD_ACTIVE_WAKEUP,
++	},
++};
++
++static const struct scpsys_soc_data mt6885_scpsys_data = {
++	.domains_data = scpsys_domain_data_mt6885,
++	.num_domains = ARRAY_SIZE(scpsys_domain_data_mt6885),
++	.bus_prot_blocks = scpsys_bus_prot_blocks_mt6885,
++	.num_bus_prot_blocks = ARRAY_SIZE(scpsys_bus_prot_blocks_mt6885),
++};
++
++#endif /* __SOC_MEDIATEK_MT6885_PM_DOMAINS_H */
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.c b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+index f0fa79e01..d98ce4a0a 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+@@ -21,6 +21,7 @@
+ #include "mt6735-pm-domains.h"
+ #include "mt6795-pm-domains.h"
+ #include "mt6858-pm-domains.h"
++#include "mt6885-pm-domains.h"
+ #include "mt6893-pm-domains.h"
+ #include "mt8167-pm-domains.h"
+ #include "mt8173-pm-domains.h"
+@@ -1322,6 +1323,9 @@ static const struct of_device_id scpsys_of_match[] = {
+ 		.data = &mt8189_scpsys_data,
+ 	},
+ 	{
++		.compatible = "mediatek,mt6885-power-controller",
++		.data = &mt6885_scpsys_data,
++	}, {
+ 		.compatible = "mediatek,mt8192-power-controller",
+ 		.data = &mt8192_scpsys_data,
+ 	},
+diff --git a/include/dt-bindings/power/mt6885-power.h b/include/dt-bindings/power/mt6885-power.h
+new file mode 100644
+index 000000000..5bcb887bc
+--- /dev/null
++++ b/include/dt-bindings/power/mt6885-power.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/*
++ * MT6885 power domains (only the GPU ones are described so far).
++ */
++#ifndef _DT_BINDINGS_POWER_MT6885_POWER_H
++#define _DT_BINDINGS_POWER_MT6885_POWER_H
++
++#define MT6885_POWER_DOMAIN_MFG0	0	/* mfg_async */
++#define MT6885_POWER_DOMAIN_MFG1	1	/* mfg */
++#define MT6885_POWER_DOMAIN_MFG2	2	/* shader core 0 */
++#define MT6885_POWER_DOMAIN_MFG3	3	/* shader cores 1-2 */
++#define MT6885_POWER_DOMAIN_MFG4	4	/* shader cores 3-4 */
++#define MT6885_POWER_DOMAIN_MFG5	5	/* shader cores 5-6 */
++#define MT6885_POWER_DOMAIN_MFG6	6	/* shader cores 7-8 */
++#define MT6885_POWER_DOMAIN_AUDIO	7
++#define MT6885_POWER_DOMAIN_CONN	8
++
++#endif /* _DT_BINDINGS_POWER_MT6885_POWER_H */

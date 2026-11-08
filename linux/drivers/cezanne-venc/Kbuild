@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-m += cezanne-venc.o
+cezanne-venc-y := venc_drv.o venc_h264.o venc_sram.o

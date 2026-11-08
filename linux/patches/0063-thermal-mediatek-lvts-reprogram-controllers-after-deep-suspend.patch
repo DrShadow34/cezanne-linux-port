@@ -1,0 +1,220 @@
+diff --git a/drivers/thermal/mediatek/lvts_thermal.c b/drivers/thermal/mediatek/lvts_thermal.c
+index 4371daa40..22ce320d4 100644
+--- a/drivers/thermal/mediatek/lvts_thermal.c
++++ b/drivers/thermal/mediatek/lvts_thermal.c
+@@ -1191,9 +1191,12 @@ static u32 lvts_dev_read(struct lvts_ctrl *lvts_ctrl, u8 reg)
+  * BSP lvts_device_read_count_RC_N() with LVTS_REFINE_MANUAL_RCK_WITH_EFUSE:
+  * count each sensor's RC oscillator, fall back to the efuse reference when the
+  * count is missing or more than 6% off, and fold it into the calibration
+- * (LVTS_EDATA = count_r * count_rc_now >> 14).
++ * (LVTS_EDATA = count_r * count_rc_now >> 14). On resume (!scale) the BSP
++ * runs the counting sequence again but keeps the boot counts
++ * (lvts_device_read_count_RC_N_resume).
+  */
+-static void lvts_ctrl_manual_rck(struct device *dev, struct lvts_ctrl *lvts_ctrl)
++static void lvts_ctrl_manual_rck(struct device *dev, struct lvts_ctrl *lvts_ctrl,
++				 bool scale)
+ {
+ 	u32 ref = lvts_ctrl->count_rc_ref;
+ 	int i, n = hweight8(lvts_ctrl->valid_sensor_mask);
+@@ -1215,7 +1218,9 @@ static void lvts_ctrl_manual_rck(struct device *dev, struct lvts_ctrl *lvts_ctrl
+ 		rc = lvts_dev_read(lvts_ctrl, 0x00) & GENMASK(23, 0);
+ 		lvts_dev_write(lvts_ctrl, 0x08, 0xf1);	/* TS_EN off */
+ 
+-		if (!rc || (ref && (max(rc, ref) * 1000ULL / min(rc, ref) > 1061))) {
++		if (!scale)
++			continue;
++		if (!rc ||(ref && (max(rc, ref) * 1000ULL / min(rc, ref) > 1061))) {
+ 			dev_dbg(dev, "sensor %d: RC count %u, using efuse %u\n", i, rc, ref);
+ 			rc = ref;
+ 		}
+@@ -1233,7 +1238,7 @@ static int lvts_ctrl_initialize(struct device *dev, struct lvts_ctrl *lvts_ctrl)
+ 
+ 	lvts_write_config(lvts_ctrl, lvts_data->init_cmd, lvts_data->num_init_cmd);
+ 	if (lvts_data->rc_ref)
+-		lvts_ctrl_manual_rck(dev, lvts_ctrl);
++		lvts_ctrl_manual_rck(dev, lvts_ctrl, true);
+ 
+ 	return 0;
+ }
+@@ -1379,21 +1384,58 @@ static int lvts_ctrl_configure(struct device *dev, struct lvts_ctrl *lvts_ctrl)
+ 	return lvts_irq_init(lvts_ctrl);
+ }
+ 
+-static int lvts_ctrl_start(struct device *dev, struct lvts_ctrl *lvts_ctrl)
++/*
++ * Enable the measurement of the sensors that got a thermal zone in
++ * lvts_ctrl_start(). If any thermal zone was not described in the
++ * device tree, it won't be enabled here in the sensor map.
++ */
++static void lvts_ctrl_select_sensors(struct lvts_ctrl *lvts_ctrl)
+ {
+-	struct lvts_sensor *lvts_sensors = lvts_ctrl->sensors;
+-	struct thermal_zone_device *tz;
+-	u32 sensor_map = 0;
+-	int i;
+ 	/*
+ 	 * Bitmaps to enable each sensor on immediate and filtered modes, as
+ 	 * described in MSRCTL1 and MONCTL0 registers below, respectively.
+ 	 */
+-	u32 sensor_imm_bitmap[] = { BIT(4), BIT(5), BIT(6), BIT(9) };
+-	u32 sensor_filt_bitmap[] = { BIT(0), BIT(1), BIT(2), BIT(3) };
++	static const u32 sensor_imm_bitmap[] = { BIT(4), BIT(5), BIT(6), BIT(9) };
++	static const u32 sensor_filt_bitmap[] = { BIT(0), BIT(1), BIT(2), BIT(3) };
++	const u32 *sensor_bitmap = lvts_ctrl->mode == LVTS_MSR_IMMEDIATE_MODE ?
++				   sensor_imm_bitmap : sensor_filt_bitmap;
++	u32 sensor_map = 0;
++	int i;
++
++	lvts_for_each_valid_sensor(i, lvts_ctrl)
++		if (lvts_ctrl->sensors[i].tz)
++			sensor_map |= sensor_bitmap[i];
++
++	if (lvts_ctrl->mode == LVTS_MSR_IMMEDIATE_MODE) {
++		/*
++		 * LVTS_MSRCTL1 : Measurement control
++		 *
++		 * Bits:
++		 *
++		 * 9: Ignore MSRCTL0 config and do immediate measurement on sensor3
++		 * 6: Ignore MSRCTL0 config and do immediate measurement on sensor2
++		 * 5: Ignore MSRCTL0 config and do immediate measurement on sensor1
++		 * 4: Ignore MSRCTL0 config and do immediate measurement on sensor0
++		 *
++		 * That configuration will ignore the filtering and the delays
++		 * introduced in MONCTL1 and MONCTL2
++		 */
++		writel(sensor_map, LVTS_MSRCTL1(lvts_ctrl->base));
++	} else {
++		/*
++		 * Bits:
++		 *      9: Single point access flow
++		 *    0-3: Enable sensing point 0-3
++		 */
++		writel(sensor_map | BIT(9), LVTS_MONCTL0(lvts_ctrl->base));
++	}
++}
+ 
+-	u32 *sensor_bitmap = lvts_ctrl->mode == LVTS_MSR_IMMEDIATE_MODE ?
+-			     sensor_imm_bitmap : sensor_filt_bitmap;
++static int lvts_ctrl_start(struct device *dev, struct lvts_ctrl *lvts_ctrl)
++{
++	struct lvts_sensor *lvts_sensors = lvts_ctrl->sensors;
++	struct thermal_zone_device *tz;
++	int i;
+ 
+ 	lvts_for_each_valid_sensor(i, lvts_ctrl) {
+ 
+@@ -1424,45 +1466,9 @@ static int lvts_ctrl_start(struct device *dev, struct lvts_ctrl *lvts_ctrl)
+ 		 * belonging to the thermal domain.
+ 		 */
+ 		lvts_sensors[i].tz = tz;
+-
+-		/*
+-		 * This sensor was correctly associated with a thermal
+-		 * zone, let's set the corresponding bit in the sensor
+-		 * map, so we can enable the temperature monitoring in
+-		 * the hardware thermal controller.
+-		 */
+-		sensor_map |= sensor_bitmap[i];
+ 	}
+ 
+-	/*
+-	 * The initialization of the thermal zones give us
+-	 * which sensor point to enable. If any thermal zone
+-	 * was not described in the device tree, it won't be
+-	 * enabled here in the sensor map.
+-	 */
+-	if (lvts_ctrl->mode == LVTS_MSR_IMMEDIATE_MODE) {
+-		/*
+-		 * LVTS_MSRCTL1 : Measurement control
+-		 *
+-		 * Bits:
+-		 *
+-		 * 9: Ignore MSRCTL0 config and do immediate measurement on sensor3
+-		 * 6: Ignore MSRCTL0 config and do immediate measurement on sensor2
+-		 * 5: Ignore MSRCTL0 config and do immediate measurement on sensor1
+-		 * 4: Ignore MSRCTL0 config and do immediate measurement on sensor0
+-		 *
+-		 * That configuration will ignore the filtering and the delays
+-		 * introduced in MONCTL1 and MONCTL2
+-		 */
+-		writel(sensor_map, LVTS_MSRCTL1(lvts_ctrl->base));
+-	} else {
+-		/*
+-		 * Bits:
+-		 *      9: Single point access flow
+-		 *    0-3: Enable sensing point 0-3
+-		 */
+-		writel(sensor_map | BIT(9), LVTS_MONCTL0(lvts_ctrl->base));
+-	}
++	lvts_ctrl_select_sensors(lvts_ctrl);
+ 
+ 	return 0;
+ }
+@@ -1682,6 +1688,43 @@ static int lvts_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * A suspend that powers the controllers down (MT6885 deep SPM: infra and
++ * MCUSYS off) leaves them at their reset values: no calibration, no sensor
++ * selection, and no sample ever turns valid again (-EAGAIN on every zone
++ * until reboot). Program them as at probe then, as the BSP does on each
++ * resume, keeping the calibration (and RC counts) from boot. The cached
++ * thresholds are dropped so the thermal core's resume update writes the
++ * trip interrupts again.
++ */
++static int lvts_ctrl_reprogram(struct device *dev, struct lvts_ctrl *lvts_ctrl)
++{
++	const struct lvts_data *lvts_data = lvts_ctrl->lvts_data;
++	int ret;
++
++	lvts_ctrl_set_enable(lvts_ctrl, true);
++
++	ret = lvts_ctrl_connect(dev, lvts_ctrl);
++	if (ret)
++		return ret;
++
++	lvts_write_config(lvts_ctrl, lvts_data->init_cmd, lvts_data->num_init_cmd);
++	if (lvts_data->rc_ref)
++		lvts_ctrl_manual_rck(dev, lvts_ctrl, false);
++
++	lvts_ctrl_calibrate(dev, lvts_ctrl);
++
++	ret = lvts_ctrl_configure(dev, lvts_ctrl);
++	if (ret)
++		return ret;
++
++	lvts_ctrl->low_thresh = INT_MIN;
++	lvts_ctrl->high_thresh = INT_MIN;
++	lvts_ctrl_select_sensors(lvts_ctrl);
++
++	return 0;
++}
++
+ static int lvts_resume(struct device *dev)
+ {
+ 	struct lvts_domain *lvts_td;
+@@ -1694,9 +1737,19 @@ static int lvts_resume(struct device *dev)
+ 		return ret;
+ 
+ 	for (i = 0; i < lvts_td->num_lvts_ctrl; i++) {
+-		lvts_ctrl_set_enable(&lvts_td->lvts_ctrl[i], true);
++		struct lvts_ctrl *lvts_ctrl = &lvts_td->lvts_ctrl[i];
++
++		if (readl(LVTS_TSSEL(lvts_ctrl->base)) != LVTS_TSSEL_CONF) {
++			ret = lvts_ctrl_reprogram(dev, lvts_ctrl);
++			if (ret)
++				dev_err(dev, "controller %d lost its state, reprogram: %d\n",
++					i, ret);
++			continue;
++		}
++
++		lvts_ctrl_set_enable(lvts_ctrl, true);
+ 		usleep_range(100, 200);
+-		lvts_ctrl_monitor_enable(dev, &lvts_td->lvts_ctrl[i], true);
++		lvts_ctrl_monitor_enable(dev, lvts_ctrl, true);
+ 	}
+ 
+ 	return 0;

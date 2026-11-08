@@ -1,0 +1,430 @@
+From 7c8e3114587909f35faa232d7edfd73cb28d9526 Mon Sep 17 00:00:00 2001
+From: arch-port <26345330+DrShadow34@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 20:03:44 +0100
+Subject: [PATCH 17/17] panvk: v9 compressed images U-interleaved, copies by
+ blocks
+
+Images with a compressed format and transfer usage got MUTABLE_FORMAT |
+BLOCK_TEXEL_VIEW_COMPATIBLE from panvk itself, for vk_meta's copies
+through RGBA32UI / RG32UI views, and that rules out U-interleaved
+tiling: compressed formats tile in 4x4 blocks, uncompressed ones in
+16x16 texels, so no uncompressed view can alias the layout. Every BC /
+ETC2 / ASTC texture a D3D game uploads (DXVK: TRANSFER_SRC | DST |
+SAMPLED) was LINEAR; Risk of Rain 2 had ~2700 of them.
+
+On v9 such images no longer get the flags (unless the app asks for
+uncompressed views, or the image ends up LINEAR anyway) and every copy
+touching a compressed U-interleaved image (buffer <-> image, image <->
+image, compressed <-> size-compatible uncompressed, 2D arrays and 3D)
+goes through panlib_copy_image_blocks, a libpan kernel computing the
+tiled addresses itself (one invocation per 8 / 16 byte block, linear,
+4x4 or 16x16 U-interleaved on either side). Host image copies already
+handle compressed U-interleaved images on the CPU.
+
+CTS (texture.compressed, copy_and_blit image_to_buffer / buffer_to_image
+2D + 3D, image_to_image all_formats 1/3, blit_image all_formats with
+compressed sources 1/25, image.texel_view_compatible 1/4): 6769 pass,
+0 fail. Risk of Rain 2 main menu (1080x2160, GPU bound): ~3% less GPU
+time per pass; texture reads there are dominated by RGBA16F targets and
+a 4096^2 shadow map.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013fD3if93WntovhmD8fGa8C
+---
+ src/panfrost/libpan/copy.cl             |  67 ++++++++
+ src/panfrost/vulkan/panvk_image.c       |  34 +++-
+ src/panfrost/vulkan/panvk_image.h       |   2 +
+ src/panfrost/vulkan/panvk_vX_cmd_meta.c | 208 ++++++++++++++++++++++++
+ 4 files changed, 310 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/libpan/copy.cl b/src/panfrost/libpan/copy.cl
+index c3ad0bd..e3dc34e 100644
+--- a/src/panfrost/libpan/copy.cl
++++ b/src/panfrost/libpan/copy.cl
+@@ -29,4 +29,71 @@ panlib_fill_uint4_scalar(global uint4 *address, uint a, uint b, uint c, uint d)
+ {
+    address[cl_global_id.x] = (uint4)(a, b, c, d);
+ }
++
++/* Index of element (x, y) inside a Mali u-interleaved tile: the bits of y
++ * go to the odd positions, the bits of x ^ y to the even ones (pan_tiling.c
++ * bit_duplication[y] ^ space_4[x]).
++ */
++static uint32_t
++panlib_u_interleave(uint32_t x, uint32_t y)
++{
++   uint32_t xy = x ^ y;
++
++   xy = (xy | (xy << 2)) & 0x33;
++   xy = (xy | (xy << 1)) & 0x55;
++   y = (y | (y << 2)) & 0x33;
++   y = (y | (y << 1)) & 0x55;
++   return xy | (y << 1);
++}
++
++/* Byte offset of block (x, y) in a surface: linear (tile_shift 0) or
++ * u-interleaved in tiles of (1 << tile_shift)^2 blocks, 4x4 for compressed
++ * formats and 16x16 otherwise. row_stride is the size of a row of tiles.
++ */
++static uint64_t
++panlib_block_offset(uint32_t x, uint32_t y, uint32_t row_stride,
++                    uint32_t tile_shift, uint32_t block_size)
++{
++   uint64_t row = (uint64_t)(y >> tile_shift) * row_stride;
++
++   if (!tile_shift)
++      return row + (uint64_t)x * block_size;
++
++   uint32_t mask = (1u << tile_shift) - 1;
++   uint32_t idx = ((x >> tile_shift) << (2 * tile_shift)) +
++                  panlib_u_interleave(x & mask, y & mask);
++   return row + (uint64_t)idx * block_size;
++}
++
++/* Copies a width x (count / width) rectangle of 8 or 16 byte blocks between
++ * two surfaces (buffers, linear or u-interleaved images), one layer per
++ * global_id.y. Used for compressed u-interleaved images, which vk_meta's
++ * uncompressed views can't alias (their tiles are 4x4 blocks, not 16x16).
++ */
++KERNEL(64)
++panlib_copy_image_blocks(uint64_t src, uint64_t dst, uint64_t src_layer_stride,
++                         uint64_t dst_layer_stride, uint32_t src_row_stride,
++                         uint32_t dst_row_stride, uint32_t src_x,
++                         uint32_t src_y, uint32_t dst_x, uint32_t dst_y,
++                         uint32_t width, uint32_t count,
++                         uint32_t src_tile_shift, uint32_t dst_tile_shift,
++                         uint32_t block_size)
++{
++   uint32_t i = cl_global_id.x;
++   if (i >= count)
++      return;
++
++   uint32_t x = i % width, y = i / width;
++   uint64_t s = src + cl_global_id.y * src_layer_stride +
++                panlib_block_offset(src_x + x, src_y + y, src_row_stride,
++                                    src_tile_shift, block_size);
++   uint64_t d = dst + cl_global_id.y * dst_layer_stride +
++                panlib_block_offset(dst_x + x, dst_y + y, dst_row_stride,
++                                    dst_tile_shift, block_size);
++
++   if (block_size == 16)
++      *(global uint4 *)d = *(global uint4 *)s;
++   else
++      *(global uint2 *)d = *(global uint2 *)s;
++}
+ #endif
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index 892f301..d9441a2 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -504,6 +504,24 @@ panvk_image_init_layouts(struct panvk_image *image,
+    return VK_SUCCESS;
+ }
+ 
++/* On v9, copies touching compressed U-interleaved images don't go through
++ * vk_meta's uncompressed views (U-interleaved tiles are 4x4 blocks for
++ * compressed formats, 16x16 texels otherwise, so no view can alias them) but
++ * through panlib_copy_image_blocks, which computes the tiled addresses. Such
++ * images then don't need the RGBA-view flags that force them LINEAR.
++ */
++bool
++panvk_image_compressed_copies_by_blocks(const struct panvk_image *image)
++{
++   struct panvk_physical_device *phys_dev =
++      to_panvk_physical_device(image->vk.base.device->physical);
++
++   return pan_arch(phys_dev->kmod.dev->props.gpu_id) == 9 &&
++          vk_format_is_compressed(image->vk.format) &&
++          vk_format_get_blocksize(image->vk.format) >= 8 &&
++          image->vk.image_type != VK_IMAGE_TYPE_1D;
++}
++
+ static void
+ panvk_image_pre_mod_select_meta_adjustments(struct panvk_image *image)
+ {
+@@ -550,7 +568,8 @@ panvk_image_pre_mod_select_meta_adjustments(struct panvk_image *image)
+ 
+    if ((image->vk.usage &
+         (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) &&
+-       vk_format_is_compressed(image->vk.format)) {
++       vk_format_is_compressed(image->vk.format) &&
++       !panvk_image_compressed_copies_by_blocks(image)) {
+       /* We need to be able to create RGBA views of compressed formats for
+        * vk_meta copies.
+        *
+@@ -568,6 +587,19 @@ panvk_image_post_mod_select_meta_adjustments(struct panvk_image *image)
+ {
+    const VkImageAspectFlags aspects = vk_format_aspects(image->vk.format);
+ 
++   /* Compressed images that didn't get U-interleaved after all (the app asked
++    * for uncompressed views, or LINEAR) are copied by vk_meta through RGBA
++    * views, as on the other archs.
++    */
++   if ((image->vk.usage &
++        (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) &&
++       vk_format_is_compressed(image->vk.format) &&
++       panvk_image_compressed_copies_by_blocks(image) &&
++       image->vk.drm_format_mod != DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED) {
++      image->vk.create_flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
++                                VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
++   }
++
+    /* If the image didn't end up using AFBC, we should add the storage flag
+     * to allow vkmeta to take the compute based copying path. */
+    if ((image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+diff --git a/src/panfrost/vulkan/panvk_image.h b/src/panfrost/vulkan/panvk_image.h
+index eeb4529..8284b43 100644
+--- a/src/panfrost/vulkan/panvk_image.h
++++ b/src/panfrost/vulkan/panvk_image.h
+@@ -58,6 +58,8 @@ bool panvk_image_can_use_afbc(
+    VkImageUsageFlags usage, VkImageType type, VkImageTiling tiling,
+    VkImageCreateFlags flags);
+ 
++bool panvk_image_compressed_copies_by_blocks(const struct panvk_image *image);
++
+ static inline unsigned
+ panvk_plane_index(const struct panvk_image *image,
+                   VkImageAspectFlags aspect_mask)
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index 28d9fcc..93ebdf4 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -370,6 +370,192 @@ panvk_per_arch(CmdCopyBuffer2)(VkCommandBuffer commandBuffer,
+    meta_compute_end(cmdbuf, &save);
+ }
+ 
++#if PAN_ARCH == 9
++/* Compressed U-interleaved images (see panvk_image_compressed_copies_by_blocks)
++ * are copied block by block with panlib_copy_image_blocks: vk_meta's
++ * uncompressed views would assume 16x16 tiles, compressed ones have 4x4.
++ */
++static bool
++is_compressed_utiled(const struct panvk_image *img)
++{
++   return vk_format_is_compressed(img->vk.format) &&
++          img->vk.drm_format_mod == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED;
++}
++
++struct block_surface {
++   uint64_t base;
++   uint64_t layer_stride;
++   uint32_t row_stride;
++   /* 0 = linear, else log2 of the U-interleaved tile size in blocks */
++   uint32_t tile_shift;
++};
++
++static struct block_surface
++image_block_surface(const struct panvk_image *img, uint32_t mip,
++                    uint32_t first_layer_or_z)
++{
++   const struct pan_image_plane *plane = &img->planes[0].plane;
++   const struct pan_image_slice_layout *slice = &plane->layout.slices[mip];
++   const uint64_t layer_stride = img->vk.image_type == VK_IMAGE_TYPE_3D
++                                    ? slice->tiled_or_linear.surface_stride_B
++                                    : plane->layout.array_stride_B;
++   uint32_t tile_shift = 0;
++
++   assert(!drm_is_afbc(img->vk.drm_format_mod));
++   if (img->vk.drm_format_mod == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED)
++      tile_shift = vk_format_is_compressed(img->vk.format) ? 2 : 4;
++
++   return (struct block_surface){
++      .base = plane->base + slice->offset_B + first_layer_or_z * layer_stride,
++      .layer_stride = layer_stride,
++      .row_stride = slice->tiled_or_linear.row_stride_B,
++      .tile_shift = tile_shift,
++   };
++}
++
++static struct block_surface
++buffer_block_surface(const struct panvk_buffer *buf, VkDeviceSize offset,
++                     VkFormat fmt, uint32_t row_length, uint32_t image_height)
++{
++   const uint32_t row_stride = DIV_ROUND_UP(row_length,
++                                            vk_format_get_blockwidth(fmt)) *
++                               vk_format_get_blocksize(fmt);
++
++   return (struct block_surface){
++      .base = panvk_buffer_gpu_ptr(buf, offset),
++      .layer_stride = (uint64_t)DIV_ROUND_UP(image_height,
++                                             vk_format_get_blockheight(fmt)) *
++                      row_stride,
++      .row_stride = row_stride,
++   };
++}
++
++static void
++copy_blocks(struct panvk_cmd_buffer *cmdbuf, const struct block_surface *src,
++            uint32_t src_x, uint32_t src_y, const struct block_surface *dst,
++            uint32_t dst_x, uint32_t dst_y, uint32_t width, uint32_t height,
++            uint32_t layers, uint32_t block_size)
++{
++   const uint32_t count = width * height;
++
++   if (!count || !layers)
++      return;
++
++   struct panvk_precomp_ctx ctx = panvk_per_arch(precomp_cs)(cmdbuf);
++   panlib_copy_image_blocks(&ctx, panlib_3d(DIV_ROUND_UP(count, 64), layers, 1),
++                            PANLIB_BARRIER_NONE, src->base, dst->base,
++                            src->layer_stride, dst->layer_stride,
++                            src->row_stride, dst->row_stride, src_x, src_y,
++                            dst_x, dst_y, width, count, src->tile_shift,
++                            dst->tile_shift, block_size);
++}
++
++/* Layers (2D arrays) or Z slices (3D) a buffer <-> image region covers. */
++static void
++region_layers(const struct panvk_image *img,
++              const VkImageSubresourceLayers *subres, int32_t z,
++              uint32_t depth, uint32_t *first, uint32_t *count)
++{
++   if (img->vk.image_type == VK_IMAGE_TYPE_3D) {
++      *first = z;
++      *count = depth;
++   } else {
++      *first = subres->baseArrayLayer;
++      *count = vk_image_subresource_layer_count(&img->vk, subres);
++   }
++}
++
++static bool
++copy_buffer_image_blocks(struct panvk_cmd_buffer *cmdbuf,
++                         struct panvk_image *img, struct panvk_buffer *buf,
++                         uint32_t region_count,
++                         const VkBufferImageCopy2 *regions, bool to_image)
++{
++   if (!is_compressed_utiled(img))
++      return false;
++
++   const VkFormat fmt = img->vk.format;
++   const uint32_t bw = vk_format_get_blockwidth(fmt);
++   const uint32_t bh = vk_format_get_blockheight(fmt);
++   const uint32_t bs = vk_format_get_blocksize(fmt);
++
++   for (uint32_t i = 0; i < region_count; i++) {
++      const VkBufferImageCopy2 *r = &regions[i];
++      uint32_t first, layers;
++
++      region_layers(img, &r->imageSubresource, r->imageOffset.z,
++                    r->imageExtent.depth, &first, &layers);
++
++      const struct block_surface isurf =
++         image_block_surface(img, r->imageSubresource.mipLevel, first);
++      const struct block_surface bsurf = buffer_block_surface(
++         buf, r->bufferOffset, fmt,
++         r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width,
++         r->bufferImageHeight ? r->bufferImageHeight : r->imageExtent.height);
++      const uint32_t ix = r->imageOffset.x / bw, iy = r->imageOffset.y / bh;
++      const uint32_t w = DIV_ROUND_UP(r->imageExtent.width, bw);
++      const uint32_t h = DIV_ROUND_UP(r->imageExtent.height, bh);
++
++      if (to_image)
++         copy_blocks(cmdbuf, &bsurf, 0, 0, &isurf, ix, iy, w, h, layers, bs);
++      else
++         copy_blocks(cmdbuf, &isurf, ix, iy, &bsurf, 0, 0, w, h, layers, bs);
++   }
++
++   return true;
++}
++
++static bool
++copy_image_blocks(struct panvk_cmd_buffer *cmdbuf,
++                  const VkCopyImageInfo2 *info)
++{
++   VK_FROM_HANDLE(panvk_image, src, info->srcImage);
++   VK_FROM_HANDLE(panvk_image, dst, info->dstImage);
++
++   if (!is_compressed_utiled(src) && !is_compressed_utiled(dst))
++      return false;
++
++   /* The other image is size-compatible: 64/128-bit, never AFBC on v9. */
++   if (drm_is_afbc(src->vk.drm_format_mod) ||
++       drm_is_afbc(dst->vk.drm_format_mod)) {
++      mesa_loge("panvk: copy between compressed and AFBC images");
++      return false;
++   }
++
++   const uint32_t sbw = vk_format_get_blockwidth(src->vk.format);
++   const uint32_t sbh = vk_format_get_blockheight(src->vk.format);
++   const uint32_t dbw = vk_format_get_blockwidth(dst->vk.format);
++   const uint32_t dbh = vk_format_get_blockheight(dst->vk.format);
++   const uint32_t bs = vk_format_get_blocksize(src->vk.format);
++
++   assert(bs == vk_format_get_blocksize(dst->vk.format));
++
++   for (uint32_t i = 0; i < info->regionCount; i++) {
++      const VkImageCopy2 *r = &info->pRegions[i];
++      uint32_t src_first, dst_first, layers, dst_layers;
++
++      /* The extent is in source texels. */
++      region_layers(src, &r->srcSubresource, r->srcOffset.z, r->extent.depth,
++                    &src_first, &layers);
++      region_layers(dst, &r->dstSubresource, r->dstOffset.z, r->extent.depth,
++                    &dst_first, &dst_layers);
++      layers = MIN2(layers, dst_layers);
++
++      const struct block_surface ssurf =
++         image_block_surface(src, r->srcSubresource.mipLevel, src_first);
++      const struct block_surface dsurf =
++         image_block_surface(dst, r->dstSubresource.mipLevel, dst_first);
++
++      copy_blocks(cmdbuf, &ssurf, r->srcOffset.x / sbw, r->srcOffset.y / sbh,
++                  &dsurf, r->dstOffset.x / dbw, r->dstOffset.y / dbh,
++                  DIV_ROUND_UP(r->extent.width, sbw),
++                  DIV_ROUND_UP(r->extent.height, sbh), layers, bs);
++   }
++
++   return true;
++}
++#endif
++
+ static bool
+ lower_copy_buffer_to_image(
+    VkCommandBuffer commandBuffer,
+@@ -457,6 +643,14 @@ panvk_per_arch(CmdCopyBufferToImage2)(
+    if (lower_copy_buffer_to_image(commandBuffer, pCopyBufferToImageInfo))
+       return;
+ 
++#if PAN_ARCH == 9
++   VK_FROM_HANDLE(panvk_buffer, buf, pCopyBufferToImageInfo->srcBuffer);
++   if (copy_buffer_image_blocks(cmdbuf, img, buf,
++                                pCopyBufferToImageInfo->regionCount,
++                                pCopyBufferToImageInfo->pRegions, true))
++      return;
++#endif
++
+    const bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(img);
+    struct vk_meta_copy_image_properties img_props =
+       panvk_meta_copy_get_image_properties(img, use_gfx_pipeline, true);
+@@ -488,6 +682,15 @@ panvk_per_arch(CmdCopyImageToBuffer2)(
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    VK_FROM_HANDLE(panvk_image, img, pCopyImageToBufferInfo->srcImage);
++
++#if PAN_ARCH == 9
++   VK_FROM_HANDLE(panvk_buffer, buf, pCopyImageToBufferInfo->dstBuffer);
++   if (copy_buffer_image_blocks(cmdbuf, img, buf,
++                                pCopyImageToBufferInfo->regionCount,
++                                pCopyImageToBufferInfo->pRegions, false))
++      return;
++#endif
++
+    struct vk_meta_copy_image_properties img_props =
+       panvk_meta_copy_get_image_properties(img, false, false);
+    struct panvk_cmd_meta_compute_save_ctx save = {0};
+@@ -650,6 +853,11 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
+    if (lower_copy_image(commandBuffer, pCopyImageInfo))
+       return;
+ 
++#if PAN_ARCH == 9
++   if (copy_image_blocks(cmdbuf, pCopyImageInfo))
++      return;
++#endif
++
+    const bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dst_img);
+    struct vk_meta_copy_image_properties dst_img_props =
+       panvk_meta_copy_get_image_properties(dst_img, use_gfx_pipeline, true);
+-- 
+2.56.0
+

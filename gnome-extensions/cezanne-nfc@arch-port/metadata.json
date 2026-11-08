@@ -1,0 +1,8 @@
+{
+  "uuid": "cezanne-nfc@arch-port",
+  "name": "Cezanne NFC",
+  "description": "Quick Settings NFC toggle and tag notifications through neard (Redmi K30 Ultra port)",
+  "shell-version": ["51"],
+  "settings-schema": "org.gnome.shell.extensions.cezanne-nfc",
+  "session-modes": ["user", "unlock-dialog"]
+}

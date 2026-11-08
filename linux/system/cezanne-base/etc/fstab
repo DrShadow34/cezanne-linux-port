@@ -1,0 +1,7 @@
+# Static information about the filesystems.
+# / is userdata (btrfs, label arch-root): subvolume @, the default one, mounted
+# by the initramfs (archboot) with these options; /home is subvolume @home.
+LABEL=arch-root	/	btrfs	noatime,compress=zstd:1	0 0
+LABEL=arch-root	/home	btrfs	noatime,compress=zstd:1,subvol=/@home	0 0
+# Swap on MIUI's old super partition (same UFS device), below zram (pri 100).
+LABEL=arch-swap	none	swap	defaults,pri=10,discard	0 0

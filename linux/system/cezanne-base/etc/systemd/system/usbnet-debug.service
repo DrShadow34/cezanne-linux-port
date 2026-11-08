@@ -1,0 +1,9 @@
+[Unit]
+Description=Bring-up: log USB network counters
+After=cezanne-usbd.service
+
+[Service]
+ExecStart=/usr/local/bin/usbnet-debug
+
+[Install]
+WantedBy=multi-user.target

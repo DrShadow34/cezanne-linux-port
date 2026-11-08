@@ -1,0 +1,16 @@
+[Unit]
+Description=Battery use while the phone is locked (cezanne-power)
+After=systemd-logind.service
+
+[Service]
+ExecStart=/usr/lib/cezanne-power/cezanne-standby-log
+StateDirectory=cezanne-power
+StateDirectoryMode=0755
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

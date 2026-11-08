@@ -1,0 +1,166 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 9e10f5e1c..3b6d504b7 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -1020,8 +1020,12 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 				   mtk_crtc->cmdq_vblank_cnt == 0,
+ 				   msecs_to_jiffies(500));
+ #endif
+-	/* Wait for planes to be disabled */
+-	drm_crtc_wait_one_vblank(crtc);
++	/*
++	 * Wait for planes to be disabled. Command mode: the DSI output is
++	 * already off, no frame goes out and nothing scans the planes.
++	 */
++	if (!mtk_crtc->cmd_dsi)
++		drm_crtc_wait_one_vblank(crtc);
+ 
+ 	drm_crtc_vblank_off(crtc);
+ 	mtk_crtc_ddp_hw_fini(mtk_crtc);
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+index e6d987e67..cfa38832e 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+@@ -750,6 +750,40 @@ static void mtk_ddp_comp_clk_put(void *_clk)
+ 	clk_put(clk);
+ }
+ 
++/*
++ * Without an IOMMU nothing links a DMA block to its SMI larb ("mediatek,larb"):
++ * the larb would stay runtime-suspended, its clocks off and, after the
++ * display domain was power-cycled (suspend), its ports back to translated.
++ */
++static int mtk_ddp_comp_link_larb(struct device_node *node, struct device *dev)
++{
++	struct platform_device *larb_pdev;
++	struct device_node *larb_node;
++	struct device_link *link;
++
++	larb_node = of_parse_phandle(node, "mediatek,larb", 0);
++	if (!larb_node)
++		return 0;
++
++	larb_pdev = of_find_device_by_node(larb_node);
++	of_node_put(larb_node);
++	if (!larb_pdev)
++		return -EPROBE_DEFER;
++	if (!platform_get_drvdata(larb_pdev)) {
++		put_device(&larb_pdev->dev);
++		return -EPROBE_DEFER;
++	}
++
++	link = device_link_add(dev, &larb_pdev->dev,
++			       DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
++	put_device(&larb_pdev->dev);
++	if (!link) {
++		dev_err(dev, "Unable to link SMI larb\n");
++		return -EINVAL;
++	}
++	return 0;
++}
++
+ int mtk_ddp_comp_init(struct device *dev, struct device_node *node, struct mtk_ddp_comp *comp,
+ 		      unsigned int comp_id)
+ {
+@@ -782,6 +816,10 @@ int mtk_ddp_comp_init(struct device *dev, struct device_node *node, struct mtk_d
+ 	if (ret)
+ 		return ret;
+ 
++	ret = mtk_ddp_comp_link_larb(node, comp->dev);
++	if (ret)
++		return ret;
++
+ 	if (type == MTK_DISP_AAL ||
+ 	    type == MTK_DISP_BLS ||
+ 	    type == MTK_DISP_CCORR ||
+diff --git a/drivers/memory/mtk-smi.c b/drivers/memory/mtk-smi.c
+index aaeba8ab2..2b294f82a 100644
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -157,6 +157,13 @@ struct mtk_smi_larb { /* larb: local arbiter */
+ 	int				larbid;
+ 	u32				*mmu;
+ 	unsigned char			*bank;
++	/*
++	 * Without an IOMMU bound to it the larb keeps every port in MMU
++	 * bypass (physical addresses): its id then comes from the DT and
++	 * mmu points here.
++	 */
++	u32				no_mmu;
++	unsigned char			no_bank[32];
+ };
+ 
+ static int
+@@ -280,6 +287,16 @@ static int mtk_smi_larb_config_port_gen2_general(struct device *dev)
+ 		reg |= BANK_SEL(larb->bank[i]);
+ 		writel(reg, larb->base + SMI_LARB_NONSEC_CON(i));
+ 	}
++
++	/* no IOMMU: the ports come up translated after a power cycle */
++	if (larb->mmu == &larb->no_mmu) {
++		for (i = 0; i < 32; i++) {
++			reg = readl_relaxed(larb->base + SMI_LARB_NONSEC_CON(i));
++			if (reg & F_MMU_EN)
++				writel(reg & ~F_MMU_EN,
++				       larb->base + SMI_LARB_NONSEC_CON(i));
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -550,6 +567,7 @@ static const struct of_device_id mtk_smi_larb_of_ids[] = {
+ 	{.compatible = "mediatek,mt2712-smi-larb", .data = &mtk_smi_larb_mt2712},
+ 	{.compatible = "mediatek,mt6779-smi-larb", .data = &mtk_smi_larb_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-larb", .data = &mtk_smi_larb_mt8173},
++	{.compatible = "mediatek,mt6885-smi-larb", .data = &mtk_smi_larb_mt6893},
+ 	{.compatible = "mediatek,mt6893-smi-larb", .data = &mtk_smi_larb_mt6893},
+ 	{.compatible = "mediatek,mt8167-smi-larb", .data = &mtk_smi_larb_mt8167},
+ 	{.compatible = "mediatek,mt8173-smi-larb", .data = &mtk_smi_larb_mt8173},
+@@ -645,6 +663,7 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
+ {
+ 	struct mtk_smi_larb *larb;
+ 	struct device *dev = &pdev->dev;
++	u32 larbid;
+ 	int ret;
+ 
+ 	larb = devm_kzalloc(dev, sizeof(*larb), GFP_KERNEL);
+@@ -663,6 +682,12 @@ static int mtk_smi_larb_probe(struct platform_device *pdev)
+ 
+ 	larb->smi.dev = dev;
+ 
++	/* an IOMMU binding the larb replaces these */
++	larb->mmu = &larb->no_mmu;
++	larb->bank = larb->no_bank;
++	if (!of_property_read_u32(dev->of_node, "mediatek,larb-id", &larbid))
++		larb->larbid = larbid;
++
+ 	ret = mtk_smi_device_link_common(dev, &larb->smi_common_dev);
+ 	if (ret < 0)
+ 		return ret;
+@@ -845,6 +870,7 @@ static const struct of_device_id mtk_smi_common_of_ids[] = {
+ 	{.compatible = "mediatek,mt2712-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt6779-smi-common", .data = &mtk_smi_common_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-common", .data = &mtk_smi_common_mt6795},
++	{.compatible = "mediatek,mt6885-smi-common", .data = &mtk_smi_common_mt6893},
+ 	{.compatible = "mediatek,mt6893-smi-common", .data = &mtk_smi_common_mt6893},
+ 	{.compatible = "mediatek,mt8167-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt8173-smi-common", .data = &mtk_smi_common_gen2},
+diff --git a/drivers/pmdomain/mediatek/mt6885-pm-domains.h b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+index 054d99372..ec1a449a3 100644
+--- a/drivers/pmdomain/mediatek/mt6885-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+@@ -222,7 +222,14 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 		 * No bus protection yet: releasing the BSP DIS masks (they
+ 		 * overlap CAM's MM bits) while CAM is off hung the boot.
+ 		 * TODO: model them before the domain is ever powered off.
++		 *
++		 * Always on: a power cycle (s2idle) also loses everything lk
++		 * set up and mediatek-drm does not program yet (OVL/RDMA fetch
++		 * thresholds, PQ shadow and window registers, DSI extras): the
++		 * pipe then stalls after resume. The display blocks and SMI are
++		 * still clock-gated while the screen is off.
+ 		 */
++		.caps = MTK_SCPD_ALWAYS_ON,
+ 	},
+ 	[MT6885_POWER_DOMAIN_CAM] = {
+ 		.name = "cam",

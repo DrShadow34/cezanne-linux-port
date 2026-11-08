@@ -1,0 +1,24 @@
+[Unit]
+Description=Modem services (cezanne: NVRAM file service, RPC, MD boot)
+Before=ModemManager.service
+After=systemd-modules-load.service
+
+[Service]
+ExecStartPre=/usr/bin/modprobe cezanne_ccci
+ExecStart=/usr/bin/cezanne-modemd
+# leave the MD powered off for lk on the next boot, but keep it running
+# across a restart of the service: a warm restart of an MD that has been up
+# for a while does not reach HS1 (only a reboot recovers it)
+ExecStopPost=/bin/sh -c 'systemctl is-system-running | grep -q stopping && echo 0 > /sys/devices/platform/cezanne-ccci/boot || true'
+Restart=on-failure
+RestartSec=5
+StateDirectory=cezanne-modem
+StateDirectoryMode=0700
+RuntimeDirectory=cezanne-modem
+RuntimeDirectoryPreserve=yes
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

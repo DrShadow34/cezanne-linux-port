@@ -1,0 +1,26 @@
+# cezanne-photo: the camera app's picture helpers (snapshot overlay; NOTES
+# "Camera app", mainline/camera/README.md): cezanne-mono streams the mono
+# sensor and takes exposure brackets; cezanne-photo denoises, fuses HDR,
+# renders portrait and low-light pictures from the main + mono pair, and
+# upscales on the APU through cezanne-upscaled (package cezanne-upscale:
+# Real-ESRGAN x4plus on the MDLA), else on the GPU through
+# realesrgan-ncnn-vulkan (models in /usr/share/realesrgan/models). Snapshot
+# finds both helpers in PATH.
+pkgname=cezanne-photo
+pkgver=1.0
+pkgrel=10
+pkgdesc="Redmi K30 Ultra camera helpers: mono sensor brackets, HDR, portrait, low light, denoise"
+arch=(aarch64)
+url="https://localhost/arch-port"
+license=(GPL-2.0-or-later)
+depends=(glibc gcc-libs opencv exiv2)
+optdepends=('cezanne-upscale: AI upscaling on the APU (--upscale, Real-ESRGAN x4plus)'
+            'realesrgan-ncnn-vulkan: AI upscaling on the GPU (--upscale, upscayl-lite-4x)')
+
+build() {
+  "$startdir/build.sh" "$srcdir"
+}
+
+package() {
+  install -Dm755 -t "$pkgdir/usr/bin" "$srcdir/cezanne-mono" "$srcdir/cezanne-photo"
+}

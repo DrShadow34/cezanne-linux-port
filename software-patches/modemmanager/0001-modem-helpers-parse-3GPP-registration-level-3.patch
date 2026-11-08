@@ -1,0 +1,21 @@
+--- a/src/mm-modem-helpers.c	2026-10-30 03:13:16.417403343 +0100
++++ b/src/mm-modem-helpers.c	2026-10-30 03:13:16.438118363 +0100
+@@ -879,6 +879,18 @@
+     [12] = "\\+(C5GREG):\\s*([0-9]+)\\s*,\\s*([^,\\s]*)\\s*,\\s*([^,\\s]*)\\s*,\\s*([0-9]+)\\s*,\\s*([^,\\s]*)\\s*,\\s*([^,\\s]*)",
+     /* +C5GREG: <n>,<stat>,<lac>,<ci>,<AcT>,<Allowed_NSSAI_length>,<Allowed_NSSAI> (ETSI 27.007 solicited) */
+     [13] = "\\+(C5GREG):\\s*([0-9]+)\\s*,\\s*([0-9+])\\s*,\\s*([^,\\s]*)\\s*,\\s*([^,\\s]*)\\s*,\\s*([0-9]+)\\s*,\\s*([^,\\s]*)\\s*,\\s*([^,\\s]*)",
++    /* Reporting level 3 (3GPP 27.007, with <cause_type>,<reject_cause>), as
++     * MediaTek modems always answer; AcT may be two digits (13 = EN-DC).
++     * The cause fields are not captured, so the match counts fall into the
++     * branches of the level 2 forms above. */
++    /* +CREG|CEREG: <n>,<stat>,<lac>,<ci>,<AcT>,<cause_type>,<reject_cause> (solicited) */
++    [14] = "\\+(CREG|CEREG):\\s*0*([0-9]),\\s*0*([0-9])\\s*,\\s*([^,\\s]*)\\s*,\\s*([^,\\s]*)\\s*,\\s*0*([0-9]+)\\s*,\\s*[^,\\s]*\\s*,\\s*[^,\\s]*",
++    /* +CREG|CEREG: <stat>,<lac>,<ci>,<AcT>,<cause_type>,<reject_cause> (unsolicited) */
++    [15] = "\\+(CREG|CEREG):\\s*0*([0-9])\\s*,\\s*([^,\\s]*)\\s*,\\s*([^,\\s]*)\\s*,\\s*0*([0-9]+)\\s*,\\s*[^,\\s]*\\s*,\\s*[^,\\s]*",
++    /* +CGREG: <n>,<stat>,<lac>,<ci>,<AcT>,<rac>,<cause_type>,<reject_cause> (solicited) */
++    [16] = "\\+(CGREG):\\s*0*([0-9]),\\s*0*([0-9])\\s*,\\s*([^,\\s]*)\\s*,\\s*([^,\\s]*)\\s*,\\s*0*([0-9]+)\\s*,\\s*[^,\\s]*\\s*,\\s*[^,\\s]*\\s*,\\s*[^,\\s]*",
++    /* +CGREG: <stat>,<lac>,<ci>,<AcT>,<rac>,<cause_type>,<reject_cause> (unsolicited) */
++    [17] = "\\+(CGREG):\\s*0*([0-9])\\s*,\\s*([^,\\s]*)\\s*,\\s*([^,\\s]*)\\s*,\\s*0*([0-9]+)\\s*,\\s*[^,\\s]*\\s*,\\s*[^,\\s]*\\s*,\\s*[^,\\s]*",
+ };
+ 
+ GPtrArray *

@@ -1,0 +1,4 @@
+# Arch's snapshot + the cezanne fork (apps/snapshot): replaces both the stock
+# app and the old Devel build in /usr/local
+UPSTREAM=snapshot
+SUFFIX=6

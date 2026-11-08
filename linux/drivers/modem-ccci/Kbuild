@@ -1,0 +1,2 @@
+obj-m += cezanne_ccci.o
+cezanne_ccci-y := core.o ccif.o rtdata.o port.o dpmaif.o

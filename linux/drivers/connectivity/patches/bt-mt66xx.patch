@@ -1,0 +1,277 @@
+diff --git a/6885/Kbuild b/6885/Kbuild
+index 50d9428..88261df 100644
+--- a/6885/Kbuild
++++ b/6885/Kbuild
+@@ -1,5 +1,5 @@
+ BT_PLATFORM := 6885
+ LOG_TAG := [BT_Drv][btif]
+-KO_PATH := $(if $(filter /%,$(src)),,$(srctree)/)$(src)
++KO_PATH := $(M)
+ 
+ include $(KO_PATH)/../btif/Kbuild
+diff --git a/btif/Kbuild b/btif/Kbuild
+index 33bd5a1..20864f9 100644
+--- a/btif/Kbuild
++++ b/btif/Kbuild
+@@ -13,7 +13,7 @@ else
+ LINUXINCLUDE := $(DEVCIE_MODULES_INCLUDE) $(LINUXINCLUDE)
+ TOP := $(srctree)/..
+ endif
+-KO_PATH := $(if $(filter /%,$(src)),,$(srctree)/)$(src)
++KO_PATH := $(M)
+ $(info [bt_drv] btif/Kbuild KO_PATH=$(KO_PATH) DEVICE_MODULES_PATH=$(DEVICE_MODULES_PATH))
+ 
+ ifndef TOP
+@@ -25,7 +25,7 @@ ifneq ($(KERNEL_OUT),)
+ endif
+ 
+ # Force build fail on modpost warning
+-KBUILD_MODPOST_FAIL_ON_WARNINGS := y
++# KBUILD_MODPOST_FAIL_ON_WARNINGS := y
+ 
+ # platform
+ 
+@@ -126,7 +126,8 @@ endif
+ ccflags-y += -D CHIP_IF_BTIF
+ 
+ # Use device node or hci_dev as native interface
+-ccflags-y += -D USE_DEVICE_NODE=1
++# mainline: register a BlueZ hci_dev instead of /dev/stpbt
++ccflags-y += -D USE_DEVICE_NODE=0
+ 
+ # Customized fw update feature
+ ccflags-y += -D CUSTOMER_FW_UPDATE=0
+@@ -146,7 +147,7 @@ ccflags-y += -D CONFIG_MP_WAKEUP_SOURCE_SYSFS_STAT=1
+ CONN_INFRA_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra
+ CONNFEM_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/connfem
+ WMT_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/common
+-BTIF_SRC := $(DEVICE_MODULES_PATH)/drivers/misc/mediatek/btif
++BTIF_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/btif
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/connectivity/common
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/mt-plat/
+ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/connectivity/power_throttling
+@@ -159,6 +160,7 @@ ccflags-y += -I$(CONNFEM_SRC)/include
+ ccflags-y += -I$(WMT_SRC)/debug_utility
+ ccflags-y += -I$(BTIF_SRC)/common/inc
+ 
++ccflags-y += -include $(CONNINFRA_SRC)/../compat/include/compat_mainline.h -I$(CONNINFRA_SRC)/../compat/include
+ ccflags-y += -I$(KO_PATH)/core/include
+ ccflags-y += -I$(KO_PATH)/connsys/connac_2_0
+ ccflags-y += -I$(KO_PATH)/../include
+@@ -176,7 +178,7 @@ endif
+ 
+ CORE_OBJS := btif/btmtk_dbg.o btif/btmtk_dbg_tp_evt_if.o btif/btmtk_irq.o btif/btmtk_char_dev.o btmtk_fw_log.o btmtk_main.o
+ CHIP_OBJS := btif/btmtk_mt66xx.o
+-HIF_OBJS := btif/btmtk_btif_main.o btif/btmtk_queue.o btif/btmtk_beif.o btif/btmtk_beif_plat.o
++HIF_OBJS := btif/connfem_absent.o btif/btmtk_btif_main.o btif/btmtk_queue.o btif/btmtk_beif.o btif/btmtk_beif_plat.o
+ 
+ $(MODULE_NAME)-objs  += $(CORE_OBJS)
+ $(MODULE_NAME)-objs  += $(HIF_OBJS)
+diff --git a/btif/btmtk_btif_main.c b/btif/btmtk_btif_main.c
+index f4936c0..41be2d1 100644
+--- a/btif/btmtk_btif_main.c
++++ b/btif/btmtk_btif_main.c
+@@ -72,10 +72,56 @@ struct btmtk_btif_dev g_btif_dev;
+ struct bt_dbg_st g_bt_dbg_st;
+ static struct work_struct internal_trx_work;
+ 
++#if SUPPORT_BT_THREAD && (SUPPORT_BEIF == 0)
++/*
++ * mainline hci_suspend_dev() talks to the controller right before suspend, so
++ * BGFSYS is often still awake (BTIF in B_S_ON) when the BTIF device suspends,
++ * and BTIF then refuses with -1. This device is added after BTIF probed, so it
++ * suspends first: put BGFSYS to sleep and run the pending deep idle work now.
++ */
++static int mtkbt_btif_pm_suspend(struct device *dev)
++{
++	struct btmtk_btif_dev *cif_dev;
++	struct bt_psm_ctrl *psm;
++	int i;
++
++	if (!g_sbdev || !g_sbdev->cif_dev)
++		return 0;
++	cif_dev = (struct btmtk_btif_dev *)g_sbdev->cif_dev;
++	if (cif_dev->bt_state != FUNC_ON)
++		return 0;
++	psm = &cif_dev->psm;
++
++	for (i = 0; i < 100; i++) {
++		if (psm->state == PSM_ST_SLEEP && !psm->sleep_flag)
++			break;
++		if (!psm->sleep_flag) {
++			psm->sleep_flag = TRUE;
++			wake_up_interruptible(&cif_dev->tx_waitq);
++		}
++		usleep_range(10000, 11000);
++	}
++	if (cif_dev->btif_dpidle_ctrl.task)
++		flush_delayed_work(&cif_dev->btif_dpidle_ctrl.work);
++	if (psm->state != PSM_ST_SLEEP) {
++		BTMTK_WARN("%s: BGFSYS still awake", __func__);
++		return -EBUSY;
++	}
++	return 0;
++}
++
++static const struct dev_pm_ops mtkbt_btif_pm_ops = {
++	.suspend = mtkbt_btif_pm_suspend,
++};
++#endif
++
+ static struct platform_driver mtkbt_btif_driver = {
+ 	.driver = {
+ 		.name = MTKBT_BTIF_NAME,
+ 		.owner = THIS_MODULE,
++#if SUPPORT_BT_THREAD && (SUPPORT_BEIF == 0)
++		.pm = &mtkbt_btif_pm_ops,
++#endif
+ 	},
+ 	.probe = NULL,
+ 	.remove = NULL,
+@@ -586,7 +632,7 @@ void bt_notify_state(void)
+  *     0 if success, otherwise error code
+  *
+  */
+-void bt_report_hw_error()
++void bt_report_hw_error(void)
+ {
+ 	const uint8_t HCI_EVT_HW_ERROR[] = {0x04, 0x10, 0x01, 0x00};
+ 	btmtk_recv(g_sbdev->hdev, HCI_EVT_HW_ERROR, sizeof(HCI_EVT_HW_ERROR));
+@@ -1684,8 +1730,10 @@ static int btmtk_cif_probe(struct platform_device *pdev)
+ 	/* 2. Init HCI device */
+ 	btmtk_allocate_hci_device(g_sbdev, HCI_UART);
+ #if (USE_DEVICE_NODE == 0)
++	/* registered at the end of btmtk_cif_register(): the kernel powers the
++	 * controller on for setup right away, which needs the chip in WORKING
++	 * state and the IRQs requested */
+ 	SET_HCIDEV_DEV(g_sbdev->hdev, BTMTK_GET_DEV(cif_dev));
+-	btmtk_register_hci_device(g_sbdev);
+ #endif
+ 
+ 	/* 3. Init power manager */
+@@ -1765,7 +1813,7 @@ static int btmtk_cif_probe(struct platform_device *pdev)
+  * Return Value:
+  *     0 if success, otherwise error code
+  */
+-static int btmtk_cif_remove(struct platform_device *pdev)
++static void btmtk_cif_remove(struct platform_device *pdev)
+ {
+ 	struct btmtk_btif_dev *cif_dev = (struct btmtk_btif_dev *)g_sbdev->cif_dev;
+ 
+@@ -1798,7 +1846,7 @@ static int btmtk_cif_remove(struct platform_device *pdev)
+ 
+ 	bt_reg_deinit();
+ 
+-	return 0;
++	return;
+ }
+ 
+ /* btmtk_cif_register
+@@ -1873,6 +1921,9 @@ int btmtk_cif_register(void)
+ 	if (ret)
+ 		return -1;
+ 	btmtk_reset_init();
++#if (USE_DEVICE_NODE == 0)
++	btmtk_register_hci_device(g_sbdev);
++#endif
+ 
+ 	BTMTK_INFO("%s: Done", __func__);
+ 	return 0;
+diff --git a/btif/connfem_absent.c b/btif/connfem_absent.c
+new file mode 100644
+index 0000000..7476ff2
+--- /dev/null
++++ b/btif/connfem_absent.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * cezanne has no external BT front-end and no connfem DT node, so the connfem
++ * module is not ported: report "no FEM" (vid/pid 0 makes the BT driver skip
++ * its FEM command).
++ */
++#include <linux/string.h>
++#include "connfem_api.h"
++
++int connfem_epaelna_get_fem_info(struct connfem_epaelna_fem_info *fem_info)
++{
++	memset(fem_info, 0, sizeof(*fem_info));
++	return 0;
++}
++
++int connfem_epaelna_get_pin_info(struct connfem_epaelna_pin_info *pin_info)
++{
++	memset(pin_info, 0, sizeof(*pin_info));
++	return 0;
++}
++
++int connfem_epaelna_get_flags(enum connfem_subsys subsys, void *flags)
++{
++	memset(flags, 0, sizeof(struct connfem_epaelna_flags_bt));
++	return 0;
++}
+diff --git a/btmtk_main.c b/btmtk_main.c
+index 044442c..4a8e027 100644
+--- a/btmtk_main.c
++++ b/btmtk_main.c
+@@ -3501,6 +3501,22 @@ exit:
+ 	return ret;
+ }
+ 
++#if CFG_SUPPORT_BLUEZ
++/* MediaTek vendor command, as drivers/bluetooth/btmtk.c btmtk_set_bdaddr() */
++static int bt_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
++{
++	struct sk_buff *skb;
++
++	skb = __hci_cmd_sync(hdev, 0xfc1a, sizeof(bdaddr_t), bdaddr, HCI_INIT_TIMEOUT);
++	if (IS_ERR(skb)) {
++		BTMTK_ERR("%s: change address failed (%ld)", __func__, PTR_ERR(skb));
++		return PTR_ERR(skb);
++	}
++	kfree_skb(skb);
++	return 0;
++}
++#endif
++
+ static int bt_setup(struct hci_dev *hdev)
+ {
+ 	int ret = 0;
+@@ -3754,6 +3770,21 @@ int btmtk_allocate_hci_device(struct btmtk_dev *bdev, int hci_bus_type)
+ 	hdev->flush    = bt_flush;
+ 	hdev->send	   = bt_send_frame;
+ 	hdev->setup    = bt_setup;
++#if CFG_SUPPORT_BLUEZ
++	/* the firmware's address is a placeholder (00:00:46:...): stay
++	 * unconfigured until userspace sets the one from nvdata (BT_Addr) */
++	hdev->set_bdaddr = bt_set_bdaddr;
++	hci_set_quirk(hdev, HCI_QUIRK_INVALID_BDADDR);
++	/* every power off cuts ConnInfra and the chip forgets the address:
++	 * run setup (set_bdaddr) on each power on, not only the first;
++	 * else hci0 comes back as 00:00:46:67:61:01 and paired devices
++	 * (a controller reconnecting) page an address nobody answers */
++	hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
++	/* MT6885 CONNSYS BT advertises Synchronization Train in LMP features
++	 * page 2 but answers HCI_Read_Synchronization_Train_Parameters with
++	 * "unknown command", which aborts the kernel's controller init */
++	hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LOCAL_EXT_FEATURES_PAGE_2);
++#endif
+ 
+ 	init_waitqueue_head(&bdev->p_wait_event_q);
+ 
+diff --git a/include/btmtk_chip_if.h b/include/btmtk_chip_if.h
+index 60c79da..f2342c7 100644
+--- a/include/btmtk_chip_if.h
++++ b/include/btmtk_chip_if.h
+@@ -16,7 +16,12 @@
+ #include "btmtk_btif.h"
+ #define CFG_SUPPORT_BT_DL_WIFI_PATCH    0
+ #define CFG_SUPPORT_DVT                 0
++#if (USE_DEVICE_NODE == 0)
++/* mainline: keep HCI_SETUP so the kernel runs setup (FW download, BD addr) */
++#define CFG_SUPPORT_BLUEZ               1
++#else
+ #define CFG_SUPPORT_BLUEZ               0
++#endif
+ 
+ #if (CONNAC20_CHIPID == 6885)
+ 	#include "platform_6885.h"

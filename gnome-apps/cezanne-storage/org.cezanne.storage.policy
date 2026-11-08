@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>cezanne port</vendor>
+  <!-- Storage's scan workers as root (pkexec): only root may read btrfs'
+       extent items, i.e. how much space the compressed files take. They
+       send back totals per category and folder, no file contents. -->
+  <action id="org.cezanne.storage.scan">
+    <description>Measure how much space files take on disk</description>
+    <message>Authentication is required to measure the space files take on disk</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/cezanne-storage</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--root-worker</annotate>
+  </action>
+</policyconfig>

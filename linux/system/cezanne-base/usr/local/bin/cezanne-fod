@@ -1,0 +1,8 @@
+#!/bin/sh
+# cezanne-fod off|icon|press: drive the FOD spot (cezanne-fod@arch-port)
+case "$1" in
+off) s=0 ;; icon) s=1 ;; press) s=2 ;;
+*) echo "usage: $0 off|icon|press" >&2; exit 1 ;;
+esac
+exec gdbus call --session --dest org.cezanne.Fod --object-path /org/cezanne/Fod \
+	--method org.cezanne.Fod.SetState "$s" >/dev/null

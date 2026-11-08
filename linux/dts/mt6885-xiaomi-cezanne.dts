@@ -1,0 +1,1972 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Redmi K30 Ultra (cezanne, M2006J10C)
+ */
+/dts-v1/;
+
+#include "mt6885.dtsi"
+#include <dt-bindings/iio/adc/mediatek,mt6359-auxadc.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/usb/pd.h>
+
+/*
+ * The board NTCs (NCP15WF104F03RC, 100 kOhm at 25 C) on the SoC AUXADC
+ * with a 390 kOhm pull-up to 1.8 V: the BSP's MT6885 defaults (tmp_bts.h,
+ * mtk_ts_bts.c table 7); mV = 1800 R / (R + 390000), 5 C steps. Above
+ * 1500 mV (below about -27 C) the ADC saturates.
+ */
+#define CEZANNE_NTC_TABLE \
+	(-40000) 1653 (-35000) 1598 (-30000) 1529 (-25000) 1444 \
+	(-20000) 1344 (-15000) 1232 (-10000) 1111 (-5000) 985 \
+	0 860 5000 740 10000 629 15000 530 \
+	20000 442 25000 367 30000 304 35000 251 \
+	40000 207 45000 171 50000 141 55000 117 \
+	60000 97 65000 81 70000 67 75000 56 \
+	80000 47 85000 40 90000 34 95000 29 \
+	100000 25 105000 21 110000 18 115000 15 \
+	120000 13 125000 12
+
+/ {
+	model = "Xiaomi Redmi K30 Ultra";
+	compatible = "xiaomi,cezanne", "mediatek,mt6885";
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x2 0x00000000>;	/* 8 GiB */
+	};
+
+	chosen {
+		/* initrd range is filled in by mkboot-mainline.sh at build time */
+		bootargs = "watchdog.handle_boot_enabled=0 printk.devkmsg=on console=tty0 quiet splash loglevel=3 vt.global_cursor_default=0 panic=5 clk_ignore_unused fw_devlink.sync_state=timeout mem_sleep_default=s2idle cma=512M";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * lk's scanout buffer (OVL0/OVL1 layer 1, dual pipe, 540 px each);
+		 * mtk-dsi-cmd-kick below keeps the command-mode panel refreshing it.
+		 */
+		framebuffer0: framebuffer@7b806000 {
+			compatible = "simple-framebuffer";
+			/* lk's buffer, then a back buffer below it in the same carve-out */
+			reg = <0x0 0x7b806000 0x0 0x9e4000>,
+			      <0x0 0x7ae10000 0x0 0x9e4000>;
+			width = <1080>;
+			height = <2400>;
+			stride = <(1080 * 4)>;
+			format = "x8r8g8b8";
+			/* local simpledrm extension: modes at 120 (preferred) and 60 Hz; the kick driver switches the panel */
+			refresh-rates = <120 60>;
+			connector-type = "dsi";	/* local extension: built-in panel for compositors */
+		};
+	};
+
+	lk_kick: lk-display-kick@1400e000 {
+		compatible = "mediatek,lk-dsi-cmd-kick";
+		reg = <0 0x14117000 0 0x1000>,	/* disp_mutex */
+		      <0 0x1400e000 0 0x1000>,	/* dsi0 */
+		      <0 0x14116000 0 0x1000>,	/* dispsys_config */
+		      <0 0x14000000 0 0x1000>,	/* ovl0 (pipe 0) */
+		      <0 0x14100000 0 0x1000>,	/* ovl (pipe 1) */
+		      <0 0x14003000 0 0x1000>,	/* rdma0 (pipe 0) */
+		      <0 0x14103000 0 0x1000>,	/* rdma (pipe 1) */
+		      <0 0x14001000 0 0x1000>,	/* ovl0_2l (pipe 0) */
+		      <0 0x14101000 0 0x1000>;	/* ovl_2l (pipe 1) */
+		reg-names = "mutex", "dsi", "mmsys", "ovl0", "ovl1", "rdma0", "rdma1",
+			    "ovl0_2l", "ovl1_2l";
+		mediatek,mutex-id = <0>;
+		mediatek,refresh-rate = <120>;
+		mediatek,pipe1-offset = <(540 * 4)>;	/* pipe 1 scans the right half */
+		mediatek,max-brightness = <2047>;
+		mediatek,default-brightness = <1023>;
+		mediatek,ovl-xrgb-layers = <1 1>;
+	};
+
+	/*
+	 * MIUI's mtboard-thermistor1-4 (AUXADC channels 0, 1, 2, 4), roles from
+	 * the BSP drivers that bind them: mtktsAP (the AP board), mtktsbtsmdpa
+	 * (the 4G PA); channel 2: mtktsbtsnrpa (the 5G PA; the BSP's backlight
+	 * driver claims it too); channel 4: no BSP driver.
+	 */
+	/* AP board (mtktsAP) */
+	ap_ntc: thermal-sensor-ap {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&auxadc 0>;
+		io-channel-names = "sensor-channel";
+		temperature-lookup-table = <CEZANNE_NTC_TABLE>;
+	};
+
+	/* 4G PA (mtktsbtsmdpa) */
+	mdpa_ntc: thermal-sensor-mdpa {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&auxadc 1>;
+		io-channel-names = "sensor-channel";
+		temperature-lookup-table = <CEZANNE_NTC_TABLE>;
+	};
+
+	/* 5G PA (mtktsbtsnrpa) */
+	nrpa_ntc: thermal-sensor-nrpa {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&auxadc 2>;
+		io-channel-names = "sensor-channel";
+		temperature-lookup-table = <CEZANNE_NTC_TABLE>;
+	};
+
+	/* thermistor 4: role unknown */
+	board4_ntc: thermal-sensor-board4 {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&auxadc 4>;
+		io-channel-names = "sensor-channel";
+		temperature-lookup-table = <CEZANNE_NTC_TABLE>;
+	};
+};
+
+/* the board NTCs: monitoring only for now (no trips, read on demand) */
+/ {
+	thermal-zones {
+		ap-ntc-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&ap_ntc>;
+		};
+
+		mdpa-ntc-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&mdpa_ntc>;
+		};
+
+		nrpa-ntc-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&nrpa_ntc>;
+		};
+
+		board4-ntc-thermal {
+			polling-delay = <0>;
+			polling-delay-passive = <0>;
+			thermal-sensors = <&board4_ntc>;
+		};
+	};
+};
+
+/*
+ * MT6360 sub-PMIC (charger, Type-C, LDOs). Charger and regulators are used;
+ * LDO2 is the touch panel supply "VTP".
+ */
+&i2c5 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	mt6360: pmic@34 {
+		compatible = "mediatek,mt6360";
+		reg = <0x34>;
+		interrupts-extended = <&pio 24 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "IRQB";
+		interrupt-controller;
+		#interrupt-cells = <1>;
+
+		/*
+		 * Type-C port with USB PD (sink): 9 V from PD chargers feeds the
+		 * MT6360 charger (input limit from the contract, see
+		 * rootfs mt6360-chg-setup; PPS for the BQ25970 charge pump:
+		 * rootfs cezanne-dcharge). Dual role (try sink) so analog
+		 * USB-C headset adapters (Ra/Ra) enter Audio Accessory Mode:
+		 * the FSA4480 on the SBU port switches D+/D-/SBU to the MT6359
+		 * headphone outputs and AIN1, the sound card reports the jack
+		 * (mode-switch). Data role dual: USB host (xHCI) when the
+		 * phone is the source / DFP, VBUS from the MT6360 OTG boost;
+		 * device (USB gadget) otherwise.
+		 */
+		tcpc {
+			compatible = "mediatek,mt6360-tcpc";
+			interrupts-extended = <&pio 25 IRQ_TYPE_LEVEL_LOW>;
+			interrupt-names = "PD_IRQB";
+			pinctrl-names = "default";
+			pinctrl-0 = <&tcpc_irq>;
+			/* by name, not vbus-supply: see tcpci_mt6360 (patch 0040) */
+			richtek,vbus-regulator = "usb-otg-vbus";
+
+			connector {
+				compatible = "usb-c-connector";
+				label = "USB-C";
+				data-role = "dual";
+				power-role = "dual";
+				try-power-role = "sink";
+				source-pdos = <PDO_FIXED(5000, 500, PDO_FIXED_USB_COMM)>;
+				sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM)
+					     PDO_FIXED(9000, 2000, 0)>;
+				op-sink-microwatt = <18000000>;
+				accessory-mode-audio;
+				mode-switch = <&sound>;
+				/*
+				 * references, not graph links: fw_devlink would make
+				 * the whole I2C bus wait for the USB controller
+				 */
+				usb-role-switch = <&ssusb>;
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@2 {
+						reg = <2>;
+
+						usb_c_sbu: endpoint {
+							remote-endpoint = <&fsa4480_sbu>;
+						};
+					};
+				};
+			};
+		};
+
+		mt6360_chg: charger {
+			compatible = "mediatek,mt6360-chg";
+			richtek,vinovp-microvolt = <14500000>;
+
+			otg_vbus: usb-otg-vbus-regulator {
+				regulator-name = "usb-otg-vbus";
+				regulator-min-microvolt = <4425000>;
+				regulator-max-microvolt = <5825000>;
+			};
+		};
+
+		regulator {
+			compatible = "mediatek,mt6360-regulator";
+
+			/* fingerprint sensor (vendor "VFP"; 3.0 V for the G6 sensor) */
+			mt6360_vfp: ldo1 {
+				regulator-name = "vfp";
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+			};
+
+			mt6360_vtp: ldo2 {
+				regulator-name = "vtp";
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+			};
+		};
+
+		/*
+		 * Rear flash: FLED1/FLED2 (vendor: two colour temperatures,
+		 * strobe 750/800 mA, torch 37.5 mA). The vendor names ISINK1
+		 * "white"; the sinks are described to find the third LED.
+		 */
+		led-controller {
+			compatible = "mediatek,mt6360-led";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			led@0 {
+				reg = <0>;
+				function = LED_FUNCTION_INDICATOR;
+				function-enumerator = <1>;
+				color = <LED_COLOR_ID_WHITE>;
+				led-max-microamp = <24000>;
+			};
+
+			led@1 {
+				reg = <1>;
+				function = LED_FUNCTION_INDICATOR;
+				function-enumerator = <2>;
+				color = <LED_COLOR_ID_WHITE>;
+				led-max-microamp = <24000>;
+			};
+
+			led@2 {
+				reg = <2>;
+				function = LED_FUNCTION_INDICATOR;
+				function-enumerator = <3>;
+				color = <LED_COLOR_ID_WHITE>;
+				led-max-microamp = <24000>;
+			};
+
+			led@3 {
+				reg = <3>;
+				function = LED_FUNCTION_INDICATOR;
+				function-enumerator = <4>;
+				color = <LED_COLOR_ID_WHITE>;
+				led-max-microamp = <150000>;
+			};
+
+			led@4 {
+				reg = <4>;
+				function = LED_FUNCTION_FLASH;
+				function-enumerator = <1>;
+				color = <LED_COLOR_ID_WHITE>;
+				led-max-microamp = <200000>;
+				flash-max-microamp = <750000>;
+				flash-max-timeout-us = <1248000>;
+			};
+
+			led@5 {
+				reg = <5>;
+				function = LED_FUNCTION_FLASH;
+				function-enumerator = <2>;
+				color = <LED_COLOR_ID_WHITE>;
+				led-max-microamp = <200000>;
+				flash-max-microamp = <800000>;
+				flash-max-timeout-us = <1248000>;
+			};
+		};
+	};
+};
+
+/*
+ * Main PMIC MT6359P. Only the rails checked on this board are described.
+ */
+&pwrap {
+	status = "okay";
+
+	pmic: pmic {
+		compatible = "mediatek,mt6359";
+		interrupts-extended = <&pio 222 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		mt6359codec: audio-codec {
+			compatible = "mediatek,mt6359-codec";
+			/*
+			 * analog MEMS mics (SPH1642HT5H): main AIN0, headset AIN1,
+			 * back AIN2, third AIN3; DC coupled (MIUI: Mic_Type_Mux_0 DCC)
+			 */
+			mediatek,mic-type-0 = <3>;
+			mediatek,mic-type-1 = <3>;
+			mediatek,mic-type-2 = <3>;
+		};
+
+		rtc {
+			compatible = "mediatek,mt6358-rtc";
+			/* shared with MIUI/lk, which count years from 1968 */
+			mediatek,year-base-1968;
+		};
+
+		/* power key only; the home key input reads as held, unused here */
+		keys {
+			compatible = "mediatek,mt6359-keys";
+
+			power-key {
+				linux,keycodes = <KEY_POWER>;
+				wakeup-source;
+			};
+		};
+
+		pmic_adc: adc {
+			compatible = "mediatek,mt6359-auxadc";
+			#io-channel-cells = <1>;
+		};
+
+		/*
+		 * Coulomb counter. Profile: vendor battery2 (Sunwoda, the
+		 * pack lk reports as battery_id=2) at 25 C, rows of
+		 * <DOD 0.1mAh, OCV 0.1mV, R 0.1mOhm>.
+		 */
+		gauge {
+			compatible = "mediatek,mt6359-gauge";
+			io-channels = <&pmic_adc MT6359_AUXADC_BATADC>,
+				      <&pmic_adc MT6359_AUXADC_BAT_TEMP>,
+				      <&pmic_adc MT6359_AUXADC_VBIF>;
+			io-channel-names = "vbat", "temp", "vbif";
+			power-supplies = <&mt6360_chg>;
+			charge-full-design-microamp-hours = <4500000>;
+			mediatek,empty-microvolt = <3400000>;
+			/* vendor g_FG_PSEUDO100 at 25 C */
+			mediatek,full-percent = <97>;
+			mediatek,battery-profile =
+				<0 44220 800  459 44101 800  918 43998 800  1377 43903 819
+				 1836 43804 825  2294 43709 840  2753 43607 837  3212 43497 825
+				 3671 43389 834  4130 43281 843  4589 43164 830  5048 43052 850
+				 5507 42933 849  5966 42814 826  6424 42692 825  6883 42564 825
+				 7342 42443 825  7801 42324 825  8260 42199 825  8719 42074 825
+				 9178 41949 814  9637 41824 809  10096 41705 825  10554 41587 830
+				 11013 41476 850  11472 41357 849  11931 41235 826  12390 41124 847
+				 12849 41014 870  13308 40897 857  13767 40790 866  14226 40683 861
+				 14684 40576 862  15143 40471 885  15602 40368 908  16061 40273 931
+				 16520 40172 950  16979 40070 955  17438 39978 1000  17897 39868 1000
+				 18356 39749 1000  18814 39607 942  19273 39451 872  19732 39313 803
+				 20191 39200 775  20650 39109 775  21109 39026 766  21568 38949 758
+				 22027 38881 769  22486 38809 750  22944 38745 750  23403 38681 750
+				 23862 38617 750  24321 38568 750  24780 38514 750  25239 38459 750
+				 25698 38410 765  26157 38369 788  26616 38324 789  27074 38272 775
+				 27533 38229 782  27992 38190 795  28451 38145 778  28910 38108 801
+				 29369 38071 824  29828 38034 825  30287 37997 825  30746 37961 843
+				 31204 37911 818  31663 37856 786  32122 37805 775  32581 37755 764
+				 33040 37700 750  33499 37645 750  33958 37593 754  34417 37555 773
+				 34876 37509 750  35334 37472 750  35793 37418 750  36252 37363 750
+				 36711 37294 750  37170 37226 750  37629 37167 750  38088 37097 750
+				 38547 37019 750  39006 36961 742  39464 36938 731  39923 36927 750
+				 40382 36907 750  40841 36880 750  41300 36862 796  41759 36768 821
+				 42218 36442 806  42677 35976 835  43136 35353 881  43594 34498 993
+				 44053 33131 1423  44512 30477 3981  44971 28880 2300  45430 28880 2300>;
+		};
+
+		regulators {
+			/*
+			 * VSRAM_GPU: 0.75 V at every stock OPP. Kept on so it is up
+			 * before VGPU (Panfrost enables its supply ahead of the domains).
+			 */
+			/*
+			 * CPU SRAM rails: MCUPM controls them. Described only so the
+			 * cpufreq driver can read them; always-on so the regulator
+			 * core never touches them.
+			 */
+			/*
+			 * APU: VPROC2 is the MDLA cores' rail (BSP vmdla). lk leaves
+			 * 0.75 V; cezanne-apu takes it to 0.8 V for 800 MHz (BSP OPP)
+			 * while the APU is up (VSRAM_MD stays at lk's 0.85 V, above the
+			 * BSP's 0.825 V for a rail over 0.75 V). No regulator-name: the
+			 * driver finds it as "VPROC2". Always-on: no consumer holds it
+			 * between jobs.
+			 */
+			mt6359_vproc2: buck_vproc2 {
+				regulator-min-microvolt = <750000>;
+				regulator-max-microvolt = <800000>;
+				regulator-always-on;
+			};
+
+			mt6359_vsram_proc1: ldo_vsram_proc1 {
+				regulator-name = "vsram_proc_big";
+				regulator-always-on;
+			};
+
+			mt6359_vsram_proc2: ldo_vsram_proc2 {
+				regulator-name = "vsram_proc_little";
+				regulator-always-on;
+			};
+
+			/* connectivity supplies, switched by conninfra */
+			mt6359_vcn13: ldo_vcn13 {
+				regulator-name = "vcn13";
+			};
+
+			mt6359_vcn18: ldo_vcn18 {
+				regulator-name = "vcn18";
+			};
+
+			mt6359_vcn33_1: ldo_vcn33_1 {
+				regulator-name = "vcn33_1";
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3500000>;
+			};
+
+			mt6359_vcn33_2: ldo_vcn33_2 {
+				regulator-name = "vcn33_2";
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3500000>;
+			};
+
+			/* audio codec digital supply; the codec takes it by name only */
+			mt6359_vaud18: ldo_vaud18 {
+				regulator-name = "vaud18";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-always-on;
+			};
+
+			/* camera sensor I/O (DOVDD), on by default in the vendor DT */
+			mt6359_vcamio: ldo_vcamio {
+				regulator-name = "vcamio";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			/* panel VCI (vendor j10 panel driver), on from lk */
+			mt6359_vibr: ldo_vibr {
+				regulator-name = "vibr";
+				regulator-min-microvolt = <3000000>;
+				regulator-max-microvolt = <3000000>;
+				regulator-boot-on;
+			};
+
+			mt6359_vsram_others: ldo_vsram_others {
+				regulator-name = "vsram_gpu";
+				regulator-min-microvolt = <750000>;
+				regulator-max-microvolt = <750000>;
+				regulator-always-on;
+			};
+		};
+	};
+};
+
+/* MT6315 #7: buck1 is VGPU (stock "7_vbuck1"); #6 feeds the CPUs (owned by MCUPM) */
+&spmi {
+	status = "okay";
+
+	mt6315_6: pmic@6 {
+		compatible = "mediatek,mt6315-regulator";
+		reg = <0x6 SPMI_USID>;
+
+		/* read-only for the cpufreq driver: always-on, no voltage constraints */
+		regulators {
+			mt6315_6_vbuck1: vbuck1 {
+				regulator-name = "vproc_big";
+				regulator-always-on;
+				/* auto, forced PWM (SVS init01; MT6315_BUCK_MODE_*) */
+				regulator-allowed-modes = <0 1>;
+			};
+
+			mt6315_6_vbuck3: vbuck3 {
+				regulator-name = "vproc_little";
+				regulator-always-on;
+				regulator-allowed-modes = <0 1>;
+			};
+		};
+	};
+
+	mt6315_7: pmic@7 {
+		compatible = "mediatek,mt6315-regulator";
+		reg = <0x7 SPMI_USID>;
+
+		regulators {
+			/* VGPU: stock OPP range 350 MHz/0.56875 V .. 836 MHz/0.75 V */
+			mt6315_7_vbuck1: vbuck1 {
+				regulator-name = "vgpu";
+				regulator-min-microvolt = <568750>;
+				regulator-max-microvolt = <750000>;
+				regulator-enable-ramp-delay = <256>;
+				regulator-allowed-modes = <0 1>;
+			};
+		};
+	};
+};
+
+/* GPU rails: VSRAM_GPU before VGPU, as the BSP gpufreq driver orders them */
+&mfg_async {
+	domain-supply = <&mt6359_vsram_others>;
+};
+
+&mfg {
+	domain-supply = <&mt6315_7_vbuck1>;
+};
+
+/* Mali-G77 MC9 */
+&gpu {
+	mali-supply = <&mt6315_7_vbuck1>;
+	status = "okay";
+};
+
+&cpufreq_mcupm {
+	mediatek,cpu-level = <2>;	/* efuse bin 0x10: FY_6885T tables */
+	proc-ll-supply = <&mt6315_6_vbuck3>;
+	sram-ll-supply = <&mt6359_vsram_proc2>;
+	proc-l-supply = <&mt6315_6_vbuck1>;
+	sram-l-supply = <&mt6359_vsram_proc1>;
+	status = "okay";
+};
+
+/* SVS (EEM) voltage trimming: the bucks it checks during init01 at Vboot */
+&cpu0 {
+	proc-supply = <&mt6315_6_vbuck3>;
+};
+
+&cpu4 {
+	proc-supply = <&mt6315_6_vbuck1>;
+};
+
+&cci {
+	proc-supply = <&mt6315_6_vbuck3>;
+	status = "okay";
+};
+
+&svs_cpu {
+	status = "okay";
+};
+
+&svs_gpu {
+	status = "okay";
+};
+
+/* touch: GT9896 (yellowstone) */
+&i2c0 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	touchscreen@5d {
+		compatible = "goodix,gt9896";
+		reg = <0x5d>;
+		interrupts-extended = <&pio 21 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pio 20 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&mt6360_vtp>;
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <2400>;
+	};
+};
+
+/* scanned out by the display engine: keep it out of the linear map */
+&{/reserved-memory/framebuffer@7ae10000} {
+	no-map;
+};
+
+&u3phy0 {
+	status = "okay";
+};
+
+/* VBUS is sensed by the charger / Type-C ICs, not by the PHY */
+&u2port0 {
+	mediatek,force-vbus;
+	/* HS eye tuning from the stock dtbo (usb_phy_tuning, *_cn values) */
+	mediatek,eye-vrt = <3>;
+	mediatek,eye-term = <3>;
+	mediatek,intr = <0x1e>;
+	mediatek,discth = <7>;
+	mediatek,pre-emphasis = <2>;
+};
+
+/*
+ * USB 2.0 only port (no U3 PHY wired). Role from the Type-C port (TCPM role
+ * switch); starts as device so the USB gadget works before TCPM is up.
+ */
+&ssusb {
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
+	mediatek,force-vbus;
+	mediatek,u3p-dis-msk = <0x1>;
+	maximum-speed = "high-speed";
+	status = "okay";
+};
+
+&usb_host {
+	mediatek,u3p-dis-msk = <0x1>;
+	status = "okay";
+};
+
+/* UFS VCC is already up from lk (it loads boot.img from UFS) */
+&ufsphy {
+	status = "okay";
+};
+
+&ufshci {
+	status = "okay";
+};
+
+/*
+ * Lined up with the stock kernel's ramoops zones so logs from a mainline boot
+ * can be read back from Android's /sys/fs/pstore. MTK's 4.14 reserves two
+ * console-sized zones (console + bconsole), so one 512 KiB console zone here
+ * starts exactly where Android looks for its console (0x4d05f000).
+ */
+&{/reserved-memory/pstore@4d010000} {
+	compatible = "ramoops";
+	record-size = <0x1000>;
+	console-size = <0x80000>;
+	ftrace-size = <0x1000>;
+	pmsg-size = <0x10000>;
+	ecc-size = <0>;
+};
+
+/*
+ * The boot shim keeps lk's own FDT here (its /chosen carries what lk set up
+ * on a boot-slot boot, e.g. the modem's ccci info); see mainline/shim.
+ */
+/ {
+	reserved-memory {
+		lk_fdt: lk-fdt@4bd00000 {
+			reg = <0x0 0x4bd00000 0x0 0x80000>;
+			no-map;
+		};
+
+		/*
+		 * Carve-outs lk adds only on a normal (boot-slot) boot, when it
+		 * loads the modem, VPU, SPM, SCP and ADSP firmware (read from
+		 * MIUI's /sys/firmware/fdt; SPM and SCP are reserved elsewhere).
+		 * The modem's are EMI MPU protected: touching them resets the SoC.
+		 */
+		vpu-binary@bd380000 {
+			reg = <0x0 0xbd380000 0x0 0x2880000>;
+			no-map;
+		};
+		ccci-tag-mem@bff70000 {
+			reg = <0x0 0xbff70000 0x0 0x10000>;
+			no-map;
+		};
+		md-mem@de000000 {
+			reg = <0x0 0xde000000 0x0 0x20d0000>;
+			no-map;
+		};
+		md-mem@e1000000 {
+			reg = <0x0 0xe1000000 0x0 0x150000>;
+			no-map;
+		};
+		md-mem@e2000000 {
+			reg = <0x0 0xe2000000 0x0 0x6cd0000>;
+			no-map;
+		};
+		md-mem@f81d0000 {
+			reg = <0x0 0xf81d0000 0x0 0x3e30000>;
+			no-map;
+		};
+		ap-md-nc-smem@8e000000 {
+			reg = <0x0 0x8e000000 0x0 0x1800000>;
+			no-map;
+		};
+		ap-md-c-smem@88000000 {
+			reg = <0x0 0x88000000 0x0 0x4960000>;
+			no-map;
+		};
+		adsp-reserved@78000000 {
+			reg = <0x0 0x78000000 0x0 0xe30000>;
+			no-map;
+		};
+	};
+};
+
+/*
+ * On a normal (boot-slot) boot lk loads the SPM firmware, and ATF then hands
+ * MCUSYS off to the SPM; without the kernel side of MediaTek's low-power
+ * setup (parked: "Suspend power / SPM" in NOTES.md) the first mcusys-off
+ * entry hangs the SoC until the watchdog fires. cpu-off and cluster-off are
+ * fine. Last state in the list, so disabling it keeps psci's indices intact.
+ */
+&mcusys_off {
+	status = "disabled";
+};
+
+/* volume keys on the SoC keypad: vendor kpd-hw-init-map index 0 = up, 1 = down */
+&keypad {
+	keypad,num-rows = <1>;
+	keypad,num-columns = <2>;
+	linux,keymap = <MATRIX_KEY(0, 0, KEY_VOLUMEUP)
+			MATRIX_KEY(0, 1, KEY_VOLUMEDOWN)>;
+	/* vendor kpd-key-debounce 0x400 = 32 ms */
+	debounce-delay-ms = <32>;
+	status = "okay";
+};
+
+/* i2c9: pop-up camera hall sensor, USB-C analog audio switch, charge pump, notification LED */
+&i2c9 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/* 3-axis hall sensor reading the pop-up camera's magnet (vendor akm09970) */
+	popup_hall: magnetometer@d {
+		compatible = "asahi-kasei,ak09970";
+		reg = <0x0d>;
+		reset-gpios = <&pio 27 GPIO_ACTIVE_LOW>;
+		interrupts-extended = <&pio 0 IRQ_TYPE_EDGE_FALLING>;
+	};
+
+	/* USB-C analog audio mux (Audio Accessory Mode from the TCPC above) */
+	fsa4480: typec-mux@42 {
+		compatible = "fcs,fsa4480";
+		reg = <0x42>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&sbu_uart_off>;
+		mode-switch;
+		orientation-switch;
+		/*
+		 * auto detection often reads a 4-pole headset as 3-pole; the
+		 * vendor then swaps MIC/GND from accdet (CTIA = swapped here)
+		 */
+		fcs,audio-mic-gnd-swap-fallback;
+
+		port {
+			fsa4480_sbu: endpoint {
+				remote-endpoint = <&usb_c_sbu>;
+			};
+		};
+	};
+
+	/*
+	 * 2:1 charge pump for direct (PPS) charging; the fitted part reports
+	 * BQ25968. Limits from the vendor bq2597x-standalone node.
+	 */
+	charge_pump: charger@66 {
+		compatible = "ti,bq25970";
+		reg = <0x66>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cp_irq>;
+		interrupts-extended = <&pio 3 IRQ_TYPE_EDGE_FALLING>;
+		ti,bat-ovp-microvolt = <4525000>;
+		ti,bat-ocp-microamp = <7000000>;
+		ti,bus-ovp-microvolt = <12000000>;
+		ti,bus-ocp-microamp = <3750000>;
+		ti,ac-ovp-microvolt = <14000000>;
+		ti,sense-resistor-micro-ohms = <5000>;
+	};
+
+	/*
+	 * XMUSB350 (Weltrend WT6670F, Xiaomi firmware "XM35"): BC1.2 and QC
+	 * 2.0 / 3.0 / 3+ detection and D+ / D- signalling. Runs from VBUS:
+	 * answers only with a charger plugged in. Vendor node xmusb350-charger.
+	 */
+	charger-detect@35 {
+		compatible = "xiaomi,xmusb350";
+		reg = <0x35>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&xmusb350_pins>;
+		interrupts-extended = <&pio 110 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pio 126 GPIO_ACTIVE_HIGH>;
+	};
+
+	/*
+	 * AW2015 behind the left edge of the pop-up camera: the notification
+	 * light (vendor max: ILED 30 at IMAX 3.1875 mA). Its hardware charge
+	 * indicator lights red while charging when nothing else is shown.
+	 */
+	led-controller@64 {
+		compatible = "awinic,aw2015";
+		reg = <0x64>;
+		awinic,charge-indicator;
+
+		multi-led {
+			color = <LED_COLOR_ID_RGB>;
+			function = LED_FUNCTION_STATUS;
+			led-max-microamp = <375>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			led@0 {
+				reg = <0>;
+				color = <LED_COLOR_ID_RED>;
+			};
+
+			led@1 {
+				reg = <1>;
+				color = <LED_COLOR_ID_GREEN>;
+			};
+
+			led@2 {
+				reg = <2>;
+				color = <LED_COLOR_ID_BLUE>;
+			};
+		};
+	};
+};
+
+/*
+ * NFC: NXP SN100U (NCI 2.0; vendor "qcom,nq-nci" / pn553 driver). CLK_REQ
+ * (GPIO17, SRCLKENAI0) is left as lk sets it (pull-down): MIUI keeps XO_NFC
+ * off and the pin pulled down even while reading cards. The bus also
+ * carries the DRAM supply buck (0x51) and the LCD bias (0x3e): no other
+ * nodes here.
+ */
+&i2c6 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	nfc@28 {
+		compatible = "nxp,nxp-nci-i2c";
+		reg = <0x28>;
+		interrupts-extended = <&pio 11 IRQ_TYPE_EDGE_RISING>;
+		enable-gpios = <&pio 18 GPIO_ACTIVE_HIGH>;
+		firmware-gpios = <&pio 10 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/*
+ * GNSS: the L1 / L5 external LNA enables (GPIO162 / 163) are driven by the
+ * GPS DSP (function 2) while it runs, low otherwise; the driver switches
+ * between these states (names as the BSP).
+ */
+&gps {
+	pinctrl-names = "default", "gps_l1_lna_disable", "gps_l1_lna_dsp_ctrl",
+			"gps_l1_lna_enable", "gps_l5_lna_disable",
+			"gps_l5_lna_dsp_ctrl", "gps_l5_lna_enable";
+	pinctrl-0 = <&gps_default>;
+	pinctrl-1 = <&gps_l1_lna_off>;
+	pinctrl-2 = <&gps_l1_lna_dsp>;
+	pinctrl-3 = <&gps_l1_lna_on>;
+	pinctrl-4 = <&gps_l5_lna_off>;
+	pinctrl-5 = <&gps_l5_lna_dsp>;
+	pinctrl-6 = <&gps_l5_lna_on>;
+	status = "okay";
+};
+
+&pio {
+	gps_default: gps-default-pins {
+	};
+
+	gps_l1_lna_off: gps-l1-lna-off-pins {
+		pins-lna {
+			pinmux = <0xa200>;
+			output-low;
+		};
+	};
+
+	gps_l1_lna_dsp: gps-l1-lna-dsp-pins {
+		pins-lna {
+			pinmux = <0xa202>;
+		};
+	};
+
+	gps_l1_lna_on: gps-l1-lna-on-pins {
+		pins-lna {
+			pinmux = <0xa200>;
+			output-high;
+		};
+	};
+
+	gps_l5_lna_off: gps-l5-lna-off-pins {
+		pins-lna {
+			pinmux = <0xa300>;
+			output-low;
+		};
+	};
+
+	gps_l5_lna_dsp: gps-l5-lna-dsp-pins {
+		pins-lna {
+			pinmux = <0xa302>;
+		};
+	};
+
+	gps_l5_lna_on: gps-l5-lna-on-pins {
+		pins-lna {
+			pinmux = <0xa300>;
+			output-high;
+		};
+	};
+};
+
+/* speaker amps: two CS35L41 (vendor i2c7), shared reset on GPIO30; slot 0 bottom, 1 top */
+&i2c7 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	/*
+	 * camera LDOs (voltages read back in MIUI while streaming): L1 front
+	 * DVDD 1.1 V, L2 ultrawide DVDD 1.1 V, L3 main AVDD 2.9 V, L4 ultrawide
+	 * AVDD 2.8 V, L5 main AVDD2 1.8 V, L6/L7 2.8 V AF supplies
+	 */
+	camera_pmic: regulator@35 {
+		compatible = "onsemi,fan53870";
+		reg = <0x35>;
+		reset-gpios = <&pio 134 GPIO_ACTIVE_LOW>;
+
+		regulators {
+			cam_ldo1: ldo1 {
+				regulator-name = "cam1_dvdd";
+				regulator-min-microvolt = <1104000>;
+				regulator-max-microvolt = <1104000>;
+			};
+
+			cam_ldo2: ldo2 {
+				regulator-name = "cam4_dvdd";
+				regulator-min-microvolt = <1104000>;
+				regulator-max-microvolt = <1104000>;
+			};
+
+			cam_ldo3: ldo3 {
+				regulator-name = "cam0_avdd";
+				regulator-min-microvolt = <2900000>;
+				regulator-max-microvolt = <2900000>;
+			};
+
+			cam_ldo4: ldo4 {
+				regulator-name = "cam4_avdd";
+				regulator-min-microvolt = <2804000>;
+				regulator-max-microvolt = <2804000>;
+			};
+
+			cam_ldo5: ldo5 {
+				regulator-name = "cam0_avdd2";
+				regulator-min-microvolt = <1804000>;
+				regulator-max-microvolt = <1804000>;
+			};
+
+			cam_ldo6: ldo6 {
+				regulator-name = "cam3_afvdd";
+				regulator-min-microvolt = <2804000>;	/* 8 mV steps */
+				regulator-max-microvolt = <2804000>;
+			};
+
+			cam_ldo7: ldo7 {
+				regulator-name = "cam0_afvdd";
+				regulator-min-microvolt = <2804000>;	/* 8 mV steps */
+				regulator-max-microvolt = <2804000>;
+			};
+		};
+	};
+
+	/*
+	 * LRA vibrator; reset is GPIO129 (high = running). The vendor DT also
+	 * lists an AW8624 on i2c6 for other boards; cezanne has the AW8697 (ID 0x97).
+	 */
+	haptics@5a {
+		compatible = "awinic,aw8697";
+		reg = <0x5a>;
+		reset-gpios = <&pio 129 GPIO_ACTIVE_LOW>;
+	};
+
+	/*
+	 * AW2015 behind the right edge of the pop-up camera: used by the vendor
+	 * only for the pop-up animation (IMAX 6.375 mA, full scale).
+	 */
+	led-controller@64 {
+		compatible = "awinic,aw2015";
+		reg = <0x64>;
+
+		multi-led {
+			color = <LED_COLOR_ID_RGB>;
+			function = LED_FUNCTION_INDICATOR;
+			led-max-microamp = <6375>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			led@0 {
+				reg = <0>;
+				color = <LED_COLOR_ID_RED>;
+			};
+
+			led@1 {
+				reg = <1>;
+				color = <LED_COLOR_ID_GREEN>;
+			};
+
+			led@2 {
+				reg = <2>;
+				color = <LED_COLOR_ID_BLUE>;
+			};
+		};
+	};
+
+	spk_l: amplifier@40 {
+		compatible = "cirrus,cs35l41";
+		reg = <0x40>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&spk_l_irq>;
+		#sound-dai-cells = <1>;
+		/* bottom speaker; DSP files cirrus/cs35l41-dsp1-spk-prot-cezanne-bottom.* */
+		sound-name-prefix = "Bottom";
+		cirrus,subsystem-id = "cezanne";
+		/* vendor CSPL v0.13: start the DSP once clocked (patch 0037) */
+		cirrus,dsp-start-on-pll-lock;
+		interrupts-extended = <&pio 31 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&pio 30 GPIO_ACTIVE_HIGH>;
+		cirrus,boost-peak-milliamp = <4500>;
+		cirrus,boost-ind-nanohenry = <1000>;
+		cirrus,boost-cap-microfarad = <15>;
+		cirrus,asp-sdout-hiz = <1>;
+		cirrus,gpio2-src-select = <4>;
+		cirrus,gpio2-output-enable;
+	};
+
+	spk_r: amplifier@41 {
+		compatible = "cirrus,cs35l41";
+		reg = <0x41>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&spk_r_irq>;
+		#sound-dai-cells = <1>;
+		/* top speaker, doubles as the earpiece (vendor "RCV" tuning) */
+		sound-name-prefix = "Top";
+		cirrus,subsystem-id = "cezanne";
+		/* vendor CSPL v0.13: start the DSP once clocked (patch 0037) */
+		cirrus,dsp-start-on-pll-lock;
+		interrupts-extended = <&pio 113 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&pio 30 GPIO_ACTIVE_HIGH>;
+		cirrus,boost-peak-milliamp = <4500>;
+		cirrus,boost-ind-nanohenry = <1000>;
+		cirrus,boost-cap-microfarad = <15>;
+		cirrus,asp-sdout-hiz = <1>;
+		cirrus,gpio2-src-select = <4>;
+		cirrus,gpio2-output-enable;
+	};
+};
+
+&afe {
+	status = "okay";
+};
+
+/* pinmux = pin << 8 | function, from the vendor afe pinctrl states */
+&pio {
+	aud_clk_mosi_off: aud-clk-mosi-off-pins {
+		pins-clk {
+			pinmux = <0xd600>, <0xd700>;
+			input-enable;
+			bias-pull-down;
+		};
+	};
+
+	aud_clk_mosi_on: aud-clk-mosi-on-pins {
+		pins-clk {
+			pinmux = <0xd601>, <0xd701>;
+			input-schmitt-enable;
+			bias-disable;
+		};
+	};
+
+	aud_dat_mosi_off: aud-dat-mosi-off-pins {
+		pins-dat {
+			pinmux = <0xd800>, <0xd900>;
+			input-enable;
+			bias-pull-down;
+		};
+	};
+
+	aud_dat_mosi_on: aud-dat-mosi-on-pins {
+		pins-dat {
+			pinmux = <0xd801>, <0xd901>;
+			input-schmitt-enable;
+			bias-disable;
+		};
+	};
+
+	aud_dat_miso_off: aud-dat-miso-off-pins {
+		pins-dat {
+			pinmux = <0xda00>, <0xdb00>;
+			input-enable;
+			bias-pull-down;
+		};
+	};
+
+	aud_dat_miso_on: aud-dat-miso-on-pins {
+		pins-dat {
+			pinmux = <0xda01>, <0xdb01>;
+			input-schmitt-enable;
+			bias-disable;
+		};
+	};
+
+	aud_dat_mosi_ch34_off: aud-dat-mosi-ch34-off-pins {
+		pins-dat {
+			pinmux = <0xc400>;
+			input-enable;
+			bias-pull-down;
+		};
+	};
+
+	aud_dat_mosi_ch34_on: aud-dat-mosi-ch34-on-pins {
+		pins-dat {
+			pinmux = <0xc401>;
+			input-schmitt-enable;
+			bias-disable;
+		};
+	};
+
+	aud_dat_miso_ch34_off: aud-dat-miso-ch34-off-pins {
+		pins-dat {
+			pinmux = <0xc700>;
+			input-enable;
+			bias-pull-down;
+		};
+	};
+
+	aud_dat_miso_ch34_on: aud-dat-miso-ch34-on-pins {
+		pins-dat {
+			pinmux = <0xc701>;
+			input-schmitt-enable;
+			bias-disable;
+		};
+	};
+
+	/* MT6360 PD interrupt */
+	tcpc_irq: tcpc-irq-pins {
+		pins-irq {
+			pinmux = <0x1900>;
+			input-schmitt-enable;
+			bias-pull-up;
+		};
+	};
+
+	/* amp interrupts (open drain, active low); lk leaves GPIO113 an output */
+	/*
+	 * GPIO101 high keeps the SoC UART off the SBU lines (vendor
+	 * fsa4480 "uart_disable", selected in audio mode; no SBU UART here)
+	 */
+	sbu_uart_off: sbu-uart-off-pins {
+		pins-en {
+			pinmux = <0x6500>;	/* GPIO101 */
+			output-high;
+			bias-disable;
+		};
+	};
+
+	xmusb350_pins: xmusb350-pins {
+		pins-irq {
+			pinmux = <0x6e00>;	/* GPIO110 */
+			input-schmitt-enable;
+			bias-pull-up;
+		};
+
+		pins-reset {
+			pinmux = <0x7e00>;	/* GPIO126, high = reset */
+			output-low;
+			bias-disable;
+		};
+	};
+
+	cp_irq: cp-irq-pins {
+		pins-irq {
+			pinmux = <0x0300>;	/* GPIO3 */
+			input-schmitt-enable;
+			bias-pull-up;
+		};
+	};
+
+	spk_l_irq: spk-l-irq-pins {
+		pins-irq {
+			pinmux = <0x1f00>;
+			/* on this pinctrl only the schmitt setting clears DIR */
+			input-schmitt-enable;
+			bias-pull-up;
+		};
+	};
+
+	spk_r_irq: spk-r-irq-pins {
+		pins-irq {
+			pinmux = <0x7100>;
+			/* on this pinctrl only the schmitt setting clears DIR */
+			input-schmitt-enable;
+			bias-pull-up;
+		};
+	};
+
+	/* I2S0 in: data from the amps (IV sense / echo), unused so far */
+	aud_gpio_i2s0_off: aud-gpio-i2s0-off-pins {
+		pins-dat {
+			pinmux = <0x2200>;
+			input-enable;
+			bias-pull-down;
+		};
+	};
+
+	aud_gpio_i2s0_on: aud-gpio-i2s0-on-pins {
+		pins-dat {
+			pinmux = <0x2201>;
+			input-schmitt-enable;
+			bias-disable;
+		};
+	};
+
+	/* I2S3 out to the amps: GPIO32 BCK, 33 LRCK, 35 DO */
+	aud_gpio_i2s3_off: aud-gpio-i2s3-off-pins {
+		pins-i2s {
+			pinmux = <0x2000>, <0x2100>, <0x2300>;
+			input-enable;
+			bias-pull-down;
+		};
+	};
+
+	aud_gpio_i2s3_on: aud-gpio-i2s3-on-pins {
+		pins-i2s {
+			pinmux = <0x2001>, <0x2101>, <0x2301>;
+			input-schmitt-enable;
+			bias-disable;
+		};
+	};
+};
+
+/ {
+	sound: sound {
+		compatible = "mediatek,mt6885-mt6359-cs35l41-sound";
+		model = "cezanne";
+		mediatek,platform = <&afe>;
+		/* headset jack from the Type-C port mode (USB-C analog audio) */
+		mode-switch;
+		pinctrl-names = "aud_clk_mosi_off", "aud_clk_mosi_on",
+				"aud_dat_mosi_off", "aud_dat_mosi_on",
+				"aud_dat_miso_off", "aud_dat_miso_on",
+				"aud_dat_mosi_ch34_off", "aud_dat_mosi_ch34_on",
+				"aud_dat_miso_ch34_off", "aud_dat_miso_ch34_on",
+				"aud_gpio_i2s0_off", "aud_gpio_i2s0_on",
+				"aud_gpio_i2s3_off", "aud_gpio_i2s3_on";
+		pinctrl-0 = <&aud_clk_mosi_off>;
+		pinctrl-1 = <&aud_clk_mosi_on>;
+		pinctrl-2 = <&aud_dat_mosi_off>;
+		pinctrl-3 = <&aud_dat_mosi_on>;
+		pinctrl-4 = <&aud_dat_miso_off>;
+		pinctrl-5 = <&aud_dat_miso_on>;
+		pinctrl-6 = <&aud_dat_mosi_ch34_off>;
+		pinctrl-7 = <&aud_dat_mosi_ch34_on>;
+		pinctrl-8 = <&aud_dat_miso_ch34_off>;
+		pinctrl-9 = <&aud_dat_miso_ch34_on>;
+		pinctrl-10 = <&aud_gpio_i2s0_off>;
+		pinctrl-11 = <&aud_gpio_i2s0_on>;
+		pinctrl-12 = <&aud_gpio_i2s3_off>;
+		pinctrl-13 = <&aud_gpio_i2s3_on>;
+		audio-routing =
+			"Speakers", "Bottom SPK",
+			"Speakers", "Top SPK",
+			"Earpiece", "Top SPK",
+			"Headphone Jack", "Headphone L",
+			"Headphone Jack", "Headphone R",
+			"AIN1", "Headset Mic";
+
+		/* RT5682 links on the Chromebook design; dummy codecs here */
+		i2s8-dai-link {
+			link-name = "I2S8";
+		};
+
+		i2s9-dai-link {
+			link-name = "I2S9";
+		};
+
+		speaker-dai-link {
+			link-name = "I2S3";
+			dai-format = "i2s";
+			mediatek,clk-provider = "cpu";
+			codec {
+				sound-dai = <&spk_l 0>, <&spk_r 0>;
+			};
+		};
+	};
+};
+
+&consys {
+	pmic = <&pmic>;
+	vcn13-supply = <&mt6359_vcn13>;
+	vcn18-supply = <&mt6359_vcn18>;
+	vcn33_1_bt-supply = <&mt6359_vcn33_1>;
+	vcn33_1_wifi-supply = <&mt6359_vcn33_1>;
+	vcn33_2_wifi-supply = <&mt6359_vcn33_2>;
+	status = "okay";
+};
+
+&wifi {
+	status = "okay";
+};
+
+&bt {
+	status = "okay";
+};
+
+&fm {
+	status = "okay";
+};
+
+&btif {
+	status = "okay";
+};
+
+&scp {
+	status = "okay";
+};
+
+/* pop-up front camera: TI DRV8846 stepper driver, step pulses on PWM channel 2 */
+&pwm {
+	pinctrl-names = "default";
+	pinctrl-0 = <&popup_pwm_pins>;
+	status = "okay";
+};
+
+/ {
+	popup-camera {
+		compatible = "xiaomi,cezanne-popup-motor";
+		pwms = <&pwm 2 54171>;
+		mode0-gpios = <&pio 188 GPIO_ACTIVE_HIGH>;
+		mode1-gpios = <&pio 184 GPIO_ACTIVE_HIGH>;
+		sleep-gpios = <&pio 186 GPIO_ACTIVE_LOW>;
+		dir-gpios = <&pio 185 GPIO_ACTIVE_HIGH>;
+		power-gpios = <&pio 128 GPIO_ACTIVE_HIGH>;
+		xiaomi,step-mode = <2>;
+	};
+};
+
+&pio {
+	popup_pwm_pins: popup-pwm-pins {
+		pins-pwm {
+			pinmux = <0x9802>;	/* GPIO152 func 2: PWM_2 */
+		};
+	};
+};
+
+/*
+ * IR blaster: the LED driver hangs off GPIO135 (BSP irtx_pwm switches the
+ * pin to function 1 = PWM_0 and plays a bit stream with the carrier already
+ * modulated in, from memory). gpio-ir-tx bit-bangs the carrier on the pin in
+ * GPIO mode instead: exact timing, LIRC (/dev/lirc0). The pin idles low, LED
+ * off. No supply to switch on this board.
+ */
+/ {
+	ir-transmitter {
+		compatible = "gpio-ir-tx";
+		gpios = <&pio 135 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&irtx_pins>;
+	};
+};
+
+&pio {
+	irtx_pins: irtx-pins {
+		pins-irtx {
+			pinmux = <0x8700>;	/* GPIO135 func 0: GPIO */
+			output-low;
+		};
+	};
+};
+
+/* front camera: S5K3T2 on i2c4, MCLK1 = CAMTG2 on GPIO137, 4 CSI-2 lanes */
+/ {
+	cam1_avdd: regulator-cam1-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam1_avdd";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&pio 148 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+&i2c4 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	front_camera: camera-sensor@56 {
+		compatible = "samsung,s5k3t2";
+		reg = <0x56>;
+		clocks = <&topckgen TOP_MUX_CAMTG2>;
+		assigned-clocks = <&topckgen TOP_MUX_CAMTG2>;
+		assigned-clock-parents = <&topckgen TOP_UNIVP_192M_D8>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam1_mclk_pins>;
+		reset-gpios = <&pio 131 GPIO_ACTIVE_LOW>;
+		dvdd-supply = <&cam_ldo1>;
+		avdd-supply = <&cam1_avdd>;
+		dovdd-supply = <&mt6359_vcamio>;
+		orientation = <0>;	/* front */
+		/*
+		 * Sensor mounted sideways (V4L2: counter-clockwise correction).
+		 * 270 gave an upside-down preview; libcamera's software ISP
+		 * does the rotation.
+		 */
+		rotation = <90>;
+
+		port {
+			front_camera_ep: endpoint {
+				remote-endpoint = <&camsv_front_ep>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <267000000>;
+			};
+		};
+	};
+};
+
+&pio {
+	cam1_mclk_pins: cam1-mclk-pins {
+		pins-mclk {
+			pinmux = <0x8901>;	/* GPIO137 func 1: CMMCLK1 */
+			drive-strength = <4>;
+		};
+	};
+};
+
+/*
+ * ultrawide: HI1337 on i2c4 (7-bit 0x20), MCLK on GPIO151 (CAMTG3), reset
+ * GPIO144, FAN53870 L4 2.8 V AVDD + L2 1.1 V DVDD;
+ * 4-lane D-PHY into SENINF5 (MIUI)
+ */
+&i2c4 {
+	uw_camera: camera-sensor@20 {
+		compatible = "hynix,hi1337";
+		reg = <0x20>;
+		/* measured: only CAMTG3 makes it answer (not the BSP index's TG5) */
+		clocks = <&topckgen TOP_MUX_CAMTG3>;
+		assigned-clocks = <&topckgen TOP_MUX_CAMTG3>;
+		assigned-clock-parents = <&topckgen TOP_UNIVP_192M_D8>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam4_mclk_pins>;
+		reset-gpios = <&pio 144 GPIO_ACTIVE_LOW>;
+		avdd-supply = <&cam_ldo4>;
+		dvdd-supply = <&cam_ldo2>;
+		dovdd-supply = <&mt6359_vcamio>;
+		orientation = <1>;	/* back */
+		rotation = <270>;
+
+		port {
+			uw_camera_ep: endpoint {
+				remote-endpoint = <&camsv_uw_ep>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <720000000>;
+			};
+		};
+	};
+};
+
+/*
+ * mono (the BSP's "depth" camera, OV02B1B, no colour filter) and macro
+ * (S5K5E9) on i2c8. Mono: MCLK GPIO150 (CAMTG2), reset GPIO143, AVDD 2.8 V
+ * switched by GPIO147, GPIO16 high powers it up ("depth vio"). Macro: MCLK
+ * GPIO136 (CAMTG4), reset GPIO130, AVDD 2.8 V by GPIO148 (shared with the
+ * front camera), DVDD 1.2 V by GPIO146.
+ */
+/ {
+	cam2_avdd: regulator-cam2-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam2_avdd";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&pio 147 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	cam3_dvdd: regulator-cam3-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam3_dvdd";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		gpio = <&pio 146 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+&i2c8 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	mono_camera: camera-sensor@3c {
+		compatible = "ovti,ov02b1b";
+		reg = <0x3c>;
+		/* measured: CAMTG2, shared with the front camera's MCLK */
+		clocks = <&topckgen TOP_MUX_CAMTG2>;
+		assigned-clocks = <&topckgen TOP_MUX_CAMTG2>;
+		assigned-clock-parents = <&topckgen TOP_UNIVP_192M_D8>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam2_mclk_pins>;
+		reset-gpios = <&pio 143 GPIO_ACTIVE_LOW>;
+		pwdn-gpios = <&pio 16 GPIO_ACTIVE_LOW>;
+		avdd-supply = <&cam2_avdd>;
+		dovdd-supply = <&mt6359_vcamio>;
+		orientation = <1>;	/* back */
+		rotation = <270>;
+
+		port {
+			mono_camera_ep: endpoint {
+				remote-endpoint = <&camsv_mono_ep>;
+				data-lanes = <1>;
+				link-frequencies = /bits/ 64 <300000000>;
+			};
+		};
+	};
+
+	/*
+	 * macro VCM at 7-bit 0x0c (BSP camera_sub_two_af; its sub2 lens
+	 * drivers: AK7371, DW9800, DW9714), FAN53870 L6 (on in MIUI's macro
+	 * mode)
+	 */
+	macro_af: lens@c {
+		compatible = "dongwoon,dw9800k";
+		reg = <0x0c>;
+		vdd-supply = <&cam_ldo6>;
+		/* BSP sub2 DW9800AF init: 0x06 = 0x80 (SAC mode 2), 0x07 = 0x7f */
+		dongwoon,sac-mode = <2>;
+		dongwoon,vcm-prescale = <0x7f>;
+	};
+
+	macro_camera: camera-sensor@2d {
+		compatible = "samsung,s5k5e9";
+		reg = <0x2d>;
+		clocks = <&topckgen TOP_MUX_CAMTG4>;
+		assigned-clocks = <&topckgen TOP_MUX_CAMTG4>;
+		assigned-clock-parents = <&topckgen TOP_UNIVP_192M_D8>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam3_mclk_pins>;
+		reset-gpios = <&pio 130 GPIO_ACTIVE_LOW>;
+		lens-focus = <&macro_af>;
+		avdd-supply = <&cam1_avdd>;
+		dvdd-supply = <&cam3_dvdd>;
+		dovdd-supply = <&mt6359_vcamio>;
+		orientation = <1>;	/* back */
+		rotation = <270>;
+
+		port {
+			macro_camera_ep: endpoint {
+				remote-endpoint = <&camsv_macro_ep>;
+				data-lanes = <1 2>;
+				link-frequencies = /bits/ 64 <438000000>;
+			};
+		};
+	};
+};
+
+&pio {
+	cam2_mclk_pins: cam2-mclk-pins {
+		pins-mclk {
+			pinmux = <0x9601>;	/* GPIO150 func 1 */
+			drive-strength = <4>;
+		};
+	};
+
+	cam3_mclk_pins: cam3-mclk-pins {
+		pins-mclk {
+			pinmux = <0x8801>;	/* GPIO136 func 1 */
+			drive-strength = <4>;
+		};
+	};
+
+	cam4_mclk_pins: cam4-mclk-pins {
+		pins-mclk {
+			pinmux = <0x9701>;	/* GPIO151 func 1 */
+			drive-strength = <4>;
+		};
+	};
+};
+
+/*
+ * main camera: IMX682 on i2c2 (7-bit 0x1a), MCLK0 = CAMTG on GPIO149,
+ * 3-trio C-PHY into SENINF7 (MIUI); 1.1 V core switched by GPIO133
+ */
+/ {
+	cam0_dvdd: regulator-cam0-dvdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam0_dvdd";
+		regulator-min-microvolt = <1100000>;
+		regulator-max-microvolt = <1100000>;
+		gpio = <&pio 133 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+&i2c2 {
+	clock-frequency = <400000>;
+	status = "okay";
+
+	main_camera: camera-sensor@1a {
+		compatible = "sony,imx682";
+		reg = <0x1a>;
+		clocks = <&topckgen TOP_MUX_CAMTG>;
+		assigned-clocks = <&topckgen TOP_MUX_CAMTG>;
+		assigned-clock-parents = <&topckgen TOP_UNIVP_192M_D8>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam0_mclk_pins>;
+		reset-gpios = <&pio 145 GPIO_ACTIVE_LOW>;
+		avdd-supply = <&cam_ldo3>;
+		avdd2-supply = <&cam_ldo5>;
+		dovdd-supply = <&mt6359_vcamio>;
+		dvdd-supply = <&cam0_dvdd>;
+		lens-focus = <&main_af>;
+		orientation = <1>;	/* back */
+		/*
+		 * Upright in the raw frames with the phone right edge up (landscape):
+		 * 90 degrees clockwise (V4L2: counter-clockwise 270) in portrait
+		 */
+		rotation = <270>;
+
+		port {
+			main_camera_ep: endpoint {
+				remote-endpoint = <&camsv_main_ep>;
+				bus-type = <1>;		/* MEDIA_BUS_TYPE_CSI2_CPHY */
+				data-lanes = <1 2 3>;
+				link-frequencies = /bits/ 64 <492000000>;
+			};
+		};
+	};
+};
+
+&i2c2 {
+	/*
+	 * main camera VCM: DW9800 family (IC info 0xf2), vendor dw9800vaf/waf
+	 * init: ringing control, SAC mode 0x40, prescale 0x60
+	 */
+	main_af: lens@c {
+		compatible = "dongwoon,dw9800k";
+		reg = <0x0c>;
+		vdd-supply = <&cam_ldo7>;
+		dongwoon,sac-mode = <1>;
+		dongwoon,vcm-prescale = <0x60>;
+	};
+};
+
+&pio {
+	cam0_mclk_pins: cam0-mclk-pins {
+		pins-mclk {
+			pinmux = <0x9501>;	/* GPIO149 func 1: CMMCLK0 */
+			drive-strength = <4>;
+		};
+	};
+};
+
+&camera_frontend {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			camsv_front_ep: endpoint {
+				remote-endpoint = <&front_camera_ep>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			camsv_main_ep: endpoint {
+				remote-endpoint = <&main_camera_ep>;
+				bus-type = <1>;		/* MEDIA_BUS_TYPE_CSI2_CPHY */
+				data-lanes = <1 2 3>;
+			};
+		};
+
+		port@2 {
+			reg = <2>;
+			camsv_uw_ep: endpoint {
+				remote-endpoint = <&uw_camera_ep>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+
+		port@3 {
+			reg = <3>;
+			camsv_macro_ep: endpoint {
+				remote-endpoint = <&macro_camera_ep>;
+				data-lanes = <1 2>;
+			};
+		};
+
+		port@4 {
+			reg = <4>;
+			camsv_mono_ep: endpoint {
+				remote-endpoint = <&mono_camera_ep>;
+				data-lanes = <1>;
+			};
+		};
+	};
+};
+
+/* camera DMA: CAMSV2/3 on larb13 through the MDP IOMMU */
+&smi_mdp { status = "okay"; };
+&iommu_mdp { status = "okay"; };
+&larb13 { status = "okay"; };
+
+/*
+ * Video decoder (cezanne-vdec.ko): V4L2 stateless H.264 / HEVC / VP9 /
+ * VP8 / AV1 on LAT + core ("racing"); VDEC (soc + LAT, larb5) and VDEC2
+ * (core, larb4), all ports through the IOMMUs (buffers need not be
+ * physically contiguous). IRQs: core SPI 424, LAT SPI 425 (MIUI's
+ * vdec@16000000).
+ */
+&larb4 { status = "okay"; };
+&larb5 { status = "okay"; };
+/* the core's SMI path runs through the MDP-domain smi common: without it
+ * the whole 0x1602xxxx block stays dark even with VDEC2 powered */
+&smi_mdp { status = "okay"; };
+
+/ {
+	vdec: vdec@16000000 {
+		compatible = "cezanne,mt6885-vdec";
+		reg = <0 0x16000000 0 0x40000>;
+		interrupts = <GIC_SPI 424 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 425 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&spm MT6885_POWER_DOMAIN_VDEC>,
+				<&spm MT6885_POWER_DOMAIN_VDEC2>;
+		mediatek,larbs = <&larb5>, <&larb4>;
+		mediatek,smi-core = <&smi_mdp>;
+		/* soc + LAT: larb5 ports 0-7 (VLD, VLD2, AVC_MV, PRED_RD, TILE,
+		 * WDMA, RG_CTRL_DMA, UFO_ENC) on the MM IOMMU */
+		iommus = <&iommu_mm MTK_M4U_ID(5, 0)>, <&iommu_mm MTK_M4U_ID(5, 1)>,
+			 <&iommu_mm MTK_M4U_ID(5, 2)>, <&iommu_mm MTK_M4U_ID(5, 3)>,
+			 <&iommu_mm MTK_M4U_ID(5, 4)>, <&iommu_mm MTK_M4U_ID(5, 5)>,
+			 <&iommu_mm MTK_M4U_ID(5, 6)>, <&iommu_mm MTK_M4U_ID(5, 7)>;
+
+		/*
+		 * The core's larb4 is behind the MDP IOMMU and a device names
+		 * one IOMMU only: the core ports (0-10: MC, UFO, PP, PRED_RD,
+		 * PRED_WR, PPWRAP, TILE, VLD, VLD2, AVC_MV, RG_CTRL_DMA) belong
+		 * to this child. Both land in IOMMU region 0, one domain with a
+		 * page table shared by the two IOMMUs.
+		 */
+		vdec-core {
+			compatible = "cezanne,mt6885-vdec-core";
+			iommus = <&iommu_mdp MTK_M4U_ID(4, 0)>, <&iommu_mdp MTK_M4U_ID(4, 1)>,
+				 <&iommu_mdp MTK_M4U_ID(4, 2)>, <&iommu_mdp MTK_M4U_ID(4, 3)>,
+				 <&iommu_mdp MTK_M4U_ID(4, 4)>, <&iommu_mdp MTK_M4U_ID(4, 5)>,
+				 <&iommu_mdp MTK_M4U_ID(4, 6)>, <&iommu_mdp MTK_M4U_ID(4, 7)>,
+				 <&iommu_mdp MTK_M4U_ID(4, 8)>, <&iommu_mdp MTK_M4U_ID(4, 9)>,
+				 <&iommu_mdp MTK_M4U_ID(4, 10)>;
+		};
+	};
+};
+
+/*
+ * DRAM description for userspace (mt6885-dram-info, patch 0047): lk's
+ * "mediatek,common-dramc" node in its FDT (lk-fdt) plus the channel 0
+ * DDRPHY (NAO, AO) for the current data rate.
+ */
+/ {
+	dram-info@10236000 {
+		compatible = "cezanne,mt6885-dram-info";
+		reg = <0 0x10236000 0 0x1000>,
+		      <0 0x10238000 0 0x2000>;
+		memory-region = <&lk_fdt>;
+	};
+};
+
+/*
+ * Video encoder: two H.264 / HEVC cores, VENC (larb7, SPI 308) and
+ * VENC_CORE1 (larb8, SPI 313), through the IOMMUs like the decoder.
+ * Bring-up device for now (cezanne-vencdev.ko).
+ */
+&larb7 { status = "okay"; };
+&larb8 { status = "okay"; };
+
+/ {
+	venc: venc@17020000 {
+		compatible = "cezanne,mt6885-venc";
+		reg = <0 0x17020000 0 0x2000>,
+		      <0 0x17820000 0 0x2000>;
+		interrupts = <GIC_SPI 308 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 313 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&spm MT6885_POWER_DOMAIN_VENC>,
+				<&spm MT6885_POWER_DOMAIN_VENC_CORE1>;
+		mediatek,larbs = <&larb7>, <&larb8>;
+		/*
+		 * core 0: larb7's VENC ports 0-4 (RCPU, REC, BSDMA, SV_COMV,
+		 * RD_COMV) and 15-20 (CUR / REF LUMA / CHROMA, SUB_R / SUB_W
+		 * LUMA) on the MM IOMMU. The NBM engines (5, 6, 13, 14, FCS
+		 * 21, 22) work in the MM SRAM at physical 0x1e000000: the
+		 * driver routes those ports to the SRAM's SMI common (BSP
+		 * smi_sysram_enable), so they stay out of the IOMMU, as do
+		 * the JPEG encoder's ports. Left in bypass without that
+		 * routing, the NBM traffic goes to DRAM instead (0x1e000000
+		 * wrapped into RAM), so the driver refuses to run without
+		 * the SRAM.
+		 */
+		iommus = <&iommu_mm MTK_M4U_ID(7, 0)>, <&iommu_mm MTK_M4U_ID(7, 1)>,
+			 <&iommu_mm MTK_M4U_ID(7, 2)>, <&iommu_mm MTK_M4U_ID(7, 3)>,
+			 <&iommu_mm MTK_M4U_ID(7, 4)>, <&iommu_mm MTK_M4U_ID(7, 15)>,
+			 <&iommu_mm MTK_M4U_ID(7, 16)>, <&iommu_mm MTK_M4U_ID(7, 17)>,
+			 <&iommu_mm MTK_M4U_ID(7, 18)>, <&iommu_mm MTK_M4U_ID(7, 19)>,
+			 <&iommu_mm MTK_M4U_ID(7, 20)>;
+		cezanne,mmsram = <&mmsram>;
+
+		/* core 1 (larb8) is behind the MDP IOMMU: child device, as vdec-core */
+		venc-core1 {
+			compatible = "cezanne,mt6885-venc-core1";
+			iommus = <&iommu_mdp MTK_M4U_ID(8, 0)>, <&iommu_mdp MTK_M4U_ID(8, 1)>,
+				 <&iommu_mdp MTK_M4U_ID(8, 2)>, <&iommu_mdp MTK_M4U_ID(8, 3)>,
+				 <&iommu_mdp MTK_M4U_ID(8, 4)>, <&iommu_mdp MTK_M4U_ID(8, 15)>,
+				 <&iommu_mdp MTK_M4U_ID(8, 16)>, <&iommu_mdp MTK_M4U_ID(8, 17)>,
+				 <&iommu_mdp MTK_M4U_ID(8, 18)>, <&iommu_mdp MTK_M4U_ID(8, 19)>,
+				 <&iommu_mdp MTK_M4U_ID(8, 20)>;
+		};
+	};
+};
+
+#ifdef CEZANNE_DRM
+/*
+ * mediatek-drm drives the display (mkboot-mainline.sh default;
+ * DISPLAY_DRV=simpledrm builds the old simpledrm + kick driver variant):
+ * single pipe at 60 Hz, command-mode panel with DSC. simpledrm and the
+ * kick driver must not touch the hardware then.
+ */
+&framebuffer0 {
+	status = "disabled";
+};
+
+/*
+ * lk's framebuffer carve-out (30 MiB): only simpledrm scans it out. lk keeps
+ * showing it until mediatek-drm takes over (<1 s), and early allocations come
+ * from the top of RAM, not from here.
+ */
+/ {
+	reserved-memory {
+		/delete-node/ framebuffer@7ae10000;
+	};
+};
+
+/*
+ * The APU's DMA pool (cezanne-apu: the upscaler's buffer, ~750 MB for two
+ * 579 px tiles): CMA above 4 GiB, as the default area below 4 GiB cannot
+ * grow (no free range there is much larger than its 512 MiB). The MDLA's
+ * addresses are 32-bit and the reviser adds bits 33:32 (commands and data
+ * both: mainline/apu/re/e22_window.py, with the pool's first 16 MiB as
+ * seen without them reserved for the test), so the pool stays inside one
+ * 4 GiB window. Reusable: movable pages use it while the APU does not.
+ */
+/ {
+	reserved-memory {
+		apu_pool: apu-pool@190000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x1 0x90000000 0x0 0x40000000>;
+			reusable;
+		};
+	};
+
+	/* interrupts: the MDLA cores' (MIUI's mtk_mdla node) */
+	cezanne-apu {
+		memory-region = <&apu_pool>;
+		interrupts = <GIC_SPI 413 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 414 IRQ_TYPE_LEVEL_HIGH>;
+	};
+};
+
+&lk_kick {
+	status = "disabled";
+};
+
+/ {
+	/* Microtrust TEE (soter): notification interrupts to the normal world */
+	utos {
+		compatible = "microtrust,utos";
+		interrupts = <GIC_SPI 506 IRQ_TYPE_EDGE_RISING>,
+			     <GIC_SPI 507 IRQ_TYPE_EDGE_RISING>;
+	};
+};
+
+/*
+ * Goodix optical (under-display) fingerprint sensor, GF3658 / "Delmar" G6.
+ * The TEE drives the sensor over this bus; Linux keeps its clock on and only
+ * reads the chip ID. Reset GPIO14, IRQ EINT15 (vendor DT).
+ */
+&spi1 {
+	status = "okay";
+
+	fingerprint@0 {
+		compatible = "goodix,cezanne-fp";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		interrupts-extended = <&pio 15 IRQ_TYPE_EDGE_RISING>;
+		reset-gpios = <&pio 14 GPIO_ACTIVE_LOW>;
+		/* GPIO15 is left an input (mode 0) by the bootloader */
+		vfp-supply = <&mt6360_vfp>;
+	};
+};
+
+
+&smi_disp { status = "okay"; };
+&iommu_mm { status = "okay"; };
+&larb0 { status = "okay"; };
+&larb1 { status = "okay"; };
+&ovl0 { status = "okay"; };
+&rdma0 { status = "okay"; };
+&color0 { status = "okay"; };
+&ccorr0 { status = "okay"; };
+&aal0 { status = "okay"; };
+&gamma0 { status = "okay"; };
+&postmask0 { status = "okay"; };
+&dither0 { status = "okay"; };
+&dsc0 { status = "okay"; };
+&ovl1 { status = "okay"; };
+&rdma1 { status = "okay"; };
+&color1 { status = "okay"; };
+&ccorr1 { status = "okay"; };
+&aal1 { status = "okay"; };
+&gamma1 { status = "okay"; };
+&postmask1 { status = "okay"; };
+&dither1 { status = "okay"; };
+&mipi_tx0 { status = "okay"; };
+
+&dsi0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	panel@0 {
+		compatible = "xiaomi,j10-38-08-0a";
+		reg = <0>;
+		/* GPIO41 is the panel TE (DSI_TE function, muxed by lk) */
+		reset-gpios = <&pio 42 GPIO_ACTIVE_LOW>;
+		bias-gpios = <&pio 29 GPIO_ACTIVE_HIGH>;
+		vci-supply = <&mt6359_vibr>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&dsi_out>;
+			};
+		};
+	};
+
+	port {
+		dsi_out: endpoint {
+			remote-endpoint = <&panel_in>;
+		};
+	};
+};
+#endif

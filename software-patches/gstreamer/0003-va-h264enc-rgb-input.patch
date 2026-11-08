@@ -1,0 +1,48 @@
+From: cezanne port
+Subject: [PATCH] va: h264enc: take RGB input where the driver encodes RGB32
+
+The cezanne VA driver (mainline/rootfs/libva-v4l2-request) lists
+VA_RT_FORMAT_RGB32 for H.264 EncSlice: its encoder (cezanne-venc) reads
+BGRx / RGBx dma-bufs and converts them to BT.709 itself. With RGB taken
+here, GNOME's screen recorder (pipewiresrc DMA_DRM XR24 ! vapostproc !
+vah264enc) runs vapostproc in passthrough and encodes the compositor's
+buffers with no copy and no CPU conversion. Drivers without RGB32 for the
+entrypoint fail the profile choice as before. The output caps get BT.709
+colorimetry instead of the input's RGB one (mp4mux would otherwise tag
+the stream GBR).
+
+--- a/sys/va/gstvah264enc.c	2026-10-29 15:25:17.856668642 +0100
++++ b/sys/va/gstvah264enc.c	2026-10-29 15:28:24.678003568 +0100
+@@ -1216,6 +1216,7 @@
+     guint MbHeightC = 8;
+ 
+     switch (base->rt_format) {
++      case VA_RT_FORMAT_RGB32:  /* coded as 8-bit 4:2:0 */
+       case VA_RT_FORMAT_YUV420:
+         BitDepthY = 8;
+         BitDepthC = 8;
+@@ -1302,8 +1303,10 @@
+ 
+   chroma = gst_va_chroma_from_video_format (format);
+ 
+-  /* Check whether the rtformat is supported. */
+-  if (chroma != VA_RT_FORMAT_YUV420) {
++  /* Check whether the rtformat is supported. RGB is taken for drivers
++   * whose encoder converts it itself (the profile choice checks that the
++   * driver lists RGB32 for the entrypoint), saving a conversion pass. */
++  if (chroma != VA_RT_FORMAT_YUV420 && chroma != VA_RT_FORMAT_RGB32) {
+     GST_ERROR_OBJECT (self, "Unsupported chroma for video format: %s",
+         gst_video_format_to_string (format));
+     return 0;
+@@ -1710,6 +1713,11 @@
+ 
+   output_state =
+       gst_video_encoder_set_output_state (venc, out_caps, base->input_state);
++  /* RGB input comes out as BT.709 limited range YCbCr (the driver's
++   * conversion), not with the RGB colorimetry of the input */
++  if (GST_VIDEO_INFO_IS_RGB (&base->in_info))
++    gst_video_colorimetry_from_string (&output_state->info.colorimetry,
++        GST_VIDEO_COLORIMETRY_BT709);
+   gst_video_codec_state_unref (output_state);
+ 
+   if (!gst_video_encoder_negotiate (venc)) {

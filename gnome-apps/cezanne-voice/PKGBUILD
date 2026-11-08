@@ -1,0 +1,39 @@
+# Voice processing for the Redmi K30 Ultra (cezanne): RNNoise noise
+# suppression (Xiph / Mozilla, the system librnnoise 0.2) as our LADSPA
+# plugin, run by PipeWire filter chains:
+#   - everything that records from the microphone (cezanne-voice.service,
+#     a WirePlumber smart filter in front of the default source);
+#   - cellular calls: cezanne-speechd (package cezanne-modem) runs
+#     call.conf.in for the length of a call, the modem's audio routed
+#     through the AP: WebRTC echo cancelling, then RNNoise.
+# The Power app (cezanne-power) switches RNNoise on and off for both
+# (~/.config/cezanne/noise-reduction). README.md.
+pkgname=cezanne-voice
+pkgver=1.0
+pkgrel=2
+pkgdesc="Microphone noise reduction (RNNoise) and call echo cancelling for the cezanne"
+arch=(aarch64)
+license=(MIT)
+depends=(rnnoise pipewire wireplumber)
+makedepends=(ladspa)
+source=(cezanne-rnnoise.c
+        cezanne-voice.conf
+        call.conf.in
+        cezanne-voice.service)
+sha256sums=(SKIP SKIP SKIP SKIP)
+
+build() {
+  # shellcheck disable=SC2086
+  cc $CFLAGS $LDFLAGS -Wall -Wextra -shared -fPIC -o cezanne-rnnoise.so \
+    cezanne-rnnoise.c -lrnnoise -lpthread
+}
+
+package() {
+  install -Dm755 cezanne-rnnoise.so "$pkgdir/usr/lib/ladspa/cezanne-rnnoise.so"
+  install -Dm644 cezanne-voice.conf "$pkgdir/usr/share/pipewire/cezanne-voice.conf"
+  install -Dm644 call.conf.in "$pkgdir/usr/share/cezanne-voice/call.conf.in"
+  install -Dm644 cezanne-voice.service "$pkgdir/usr/lib/systemd/user/cezanne-voice.service"
+  # on for every user, with PipeWire
+  install -d "$pkgdir/usr/lib/systemd/user/pipewire.service.wants"
+  ln -s ../cezanne-voice.service "$pkgdir/usr/lib/systemd/user/pipewire.service.wants/cezanne-voice.service"
+}

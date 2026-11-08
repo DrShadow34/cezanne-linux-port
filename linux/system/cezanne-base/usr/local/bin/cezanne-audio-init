@@ -1,0 +1,75 @@
+#!/bin/sh
+# CS35L41 speaker amps on cezanne: DSP protection firmware, factory calibration
+# (MIUI persist partition, audio/cs35l41_cal.txt) and the speaker settings of
+# MIUI's audio_device.xml (PCM Source DSP, amp gain 18 bottom / 17 top).
+C=cezanne
+ctl() { amixer -c "$C" -q cset name="$1" "$2"; }
+wait_ctl() {
+	for i in $(seq 100); do
+		amixer -c "$C" cget name="$1" >/dev/null 2>&1 && return 0
+		sleep 0.1
+	done
+	echo "control '$1' did not appear" >&2
+	return 1
+}
+be32() { printf '0x%02x,0x%02x,0x%02x,0x%02x' $(($1 >> 24 & 255)) $(($1 >> 16 & 255)) $(($1 >> 8 & 255)) $(($1 & 255)); }
+
+# The vendor protection firmware (CSPL v0.13) predates the mailbox protocol
+# mainline uses for hibernation: waking from runtime suspend fails and the DSP
+# stops ("CSPL Error Detected"). Keep the amps out of runtime suspend.
+for d in /sys/bus/i2c/drivers/cs35l41/*-00*; do
+	echo on > "$d/power/control"
+done
+
+wait_ctl "Bottom DSP1 Preload Switch" || exit 1
+ctl "Bottom DSP1 Preload Switch" on
+ctl "Top DSP1 Preload Switch" on
+wait_ctl "Bottom DSP1 Protection cd CAL_R" || exit 1
+wait_ctl "Top DSP1 Protection cd CAL_R" || exit 1
+
+# "status = 1, ..., cal_r = 8396, ambient = 23, ..." then the same with "R " for the top amp
+P=$(mktemp -d)
+if mount -o ro /dev/disk/by-partlabel/persist "$P" 2>/dev/null; then
+	CAL=$(cat "$P/audio/cs35l41_cal.txt" 2>/dev/null)
+	umount "$P"
+fi
+rmdir "$P"
+field() { echo "$CAL" | sed -n "s/.*$1 = \([0-9]*\).*/\1/p" | sed -n "${2}p"; }
+apply_cal() {
+	amp=$1 n=$2
+	r=$(field cal_r "$n") amb=$(field ambient "$n") st=$(field status "$n")
+	[ -n "$r" ] && [ "$st" = 1 ] || { echo "$amp: no factory calibration, using defaults" >&2; return; }
+	ctl "$amp DSP1 Protection cd CAL_R" "$(be32 "$r")"
+	ctl "$amp DSP1 Protection cd CAL_AMBIENT" "$(be32 "$amb")"
+	ctl "$amp DSP1 Protection cd CAL_STATUS" "$(be32 1)"
+	ctl "$amp DSP1 Protection cd CAL_CHECKSUM" "$(be32 $((r + 1)))"
+	echo "$amp: cal_r $r ambient $amb"
+}
+apply_cal Bottom 1
+apply_cal Top 2
+
+for a in Bottom Top; do
+	ctl "$a PCM Source" DSP
+	ctl "$a DSP RX1 Source" ASPRX1
+	ctl "$a Digital PCM Volume" 817	# 0 dB
+done
+ctl "Bottom Analog PCM Volume" 18
+ctl "Top Analog PCM Volume" 17
+
+# MIUI's media tuning deltas (cezanne-amp-usecase). They need the DSPs
+# running, which they are only after the first clocked stream (patch 0037)
+# and then until the next boot: start them with two seconds of silence while
+# DL1 is still free (the sound server may already hold it, then the deltas
+# follow its first stream). Routes and pins go back to what they were.
+get() { amixer -c "$C" cget name="$1" | sed -n 's/^ *: values=//p'; }
+if [ -z "$(fuser /dev/snd/pcmC0D0p 2>/dev/null)" ]; then
+	saved=""
+	for n in "Speakers Switch" "Earpiece Switch" "I2S3_CH1 DL1_CH1" "I2S3_CH2 DL1_CH2"; do
+		saved="$saved$n=$(get "$n")
+"
+		ctl "$n" on
+	done
+	head -c 768000 /dev/zero | aplay -q -D hw:0,0 -f S32_LE -c2 -r48000 -t raw 2>/dev/null
+	echo "$saved" | while IFS='=' read -r n v; do [ -n "$n" ] && ctl "$n" "$v"; done
+fi
+/usr/local/bin/cezanne-amp-usecase --wait 900 music &

@@ -1,0 +1,12 @@
+[Unit]
+Description=Load factory sensor calibration into the SCP sensor hub
+After=systemd-modules-load.service
+Before=iio-sensor-proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cezanne-sensor-cal
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

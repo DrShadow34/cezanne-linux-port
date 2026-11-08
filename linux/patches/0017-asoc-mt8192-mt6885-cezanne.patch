@@ -1,0 +1,220 @@
+ASoC: mediatek: mt8192: MT6885 AFE (optional reset) and a cezanne MT6359 + 2x CS35L41 card
+
+diff --git a/sound/soc/mediatek/mt8192/mt8192-afe-pcm.c b/sound/soc/mediatek/mt8192/mt8192-afe-pcm.c
+index db0ae44a8..d03f3aef9 100644
+--- a/sound/soc/mediatek/mt8192/mt8192-afe-pcm.c
++++ b/sound/soc/mediatek/mt8192/mt8192-afe-pcm.c
+@@ -2203,7 +2203,8 @@ static int mt8192_afe_pcm_dev_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	/* reset controller to reset audio regs before regmap cache */
+-	rstc = devm_reset_control_get_exclusive(dev, "audiosys");
++	/* optional: MT6885 boards have no known TOPRGU audio reset */
++	rstc = devm_reset_control_get_optional_exclusive(dev, "audiosys");
+ 	if (IS_ERR(rstc))
+ 		return dev_err_probe(dev, PTR_ERR(rstc), "could not get audiosys reset\n");
+ 
+diff --git a/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c b/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
+index c86348691..cf6fdfdfb 100644
+--- a/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
++++ b/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
+@@ -10,12 +10,14 @@
+ #include <linux/input.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_platform.h>
+ #include <linux/pm_runtime.h>
+ #include <sound/jack.h>
+ #include <sound/pcm_params.h>
+ #include <sound/rt5682.h>
+ #include <sound/soc.h>
+ 
++#include <sound/cs35l41.h>
+ #include "../../codecs/mt6359.h"
+ #include "../../codecs/rt1015.h"
+ #include "../../codecs/rt5682.h"
+@@ -39,6 +41,8 @@
+ #define RT1015_RT5682_OF_NAME "mediatek,mt8192_mt6359_rt1015_rt5682"
+ #define RT1015P_RT5682_OF_NAME "mediatek,mt8192_mt6359_rt1015p_rt5682"
+ #define RT1015P_RT5682S_OF_NAME "mediatek,mt8192_mt6359_rt1015p_rt5682s"
++#define CS35L41_CARD_NAME "mt6885_mt6359_cs35l41"
++#define CS35L41_OF_NAME "mediatek,mt6885-mt6359-cs35l41-sound"
+ 
+ enum mt8192_jacks {
+ 	MT8192_JACK_HEADSET,
+@@ -139,6 +143,43 @@ static int mt8192_rt5682x_i2s_hw_params(struct snd_pcm_substream *substream,
+ 	return snd_soc_dai_set_sysclk(cpu_dai, 0, mclk_fs, SND_SOC_CLOCK_OUT);
+ }
+ 
++/*
++ * Two CS35L41 on one I2S (BCLK = 64 fs from the AFE): the amp at codec index
++ * i takes slot i, i.e. left then right, and runs its PLL from BCLK.
++ */
++static int mt8192_cs35l41_i2s_hw_params(struct snd_pcm_substream *substream,
++					struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	unsigned int bclk = params_rate(params) * 64;
++	struct snd_soc_dai *codec_dai;
++	int i, ret;
++
++	for_each_rtd_codec_dais(rtd, i, codec_dai) {
++		unsigned int slot = i;
++
++		ret = snd_soc_component_set_sysclk(codec_dai->component,
++						   CS35L41_CLKID_SCLK, 0, bclk,
++						   SND_SOC_CLOCK_IN);
++		if (ret)
++			return ret;
++		ret = snd_soc_dai_set_sysclk(codec_dai, 0, bclk, SND_SOC_CLOCK_IN);
++		if (ret)
++			return ret;
++		ret = snd_soc_dai_set_channel_map(codec_dai, 0, NULL, 1, &slot);
++		if (ret)
++			return ret;
++	}
++
++	return snd_soc_dai_set_sysclk(cpu_dai, 0, params_rate(params) * 128,
++				      SND_SOC_CLOCK_OUT);
++}
++
++static const struct snd_soc_ops mt8192_cs35l41_i2s_ops = {
++	.hw_params = mt8192_cs35l41_i2s_hw_params,
++};
++
+ static const struct snd_soc_ops mt8192_rt1015_i2s_ops = {
+ 	.hw_params = mt8192_rt1015_i2s_hw_params,
+ };
+@@ -1019,6 +1060,34 @@ static struct snd_soc_card mt8192_mt6359_rt1015p_rt5682x_card = {
+ 	.num_dapm_routes = ARRAY_SIZE(mt8192_mt6359_rt1015p_rt5682x_routes),
+ };
+ 
++static const struct snd_soc_dapm_widget mt6885_mt6359_cs35l41_widgets[] = {
++	SND_SOC_DAPM_SPK("Speakers", NULL),
++	SND_SOC_DAPM_SPK("Earpiece", NULL),
++	SND_SOC_DAPM_HP("Headphone Jack", NULL),
++	SND_SOC_DAPM_MIC("Headset Mic", NULL),
++	SND_SOC_DAPM_MIC("Main Mic", NULL),
++	SND_SOC_DAPM_MIC("Second Mic", NULL),
++};
++
++static const struct snd_kcontrol_new mt6885_mt6359_cs35l41_controls[] = {
++	SOC_DAPM_PIN_SWITCH("Speakers"),
++	SOC_DAPM_PIN_SWITCH("Earpiece"),
++	SOC_DAPM_PIN_SWITCH("Headphone Jack"),
++	SOC_DAPM_PIN_SWITCH("Headset Mic"),
++};
++
++/* routes come from the DT (audio-routing) */
++static struct snd_soc_card mt6885_mt6359_cs35l41_card = {
++	.driver_name = DRIVER_NAME,
++	.owner = THIS_MODULE,
++	.dai_link = mt8192_mt6359_dai_links,
++	.num_links = ARRAY_SIZE(mt8192_mt6359_dai_links),
++	.controls = mt6885_mt6359_cs35l41_controls,
++	.num_controls = ARRAY_SIZE(mt6885_mt6359_cs35l41_controls),
++	.dapm_widgets = mt6885_mt6359_cs35l41_widgets,
++	.num_dapm_widgets = ARRAY_SIZE(mt6885_mt6359_cs35l41_widgets),
++};
++
+ static int mt8192_mt6359_card_set_be_link(struct device *dev,
+ 					  struct snd_soc_dai_link *link,
+ 					  struct device_node *node,
+@@ -1104,12 +1173,40 @@ static int mt8192_mt6359_legacy_probe(struct mtk_soc_card_data *soc_card_data)
+ 	return ret;
+ }
+ 
++/*
++ * Card bound before the AFE component exists ends up on the ASoC unbind list,
++ * and the DT codec references are dropped right after registration, so the
++ * later rebind fails. Defer the whole probe until the AFE is registered.
++ */
++static int mt8192_mt6359_afe_ready(struct device *dev)
++{
++	struct device_node *np = of_parse_phandle(dev->of_node, "mediatek,platform", 0);
++	struct platform_device *afe_pdev;
++	bool ready;
++
++	if (!np)
++		return -EINVAL;
++	afe_pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!afe_pdev)
++		return -EPROBE_DEFER;
++	ready = snd_soc_lookup_component(&afe_pdev->dev, NULL);
++	put_device(&afe_pdev->dev);
++	return ready ? 0 : -EPROBE_DEFER;
++}
++
+ static int mt8192_mt6359_soc_card_probe(struct mtk_soc_card_data *soc_card_data, bool legacy)
+ {
+ 	struct mtk_platform_card_data *card_data = soc_card_data->card_data;
+ 	struct snd_soc_card *card = card_data->card;
+ 	int ret;
+ 
++	if (card == &mt6885_mt6359_cs35l41_card) {
++		ret = mt8192_mt6359_afe_ready(card->dev);
++		if (ret)
++			return ret;
++	}
++
+ 	if (legacy) {
+ 		ret = mt8192_mt6359_legacy_probe(soc_card_data);
+ 		if (ret)
+@@ -1118,10 +1215,23 @@ static int mt8192_mt6359_soc_card_probe(struct mtk_soc_card_data *soc_card_data,
+ 		struct snd_soc_dai_link *dai_link;
+ 		int i;
+ 
+-		for_each_card_prelinks(card, i, dai_link)
+-			if (dai_link->num_codecs &&
+-			    strcmp(dai_link->codecs[0].dai_name, RT1015_CODEC_DAI) == 0)
++		for_each_card_prelinks(card, i, dai_link) {
++			const char *codec_dai = dai_link->num_codecs ?
++						dai_link->codecs[0].dai_name : NULL;
++
++			if (codec_dai && strcmp(codec_dai, RT1015_CODEC_DAI) == 0)
+ 				dai_link->ops = &mt8192_rt1015_i2s_ops;
++			if (card == &mt6885_mt6359_cs35l41_card) {
++				/* no RT5682 on I2S8/9; the CS35L41 pair sits on I2S3 */
++				if (!strcmp(dai_link->name, "I2S8"))
++					dai_link->init = NULL;
++				/* analog mics only: drop dmic-codec from the ADDA link */
++				if (!strcmp(dai_link->name, "Primary Codec"))
++					dai_link->num_codecs = 1;
++				if (codec_dai && !strcmp(codec_dai, "cs35l41-pcm"))
++					dai_link->ops = &mt8192_cs35l41_i2s_ops;
++			}
++		}
+ 	}
+ 
+ 	ret = mt8192_afe_gpio_init(card->dev);
+@@ -1195,6 +1305,17 @@ static const struct mtk_soundcard_pdata mt8192_mt6359_rt1015p_rt5682s_pdata = {
+ 	.soc_probe = mt8192_mt6359_soc_card_probe
+ };
+ 
++static const struct mtk_soundcard_pdata mt6885_mt6359_cs35l41_pdata = {
++	.card_name = CS35L41_CARD_NAME,
++	.card_data = &(struct mtk_platform_card_data) {
++		.card = &mt6885_mt6359_cs35l41_card,
++		.num_jacks = MT8192_JACK_MAX,
++		.pcm_constraints = mt8192_pcm_constraints,
++		.num_pcm_constraints = ARRAY_SIZE(mt8192_pcm_constraints),
++	},
++	.soc_probe = mt8192_mt6359_soc_card_probe
++};
++
+ #ifdef CONFIG_OF
+ static const struct of_device_id mt8192_mt6359_dt_match[] = {
+ 	{
+@@ -1209,6 +1330,10 @@ static const struct of_device_id mt8192_mt6359_dt_match[] = {
+ 		.compatible = RT1015P_RT5682S_OF_NAME,
+ 		.data = &mt8192_mt6359_rt1015p_rt5682s_pdata,
+ 	},
++	{
++		.compatible = CS35L41_OF_NAME,
++		.data = &mt6885_mt6359_cs35l41_pdata,
++	},
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, mt8192_mt6359_dt_match);

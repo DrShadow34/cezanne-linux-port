@@ -1,0 +1,19 @@
+[Unit]
+Description=Call audio (cezanne: modem speech path, hostless AFE stream)
+After=cezanne-modem.service ModemManager.service sound.target
+Wants=ModemManager.service
+
+[Service]
+ExecStart=/usr/bin/cezanne-speechd
+Restart=on-failure
+RestartSec=5
+# modem not up (e.g. in exception): back off to 10 min, don't wake every 5 s
+RestartSteps=8
+RestartMaxDelaySec=10min
+ProtectHome=read-only
+StateDirectory=cezanne-speechd
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- cezanne-power: what the phone does while it sleeps (read by the
+     cezanne-aod shell extension) -->
+<schemalist>
+  <schema id="org.cezanne.power" path="/org/cezanne/power/">
+    <key name="aod-enabled" type="b">
+      <default>true</default>
+      <summary>Always-on clock on the lock screen</summary>
+      <description>Without it the phone suspends fully (NetworkManager then disconnects).</description>
+    </key>
+    <key name="aod-brightness" type="s">
+      <choices>
+        <choice value="auto"/>
+        <choice value="low"/>
+        <choice value="high"/>
+      </choices>
+      <default>'auto'</default>
+      <summary>Clock brightness (auto: high above 50 lux)</summary>
+    </key>
+    <key name="wifi-standby" type="s">
+      <choices>
+        <choice value="connected"/>
+        <choice value="off-after"/>
+        <choice value="off"/>
+      </choices>
+      <default>'connected'</default>
+      <summary>Wi-Fi while the always-on clock shows</summary>
+    </key>
+    <key name="wifi-standby-minutes" type="u">
+      <range min="1" max="1440"/>
+      <default>15</default>
+      <summary>Minutes in the always-on clock before Wi-Fi turns off (off-after)</summary>
+    </key>
+    <key name="bluetooth-standby" type="b">
+      <default>true</default>
+      <summary>Bluetooth off while the phone sleeps</summary>
+      <description>Unless a device is connected (a headset); on again when the screen wakes.</description>
+    </key>
+  </schema>
+</schemalist>

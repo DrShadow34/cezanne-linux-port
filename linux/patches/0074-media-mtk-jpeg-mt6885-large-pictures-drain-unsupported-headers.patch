@@ -1,0 +1,401 @@
+diff --git a/Documentation/devicetree/bindings/media/mediatek-jpeg-decoder.yaml b/Documentation/devicetree/bindings/media/mediatek-jpeg-decoder.yaml
+--- a/Documentation/devicetree/bindings/media/mediatek-jpeg-decoder.yaml
++++ b/Documentation/devicetree/bindings/media/mediatek-jpeg-decoder.yaml
+@@ -24,6 +24,9 @@
+               - mediatek,mt7623-jpgdec
+               - mediatek,mt8188-jpgdec
+           - const: mediatek,mt2701-jpgdec
++      - items:
++          - const: mediatek,mt6885-jpgdec
++          - const: mediatek,mt8173-jpgdec
+ 
+   reg:
+     maxItems: 1
+diff --git a/Documentation/devicetree/bindings/media/mediatek-jpeg-encoder.yaml b/Documentation/devicetree/bindings/media/mediatek-jpeg-encoder.yaml
+--- a/Documentation/devicetree/bindings/media/mediatek-jpeg-encoder.yaml
++++ b/Documentation/devicetree/bindings/media/mediatek-jpeg-encoder.yaml
+@@ -17,6 +17,7 @@
+     items:
+       - enum:
+           - mediatek,mt2701-jpgenc
++          - mediatek,mt6885-jpgenc
+           - mediatek,mt8183-jpgenc
+           - mediatek,mt8186-jpgenc
+           - mediatek,mt8188-jpgenc
+diff --git a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+--- a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
++++ b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+@@ -256,6 +256,16 @@
+ 	return NULL;
+ }
+ 
++/*
++ * Bitstream buffer for a w x h picture: 2 bytes a pixel (quality 95 photos
++ * take ~0.5, noise at quality 90 1.5), at least the old 1 MiB default
++ */
++static u32 mtk_jpeg_default_sizeimage(u32 w, u32 h)
++{
++	return max_t(u32, MTK_JPEG_DEFAULT_SIZEIMAGE,
++		     round_up(min_t(u64, (u64)w * h * 2, SZ_1G), PAGE_SIZE));
++}
++
+ static int mtk_jpeg_try_fmt_mplane(struct v4l2_pix_format_mplane *pix_mp,
+ 				   struct mtk_jpeg_fmt *fmt)
+ {
+@@ -278,7 +288,8 @@
+ 		/* Source size must be aligned to 128 */
+ 		pfmt->sizeimage = round_up(pfmt->sizeimage, 128);
+ 		if (pfmt->sizeimage == 0)
+-			pfmt->sizeimage = MTK_JPEG_DEFAULT_SIZEIMAGE;
++			pfmt->sizeimage = mtk_jpeg_default_sizeimage(pix_mp->width,
++								    pix_mp->height);
+ 		return 0;
+ 	}
+ 
+@@ -457,14 +468,35 @@
+ static int mtk_jpeg_s_fmt_vid_out_mplane(struct file *file, void *priv,
+ 					 struct v4l2_format *f)
+ {
++	struct mtk_jpeg_ctx *ctx = mtk_jpeg_file_to_ctx(file);
++	struct mtk_jpeg_q_data *cap_q;
++	struct vb2_queue *cap_vq;
+ 	int ret;
+ 
+ 	ret = mtk_jpeg_try_fmt_vid_out_mplane(file, priv, f);
+ 	if (ret)
+ 		return ret;
+ 
+-	return mtk_jpeg_s_fmt_mplane(mtk_jpeg_file_to_ctx(file), f,
+-				     MTK_JPEG_FMT_FLAG_OUTPUT);
++	ret = mtk_jpeg_s_fmt_mplane(ctx, f, MTK_JPEG_FMT_FLAG_OUTPUT);
++	if (ret)
++		return ret;
++
++	/*
++	 * Encoder: the JPEG side follows the picture's size, and its buffer
++	 * with it (the 1 MiB default made a 16 MP picture stall the encoder)
++	 */
++	if (ctx->jpeg->variant->cap_q_default_fourcc != V4L2_PIX_FMT_JPEG)
++		return 0;
++	cap_vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++				 V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++	if (vb2_is_busy(cap_vq))
++		return 0;
++	cap_q = &ctx->cap_q;
++	cap_q->pix_mp.width = f->fmt.pix_mp.width;
++	cap_q->pix_mp.height = f->fmt.pix_mp.height;
++	cap_q->pix_mp.plane_fmt[0].sizeimage =
++		mtk_jpeg_default_sizeimage(cap_q->pix_mp.width, cap_q->pix_mp.height);
++	return 0;
+ }
+ 
+ static int mtk_jpeg_s_fmt_vid_cap_mplane(struct file *file, void *priv,
+@@ -697,6 +729,32 @@
+ 	return 0;
+ }
+ 
++/*
++ * The picture's header, parsed when the client queues it: one the decoder
++ * cannot take (progressive; grayscale, which has no capture format) fails
++ * VIDIOC_QBUF instead of reaching the queue's bookkeeping, where the
++ * missing capture format of a grayscale one was dereferenced.
++ */
++static int mtk_jpeg_dec_parse_src(struct mtk_jpeg_ctx *ctx,
++				  struct vb2_buffer *vb)
++{
++	struct mtk_jpeg_dev *jpeg = ctx->jpeg;
++	struct mtk_jpeg_dec_param *param =
++		&mtk_jpeg_vb2_to_srcbuf(vb)->dec_param;
++
++	memset(param, 0, sizeof(*param));
++	if (!mtk_jpeg_parse(param, (u8 *)vb2_plane_vaddr(vb, 0),
++			    vb2_get_plane_payload(vb, 0)) ||
++	    !mtk_jpeg_find_format(jpeg->variant->formats,
++				  jpeg->variant->num_formats,
++				  param->dst_fourcc,
++				  MTK_JPEG_FMT_FLAG_CAPTURE)) {
++		v4l2_err(&jpeg->v4l2_dev, "Header invalid or unsupported.\n");
++		return -EINVAL;
++	}
++	return 0;
++}
++
+ static int mtk_jpeg_buf_prepare(struct vb2_buffer *vb)
+ {
+ 	struct mtk_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+@@ -708,6 +766,7 @@
+ 	if (!q_data)
+ 		return -EINVAL;
+ 
++	to_vb2_v4l2_buffer(vb)->field = V4L2_FIELD_NONE;
+ 	for (i = 0; i < q_data->fmt->colplanes; i++) {
+ 		plane_fmt = q_data->pix_mp.plane_fmt[i];
+ 		if (ctx->enable_exif &&
+@@ -718,6 +777,9 @@
+ 			vb2_set_plane_payload(vb, i,  plane_fmt.sizeimage);
+ 	}
+ 
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) &&
++	    q_data->fmt->fourcc == V4L2_PIX_FMT_JPEG)
++		return mtk_jpeg_dec_parse_src(ctx, vb);
+ 	return 0;
+ }
+ 
+@@ -779,6 +841,41 @@
+ 		 param->dec_w, param->dec_h);
+ }
+ 
++/*
++ * The drain (V4L2_ENC_CMD_STOP / V4L2_DEC_CMD_STOP, the m2m core's state):
++ * the picture of the last output buffer queued before it ends the stream.
++ * Its capture buffer has to carry V4L2_BUF_FLAG_LAST, or a client waiting
++ * for the end (GStreamer's v4l2jpegenc / v4l2jpegdec at EOS) waits for good.
++ */
++static void mtk_jpeg_mark_last(struct mtk_jpeg_ctx *ctx,
++			       struct vb2_v4l2_buffer *src_buf,
++			       struct vb2_v4l2_buffer *dst_buf)
++{
++	if (!v4l2_m2m_is_last_draining_src_buf(ctx->fh.m2m_ctx, src_buf))
++		return;
++	dst_buf->flags |= V4L2_BUF_FLAG_LAST;
++	v4l2_m2m_mark_stopped(ctx->fh.m2m_ctx);
++}
++
++/*
++ * STOP with nothing left to process and no capture buffer queued: the next
++ * capture buffer ends the stream, empty and flagged LAST.
++ */
++static bool mtk_jpeg_buf_queue_last(struct mtk_jpeg_ctx *ctx,
++				    struct vb2_buffer *vb)
++{
++	unsigned int i;
++
++	if (!V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) ||
++	    !vb2_is_streaming(vb->vb2_queue) ||
++	    !v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx))
++		return false;
++	for (i = 0; i < vb->num_planes; i++)
++		vb2_set_plane_payload(vb, i, 0);
++	v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
++	return true;
++}
++
+ static void mtk_jpeg_enc_buf_queue(struct vb2_buffer *vb)
+ {
+ 	struct mtk_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+@@ -787,6 +884,8 @@
+ 	v4l2_dbg(2, debug, &jpeg->v4l2_dev, "(%d) buf_q id=%d, vb=%p\n",
+ 		 vb->vb2_queue->type, vb->index, vb);
+ 
++	if (mtk_jpeg_buf_queue_last(ctx, vb))
++		return;
+ 	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
+ }
+ 
+@@ -796,31 +895,35 @@
+ 	struct mtk_jpeg_dec_param *param;
+ 	struct mtk_jpeg_dev *jpeg = ctx->jpeg;
+ 	struct mtk_jpeg_src_buf *jpeg_src_buf;
+-	bool header_valid;
+ 
+ 	v4l2_dbg(2, debug, &jpeg->v4l2_dev, "(%d) buf_q id=%d, vb=%p\n",
+ 		 vb->vb2_queue->type, vb->index, vb);
+ 
++	if (mtk_jpeg_buf_queue_last(ctx, vb))
++		return;
+ 	if (vb->vb2_queue->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+ 		goto end;
+ 
++	/* parsed and checked by mtk_jpeg_buf_prepare() */
+ 	jpeg_src_buf = mtk_jpeg_vb2_to_srcbuf(vb);
+ 	param = &jpeg_src_buf->dec_param;
+-	memset(param, 0, sizeof(*param));
+-
+-	header_valid = mtk_jpeg_parse(param, (u8 *)vb2_plane_vaddr(vb, 0),
+-				      vb2_get_plane_payload(vb, 0));
+-	if (!header_valid) {
+-		v4l2_err(&jpeg->v4l2_dev, "Header invalid.\n");
+-		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+-		return;
+-	}
+ 
+ 	if (ctx->state == MTK_JPEG_INIT) {
+ 		struct vb2_queue *dst_vq = v4l2_m2m_get_vq(
+ 			ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++		/*
++		 * A client that set the stream's coded size on OUTPUT skips
++		 * waiting for the initial event and sets up CAPTURE from G_FMT
++		 * (the decoder spec, Initialization step 4): a resolution
++		 * change is due only for a mismatch. GStreamer takes a stale
++		 * event for one and loses the drain's LAST buffer to it.
++		 */
++		bool preset = !vb2_is_streaming(dst_vq) &&
++			      ctx->out_q.pix_mp.width == param->pic_w &&
++			      ctx->out_q.pix_mp.height == param->pic_h;
+ 
+-		mtk_jpeg_queue_src_chg_event(ctx);
++		if (!preset)
++			mtk_jpeg_queue_src_chg_event(ctx);
+ 		mtk_jpeg_set_queue_data(ctx, param);
+ 		ctx->state = vb2_is_streaming(dst_vq) ?
+ 				MTK_JPEG_SOURCE_CHANGE : MTK_JPEG_RUNNING;
+@@ -838,6 +941,14 @@
+ 		return v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+ }
+ 
++static int mtk_jpeg_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct mtk_jpeg_ctx *ctx = vb2_get_drv_priv(q);
++
++	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
++	return 0;
++}
++
+ static void mtk_jpeg_enc_stop_streaming(struct vb2_queue *q)
+ {
+ 	struct mtk_jpeg_ctx *ctx = vb2_get_drv_priv(q);
+@@ -845,6 +956,7 @@
+ 
+ 	while ((vb = mtk_jpeg_buf_remove(ctx, q->type)))
+ 		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
++	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
+ }
+ 
+ static void mtk_jpeg_dec_stop_streaming(struct vb2_queue *q)
+@@ -871,12 +983,14 @@
+ 
+ 	while ((vb = mtk_jpeg_buf_remove(ctx, q->type)))
+ 		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
++	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
+ }
+ 
+ static const struct vb2_ops mtk_jpeg_dec_qops = {
+ 	.queue_setup        = mtk_jpeg_queue_setup,
+ 	.buf_prepare        = mtk_jpeg_buf_prepare,
+ 	.buf_queue          = mtk_jpeg_dec_buf_queue,
++	.start_streaming    = mtk_jpeg_start_streaming,
+ 	.stop_streaming     = mtk_jpeg_dec_stop_streaming,
+ };
+ 
+@@ -884,6 +998,7 @@
+ 	.queue_setup        = mtk_jpeg_queue_setup,
+ 	.buf_prepare        = mtk_jpeg_buf_prepare,
+ 	.buf_queue          = mtk_jpeg_enc_buf_queue,
++	.start_streaming    = mtk_jpeg_start_streaming,
+ 	.stop_streaming     = mtk_jpeg_enc_stop_streaming,
+ };
+ 
+@@ -935,6 +1050,12 @@
+ 
+ 	src_buf = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+ 	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	/*
++	 * the picture's timestamp on its result, as the multi-core paths:
++	 * clients match the two by it (GStreamer took every result for its
++	 * first frame and dropped the rest)
++	 */
++	v4l2_m2m_buf_copy_metadata(src_buf, dst_buf);
+ 
+ 	ret = pm_runtime_resume_and_get(jpeg->dev);
+ 	if (ret < 0)
+@@ -961,6 +1082,7 @@
+ enc_end:
+ 	v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+ 	v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++	mtk_jpeg_mark_last(ctx, src_buf, dst_buf);
+ 	v4l2_m2m_buf_done(src_buf, buf_state);
+ 	v4l2_m2m_buf_done(dst_buf, buf_state);
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+@@ -997,6 +1119,8 @@
+ 	src_buf = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+ 	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+ 	jpeg_src_buf = mtk_jpeg_vb2_to_srcbuf(&src_buf->vb2_buf);
++	/* as in mtk_jpeg_enc_device_run() */
++	v4l2_m2m_buf_copy_metadata(src_buf, dst_buf);
+ 
+ 	if (mtk_jpeg_check_resolution_change(ctx, &jpeg_src_buf->dec_param)) {
+ 		mtk_jpeg_queue_src_chg_event(ctx);
+@@ -1031,6 +1155,7 @@
+ dec_end:
+ 	v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+ 	v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++	mtk_jpeg_mark_last(ctx, src_buf, dst_buf);
+ 	v4l2_m2m_buf_done(src_buf, buf_state);
+ 	v4l2_m2m_buf_done(dst_buf, buf_state);
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+@@ -1238,6 +1363,7 @@
+ 
+ 	pm_runtime_put(jpeg->dev);
+ 
++	mtk_jpeg_mark_last(ctx, src_buf, dst_buf);
+ 	v4l2_m2m_buf_done(src_buf, VB2_BUF_STATE_ERROR);
+ 	v4l2_m2m_buf_done(dst_buf, VB2_BUF_STATE_ERROR);
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+@@ -1571,6 +1697,7 @@
+ 
+ 	buf_state = VB2_BUF_STATE_DONE;
+ 
++	mtk_jpeg_mark_last(ctx, src_buf, dst_buf);
+ 	v4l2_m2m_buf_done(src_buf, buf_state);
+ 	v4l2_m2m_buf_done(dst_buf, buf_state);
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+@@ -1796,20 +1923,31 @@
+ {
+ 	struct mtk_jpeg_dev *jpeg = priv;
+ 	u32 irq_status;
+-	irqreturn_t ret = IRQ_NONE;
+-
+-	cancel_delayed_work(&jpeg->job_timeout_work);
+ 
+ 	irq_status = readl(jpeg->reg_base + JPEG_ENC_INT_STS) &
+ 		     JPEG_ENC_INT_STATUS_MASK_ALLIRQ;
+-	if (irq_status)
+-		writel(0, jpeg->reg_base + JPEG_ENC_INT_STS);
++	if (!irq_status)
++		return IRQ_NONE;
++	writel(0, jpeg->reg_base + JPEG_ENC_INT_STS);
++	cancel_delayed_work(&jpeg->job_timeout_work);
+ 
+-	if (!(irq_status & JPEG_ENC_INT_STATUS_DONE))
+-		return ret;
++	/*
++	 * A stall (the bitstream buffer is full) or a codec error stops the
++	 * encoder: fail the job, as the timeout (just cancelled) would have.
++	 * Returning without finishing it left the job pending for good: the
++	 * file never closed and the task blocked suspend.
++	 */
++	if (!(irq_status & JPEG_ENC_INT_STATUS_DONE)) {
++		dev_warn_ratelimited(jpeg->dev, "encode failed, status %#x%s\n",
++				     irq_status,
++				     irq_status & JPEG_ENC_INT_STATUS_STALL ?
++				     " (bitstream buffer full)" : "");
++		if (v4l2_m2m_get_curr_priv(jpeg->m2m_dev))
++			mtk_jpeg_job_timeout_work(&jpeg->job_timeout_work.work);
++		return IRQ_HANDLED;
++	}
+ 
+-	ret = mtk_jpeg_enc_done(jpeg);
+-	return ret;
++	return mtk_jpeg_enc_done(jpeg);
+ }
+ 
+ static irqreturn_t mtk_jpeg_dec_irq(int irq, void *priv)
+@@ -1852,6 +1990,7 @@
+ 	buf_state = VB2_BUF_STATE_DONE;
+ 
+ dec_end:
++	mtk_jpeg_mark_last(ctx, src_buf, dst_buf);
+ 	v4l2_m2m_buf_done(src_buf, buf_state);
+ 	v4l2_m2m_buf_done(dst_buf, buf_state);
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+diff --git a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_enc_hw.h b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_enc_hw.h
+--- a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_enc_hw.h
++++ b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_enc_hw.h
+@@ -13,6 +13,7 @@
+ #include "mtk_jpeg_core.h"
+ 
+ #define JPEG_ENC_INT_STATUS_DONE	BIT(0)
++#define JPEG_ENC_INT_STATUS_STALL	BIT(1)	/* bitstream buffer full */
+ #define JPEG_ENC_INT_STATUS_MASK_ALLIRQ	0x13
+ 
+ #define JPEG_ENC_DST_ADDR_OFFSET_MASK	GENMASK(3, 0)

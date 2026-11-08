@@ -1,0 +1,78 @@
+usb: typec: tcpci_mt6360: source VBUS from the MT6360 OTG boost
+
+diff --git a/drivers/usb/typec/tcpm/tcpci_mt6360.c b/drivers/usb/typec/tcpm/tcpci_mt6360.c
+index b51240738..4ff60d24b 100644
+--- a/drivers/usb/typec/tcpm/tcpci_mt6360.c
++++ b/drivers/usb/typec/tcpm/tcpci_mt6360.c
+@@ -10,7 +10,9 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
+ #include <linux/usb/tcpci.h>
+ #include <linux/usb/tcpm.h>
+ 
+@@ -40,6 +42,7 @@ struct mt6360_tcpc_info {
+ 	struct tcpci_data tdata;
+ 	struct tcpci *tcpci;
+ 	struct device *dev;
++	struct regulator *vbus;
+ 	int irq;
+ };
+ 
+@@ -136,9 +139,30 @@ static irqreturn_t mt6360_irq(int irq, void *dev_id)
+ 	return tcpci_irq(mti->tcpci);
+ }
+ 
++/* source VBUS from the MT6360 charger's OTG boost (DT vbus-supply) */
++static int mt6360_tcpc_set_vbus(struct tcpci *tcpci, struct tcpci_data *tdata,
++				bool source, bool sink)
++{
++	struct mt6360_tcpc_info *mti = container_of(tdata, struct mt6360_tcpc_info, tdata);
++	int ret;
++
++	ret = regulator_is_enabled(mti->vbus);
++	if (ret < 0)
++		return ret;
++
++	if (ret && !source)
++		return regulator_disable(mti->vbus);
++
++	if (!ret && source)
++		return regulator_enable(mti->vbus);
++
++	return 0;
++}
++
+ static int mt6360_tcpc_probe(struct platform_device *pdev)
+ {
+ 	struct mt6360_tcpc_info *mti;
++	const char *vbus_name;
+ 	int ret;
+ 
+ 	mti = devm_kzalloc(&pdev->dev, sizeof(*mti), GFP_KERNEL);
+@@ -157,6 +181,22 @@ static int mt6360_tcpc_probe(struct platform_device *pdev)
+ 	if (mti->irq < 0)
+ 		return mti->irq;
+ 
++	/*
++	 * The OTG boost is a regulator of the same MT6360: a vbus-supply
++	 * phandle would make fw_devlink hold the whole I2C bus for its own
++	 * child, so it is looked up by its regulator-name instead.
++	 */
++	if (!device_property_read_string(&pdev->dev, "richtek,vbus-regulator",
++					 &vbus_name)) {
++		mti->vbus = devm_regulator_get_optional(&pdev->dev, vbus_name);
++		if (IS_ERR(mti->vbus))
++			return dev_err_probe(&pdev->dev,
++					     PTR_ERR(mti->vbus) == -ENODEV ?
++					     -EPROBE_DEFER : PTR_ERR(mti->vbus),
++					     "Failed to get %s\n", vbus_name);
++		mti->tdata.set_vbus = mt6360_tcpc_set_vbus;
++	}
++
+ 	mti->tdata.init = mt6360_tcpc_init;
+ 	mti->tcpci = tcpci_register_port(&pdev->dev, &mti->tdata);
+ 	if (IS_ERR(mti->tcpci)) {

@@ -1,0 +1,502 @@
+Subject: [PATCH] mt6885: video codec + MDP / ADSP power domains, vcodec clocks, clock flags, lpm unused-clock gating (WIP, 2026-10-26)
+
+On top of 0001-0045. Supersedes the mt6885-lpm.c of 0045 (adds
+unused-clock gating). See NOTES.md 'Video codec' and 'Suspend power / SPM'.
+diff --color -urN a/drivers/clk/mediatek/clk-mt6885.c b/drivers/clk/mediatek/clk-mt6885.c
+diff --git a/drivers/clk/mediatek/Makefile b/drivers/clk/mediatek/Makefile
+index 569e9706a..117d8865b 100644
+--- a/drivers/clk/mediatek/Makefile
++++ b/drivers/clk/mediatek/Makefile
+@@ -173,4 +173,5 @@ obj-$(CONFIG_COMMON_CLK_MT8365_VDEC) += clk-mt8365-vdec.o
+ obj-$(CONFIG_COMMON_CLK_MT8365_VENC) += clk-mt8365-venc.o
+ obj-$(CONFIG_COMMON_CLK_MT8516) += clk-mt8516-apmixedsys.o clk-mt8516.o
+ obj-$(CONFIG_COMMON_CLK_MT8516_AUDSYS) += clk-mt8516-aud.o
+-obj-$(CONFIG_COMMON_CLK_MT6885) += clk-mt6885.o clk-mt6885-cam.o clk-mt6885-mm.o
++obj-$(CONFIG_COMMON_CLK_MT6885) += clk-mt6885.o clk-mt6885-cam.o clk-mt6885-mm.o \
++				   clk-mt6885-vcodec.o
+diff --git a/drivers/clk/mediatek/clk-mt6885-vcodec.c b/drivers/clk/mediatek/clk-mt6885-vcodec.c
+new file mode 100644
+index 000000000..d5a2fa1b3
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6885-vcodec.c
+@@ -0,0 +1,98 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MT6885 video codec clock gates: vdecsys_soc (VDEC power domain, soc +
++ * LAT), vdecsys (VDEC2, core), vencsys and vencsys_c1. Same layout as MT8192
++ * (clk-mt8192-vdec.c / -venc.c); bits from the BSP clk-mt6885.c
++ * vdec_*gcon_clks / venc_*gcon_clks. All gates are "set = on".
++ */
++#include <linux/clk-provider.h>
++#include <linux/platform_device.h>
++
++#include "clk-mtk.h"
++#include "clk-gate.h"
++
++#include <dt-bindings/clock/mt6885-clk.h>
++
++static const struct mtk_gate_regs vdec0_cg_regs = {
++	.set_ofs = 0x0,
++	.clr_ofs = 0x4,
++	.sta_ofs = 0x0,
++};
++
++static const struct mtk_gate_regs vdec1_cg_regs = {
++	.set_ofs = 0x200,
++	.clr_ofs = 0x204,
++	.sta_ofs = 0x200,
++};
++
++static const struct mtk_gate_regs vdec2_cg_regs = {
++	.set_ofs = 0x8,
++	.clr_ofs = 0xc,
++	.sta_ofs = 0x8,
++};
++
++#define GATE_VDEC(_id, _name, _regs, _shift)	\
++	GATE_MTK(_id, _name, "vdec_sel", _regs, _shift, &mtk_clk_gate_ops_setclr_inv)
++
++#define VDEC_CLKS(_p)								\
++static const struct mtk_gate _p##_clks[] = {					\
++	GATE_VDEC(VDEC_VDEC, #_p "_vdec", &vdec0_cg_regs, 0),			\
++	GATE_VDEC(VDEC_ACTIVE, #_p "_active", &vdec0_cg_regs, 4),		\
++	GATE_VDEC(VDEC_LAT, #_p "_lat", &vdec1_cg_regs, 0),			\
++	GATE_VDEC(VDEC_LAT_ACTIVE, #_p "_lat_active", &vdec1_cg_regs, 4),	\
++	GATE_VDEC(VDEC_LARB1, #_p "_larb1", &vdec2_cg_regs, 0),		\
++};										\
++static const struct mtk_clk_desc _p##_desc = {					\
++	.clks = _p##_clks,							\
++	.num_clks = ARRAY_SIZE(_p##_clks),					\
++}
++
++VDEC_CLKS(vdec_soc);
++VDEC_CLKS(vdec);
++
++static const struct mtk_gate_regs venc_cg_regs = {
++	.set_ofs = 0x4,
++	.clr_ofs = 0x8,
++	.sta_ofs = 0x0,
++};
++
++#define GATE_VENC(_id, _name, _shift)	\
++	GATE_MTK(_id, _name, "venc_sel", &venc_cg_regs, _shift, &mtk_clk_gate_ops_setclr_inv)
++
++#define VENC_CLKS(_p)								\
++static const struct mtk_gate _p##_clks[] = {					\
++	GATE_VENC(VENC_SET0_LARB, #_p "_set0_larb", 0),				\
++	GATE_VENC(VENC_SET1_VENC, #_p "_set1_venc", 4),				\
++	GATE_VENC(VENC_SET2_JPGENC, #_p "_set2_jpgenc", 8),			\
++	GATE_VENC(VENC_SET3_JPGDEC, #_p "_set3_jpgdec", 12),			\
++	GATE_VENC(VENC_SET4_JPGDEC_C1, #_p "_set4_jpgdec_c1", 16),		\
++	GATE_VENC(VENC_SET5_GALS, #_p "_set5_gals", 28),			\
++};										\
++static const struct mtk_clk_desc _p##_desc = {					\
++	.clks = _p##_clks,							\
++	.num_clks = ARRAY_SIZE(_p##_clks),					\
++}
++
++VENC_CLKS(venc);
++VENC_CLKS(venc_c1);
++
++static const struct of_device_id of_match_clk_mt6885_vcodec[] = {
++	{ .compatible = "mediatek,mt6885-vdecsys-soc", .data = &vdec_soc_desc },
++	{ .compatible = "mediatek,mt6885-vdecsys", .data = &vdec_desc },
++	{ .compatible = "mediatek,mt6885-vencsys", .data = &venc_desc },
++	{ .compatible = "mediatek,mt6885-vencsys-c1", .data = &venc_c1_desc },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6885_vcodec);
++
++static struct platform_driver clk_mt6885_vcodec_drv = {
++	.probe = mtk_clk_simple_probe,
++	.remove = mtk_clk_simple_remove,
++	.driver = {
++		.name = "clk-mt6885-vcodec",
++		.of_match_table = of_match_clk_mt6885_vcodec,
++	},
++};
++module_platform_driver(clk_mt6885_vcodec_drv);
++MODULE_DESCRIPTION("MediaTek MT6885 video codec clocks driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/clk/mediatek/clk-mt6885.c b/drivers/clk/mediatek/clk-mt6885.c
+index 698eb2bfb..6f3f121ff 100644
+--- a/drivers/clk/mediatek/clk-mt6885.c
++++ b/drivers/clk/mediatek/clk-mt6885.c
+@@ -1039,8 +1039,10 @@ static const struct mtk_mux top_muxes[] = {
+ 		CLK_CFG_0, CLK_CFG_0_SET, CLK_CFG_0_CLR, 8, 2, 15, CLK_CFG_UPDATE, 1),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_SCP, "scp_sel", scp_parents,
+ 		CLK_CFG_0, CLK_CFG_0_SET, CLK_CFG_0_CLR, 16, 3, 23, CLK_CFG_UPDATE, 2),
+-	MUX_GATE_CLR_SET_UPD(TOP_MUX_BUS_AXIMEM, "bus_aximem_sel", bus_aximem_parents,
+-		CLK_CFG_0, CLK_CFG_0_SET, CLK_CFG_0_CLR, 24, 3, 31, CLK_CFG_UPDATE, 3),
++	/* gating it hangs the bus (clk_disable_unused) */
++	MUX_GATE_CLR_SET_UPD_FLAGS(TOP_MUX_BUS_AXIMEM, "bus_aximem_sel", bus_aximem_parents,
++		CLK_CFG_0, CLK_CFG_0_SET, CLK_CFG_0_CLR, 24, 3, 31, CLK_CFG_UPDATE, 3,
++		CLK_SET_RATE_PARENT | CLK_IS_CRITICAL),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_DISP, "disp_sel", disp_parents,
+ 		CLK_CFG_1, CLK_CFG_1_SET, CLK_CFG_1_CLR, 0, 4, 7, CLK_CFG_UPDATE, 4),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_MDP, "mdp_sel", mdp_parents,
+@@ -1111,8 +1113,10 @@ static const struct mtk_mux top_muxes[] = {
+ 		CLK_CFG_9, CLK_CFG_9_SET, CLK_CFG_9_CLR, 8, 1, 15, CLK_CFG_UPDATE1, 6),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_DISP_PWM, "disp_pwm_sel", disp_pwm_parents,
+ 		CLK_CFG_9, CLK_CFG_9_SET, CLK_CFG_9_CLR, 16, 3, 23, CLK_CFG_UPDATE1, 7),
+-	MUX_GATE_CLR_SET_UPD(TOP_MUX_USB_TOP, "usb_top_sel", usb_top_parents,
+-		CLK_CFG_9, CLK_CFG_9_SET, CLK_CFG_9_CLR, 24, 2, 31, CLK_CFG_UPDATE1, 8),
++	/* USB uses it without a reference */
++	MUX_GATE_CLR_SET_UPD_FLAGS(TOP_MUX_USB_TOP, "usb_top_sel", usb_top_parents,
++		CLK_CFG_9, CLK_CFG_9_SET, CLK_CFG_9_CLR, 24, 2, 31, CLK_CFG_UPDATE1, 8,
++		CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_SSUSB_XHCI, "ssusb_xhci_sel", ssusb_xhci_parents,
+ 		CLK_CFG_10, CLK_CFG_10_SET, CLK_CFG_10_CLR, 0, 2, 7, CLK_CFG_UPDATE1, 9),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_I2C, "i2c_sel", i2c_parents,
+@@ -1125,16 +1129,22 @@ static const struct mtk_mux top_muxes[] = {
+ 		CLK_CFG_11, CLK_CFG_11_SET, CLK_CFG_11_CLR, 0, 3, 7, CLK_CFG_UPDATE1, 13),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_SENINF3, "seninf3_sel", seninf3_parents,
+ 		CLK_CFG_11, CLK_CFG_11_SET, CLK_CFG_11_CLR, 8, 3, 15, CLK_CFG_UPDATE1, 14),
+-	MUX_GATE_CLR_SET_UPD(TOP_MUX_DXCC, "dxcc_sel", dxcc_parents,
+-		CLK_CFG_11, CLK_CFG_11_SET, CLK_CFG_11_CLR, 16, 2, 23, CLK_CFG_UPDATE1, 15),
++	/* TEE crypto (dxcc), no kernel user */
++	MUX_GATE_CLR_SET_UPD_FLAGS(TOP_MUX_DXCC, "dxcc_sel", dxcc_parents,
++		CLK_CFG_11, CLK_CFG_11_SET, CLK_CFG_11_CLR, 16, 2, 23, CLK_CFG_UPDATE1, 15,
++		CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_AUD_ENGEN1, "aud_engen1_sel", aud_engen1_parents,
+ 		CLK_CFG_11, CLK_CFG_11_SET, CLK_CFG_11_CLR, 24, 2, 31, CLK_CFG_UPDATE1, 16),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_AUD_ENGEN2, "aud_engen2_sel", aud_engen2_parents,
+ 		CLK_CFG_12, CLK_CFG_12_SET, CLK_CFG_12_CLR, 0, 2, 7, CLK_CFG_UPDATE1, 17),
+-	MUX_GATE_CLR_SET_UPD(TOP_MUX_AES_UFSFDE, "aes_ufsfde_sel", aes_ufsfde_parents,
+-		CLK_CFG_12, CLK_CFG_12_SET, CLK_CFG_12_CLR, 8, 3, 15, CLK_CFG_UPDATE1, 18),
+-	MUX_GATE_CLR_SET_UPD(TOP_MUX_UFS, "ufs_sel", ufs_parents,
+-		CLK_CFG_12, CLK_CFG_12_SET, CLK_CFG_12_CLR, 16, 3, 23, CLK_CFG_UPDATE1, 19),
++	/* parent of the kept UFS crypto gate */
++	MUX_GATE_CLR_SET_UPD_FLAGS(TOP_MUX_AES_UFSFDE, "aes_ufsfde_sel", aes_ufsfde_parents,
++		CLK_CFG_12, CLK_CFG_12_SET, CLK_CFG_12_CLR, 8, 3, 15, CLK_CFG_UPDATE1, 18,
++		CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED),
++	/* parent of the kept UFS tick gate */
++	MUX_GATE_CLR_SET_UPD_FLAGS(TOP_MUX_UFS, "ufs_sel", ufs_parents,
++		CLK_CFG_12, CLK_CFG_12_SET, CLK_CFG_12_CLR, 16, 3, 23, CLK_CFG_UPDATE1, 19,
++		CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_AUD_1, "aud_1_sel", aud_1_parents,
+ 		CLK_CFG_12, CLK_CFG_12_SET, CLK_CFG_12_CLR, 24, 1, 31, CLK_CFG_UPDATE1, 20),
+ 	MUX_GATE_CLR_SET_UPD(TOP_MUX_AUD_2, "aud_2_sel", aud_2_parents,
+@@ -1336,8 +1346,12 @@ static const struct mtk_gate infra_clks[] = {
+ 	GATE_MTK(INFRACFG_AO_GCE_CG, "infracfg_ao_gce_cg", "axi_sel", &infracfg_ao_module_sw_cg_0_regs, 8, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_GCE2_CG, "infracfg_ao_gce2_cg", "axi_sel", &infracfg_ao_module_sw_cg_0_regs, 9, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_THERM_CG, "infracfg_ao_therm_cg", "axi_sel", &infracfg_ao_module_sw_cg_0_regs, 10, &mtk_clk_gate_ops_setclr),
+-	/* clocks the imp_iic_wrap_* blocks; reading their gate status while it is off raises an SError (e.g. clk_summary) */
+-	GATE_MTK_FLAGS(INFRACFG_AO_I2C0_CG, "infracfg_ao_i2c0_cg", "i2c_sel", &infracfg_ao_module_sw_cg_0_regs, 11, &mtk_clk_gate_ops_setclr, CLK_IS_CRITICAL),
++	/*
++	 * clocks the imp_iic_wrap_* blocks; reading their gate status while it
++	 * is off raises an SError (e.g. clk_summary). Not critical: the imp
++	 * gates are its children, and left on it blocks every SPM constraint.
++	 */
++	GATE_MTK(INFRACFG_AO_I2C0_CG, "infracfg_ao_i2c0_cg", "i2c_sel", &infracfg_ao_module_sw_cg_0_regs, 11, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_I2C1_CG, "infracfg_ao_i2c1_cg", "i2c_sel", &infracfg_ao_module_sw_cg_0_regs, 12, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_I2C2_CG, "infracfg_ao_i2c2_cg", "i2c_sel", &infracfg_ao_module_sw_cg_0_regs, 13, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_I2C3_CG, "infracfg_ao_i2c3_cg", "i2c_sel", &infracfg_ao_module_sw_cg_0_regs, 14, &mtk_clk_gate_ops_setclr),
+@@ -1373,8 +1387,10 @@ static const struct mtk_gate infra_clks[] = {
+ 	GATE_MTK(INFRACFG_AO_DEBUGSYS_CG, "infracfg_ao_debugsys_cg", "axi_sel", &infracfg_ao_module_sw_cg_1_regs, 24, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_AUDIO_CG, "infracfg_ao_audio_cg", "axi_sel", &infracfg_ao_module_sw_cg_1_regs, 25, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_CCIF_MD_CG, "infracfg_ao_ccif_md_cg", "axi_sel", &infracfg_ao_module_sw_cg_1_regs, 26, &mtk_clk_gate_ops_setclr),
+-	GATE_MTK(INFRACFG_AO_DXCC_SEC_CORE_CG, "infracfg_ao_dxcc_sec_core_cg", "dxcc_sel", &infracfg_ao_module_sw_cg_1_regs, 27, &mtk_clk_gate_ops_setclr),
+-	GATE_MTK(INFRACFG_AO_DXCC_AO_CG, "infracfg_ao_dxcc_ao_cg", "dxcc_sel", &infracfg_ao_module_sw_cg_1_regs, 28, &mtk_clk_gate_ops_setclr),
++	/* TEE crypto (dxcc), no kernel user */
++	GATE_MTK_FLAGS(INFRACFG_AO_DXCC_SEC_CORE_CG, "infracfg_ao_dxcc_sec_core_cg", "dxcc_sel", &infracfg_ao_module_sw_cg_1_regs, 27, &mtk_clk_gate_ops_setclr, CLK_IGNORE_UNUSED),
++	/* TEE crypto (dxcc), no kernel user */
++	GATE_MTK_FLAGS(INFRACFG_AO_DXCC_AO_CG, "infracfg_ao_dxcc_ao_cg", "dxcc_sel", &infracfg_ao_module_sw_cg_1_regs, 28, &mtk_clk_gate_ops_setclr, CLK_IGNORE_UNUSED),
+ 	GATE_MTK(INFRACFG_AO_DBG_TRACE_CG, "infracfg_ao_dbg_trace_cg", "axi_sel", &infracfg_ao_module_sw_cg_1_regs, 29, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_DEVMPU_BCLK_CG, "infracfg_ao_devmpu_bclk_cg", "axi_sel", &infracfg_ao_module_sw_cg_1_regs, 30, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_DRAMC_F26M_CG, "infracfg_ao_dramc_f26m_cg", "f26m_sel", &infracfg_ao_module_sw_cg_1_regs, 31, &mtk_clk_gate_ops_setclr),
+@@ -1406,14 +1422,17 @@ static const struct mtk_gate infra_clks[] = {
+ 	GATE_MTK(INFRACFG_AO_SPI5_CG, "infracfg_ao_spi5_cg", "spi_sel", &infracfg_ao_module_sw_cg_2_regs, 26, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_CQ_DMA_CG, "infracfg_ao_cq_dma_cg", "axi_sel", &infracfg_ao_module_sw_cg_2_regs, 27, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_UFS_CG, "infracfg_ao_ufs_cg", "ufs_sel", &infracfg_ao_module_sw_cg_2_regs, 28, &mtk_clk_gate_ops_setclr),
+-	GATE_MTK(INFRACFG_AO_AES_UFSFDE_CG, "infracfg_ao_aes_ufsfde_cg", "aes_ufsfde_sel", &infracfg_ao_module_sw_cg_2_regs, 29, &mtk_clk_gate_ops_setclr),
+-	GATE_MTK(INFRACFG_AO_UFS_TICK_CG, "infracfg_ao_ufs_tick_cg", "ufs_sel", &infracfg_ao_module_sw_cg_2_regs, 30, &mtk_clk_gate_ops_setclr),
++	/* UFS inline crypto engine, no reference from ufs-mediatek */
++	GATE_MTK_FLAGS(INFRACFG_AO_AES_UFSFDE_CG, "infracfg_ao_aes_ufsfde_cg", "aes_ufsfde_sel", &infracfg_ao_module_sw_cg_2_regs, 29, &mtk_clk_gate_ops_setclr, CLK_IGNORE_UNUSED),
++	/* UFS tick, no reference from ufs-mediatek */
++	GATE_MTK_FLAGS(INFRACFG_AO_UFS_TICK_CG, "infracfg_ao_ufs_tick_cg", "ufs_sel", &infracfg_ao_module_sw_cg_2_regs, 30, &mtk_clk_gate_ops_setclr, CLK_IGNORE_UNUSED),
+ 	GATE_MTK(INFRACFG_AO_SSUSB_XHCI_CG, "infracfg_ao_ssusb_xhci_cg", "ssusb_xhci_sel", &infracfg_ao_module_sw_cg_2_regs, 31, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_MSDC0_SELF_CG, "infracfg_ao_msdc0_self_cg", "msdc50_0_sel", &infracfg_ao_module_sw_cg_3_regs, 0, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_MSDC1_SELF_CG, "infracfg_ao_msdc1_self_cg", "msdc50_0_sel", &infracfg_ao_module_sw_cg_3_regs, 1, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_MSDC2_SELF_CG, "infracfg_ao_msdc2_self_cg", "msdc50_0_sel", &infracfg_ao_module_sw_cg_3_regs, 2, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_SSPM_26M_SELF_CG, "infracfg_ao_sspm_26m_self_cg", "f26m_sel", &infracfg_ao_module_sw_cg_3_regs, 3, &mtk_clk_gate_ops_setclr),
+-	GATE_MTK(INFRACFG_AO_SSPM_32K_SELF_CG, "infracfg_ao_sspm_32k_self_cg", "clk32k", &infracfg_ao_module_sw_cg_3_regs, 4, &mtk_clk_gate_ops_setclr),
++	/* SSPM firmware clock */
++	GATE_MTK_FLAGS(INFRACFG_AO_SSPM_32K_SELF_CG, "infracfg_ao_sspm_32k_self_cg", "clk32k", &infracfg_ao_module_sw_cg_3_regs, 4, &mtk_clk_gate_ops_setclr, CLK_IGNORE_UNUSED),
+ 	GATE_MTK(INFRACFG_AO_UFS_AXI_CG, "infracfg_ao_ufs_axi_cg", "axi_sel", &infracfg_ao_module_sw_cg_3_regs, 5, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_I2C6_CG, "infracfg_ao_i2c6_cg", "i2c_sel", &infracfg_ao_module_sw_cg_3_regs, 6, &mtk_clk_gate_ops_setclr),
+ 	GATE_MTK(INFRACFG_AO_AP_MSDC0_CG, "infracfg_ao_ap_msdc0_cg", "msdc50_0_sel", &infracfg_ao_module_sw_cg_3_regs, 7, &mtk_clk_gate_ops_setclr),
+diff --git a/drivers/pmdomain/mediatek/mt6885-pm-domains.h b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+index ad30756b0..00dc0ef02 100644
+--- a/drivers/pmdomain/mediatek/mt6885-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+@@ -52,6 +52,30 @@
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWB_2ND	BIT(21)
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC	BIT(22)
+ #define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC_2ND	BIT(23)
++#define MT6885_TOP_AXI_PROT_EN_MM_2_SET		0xdcc
++#define MT6885_TOP_AXI_PROT_EN_MM_2_CLR		0xdd0
++#define MT6885_TOP_AXI_PROT_EN_MM_2_STA1	0xdd8
++#define MT6885_TOP_AXI_PROT_EN_MM_VDEC		BIT(24)
++#define MT6885_TOP_AXI_PROT_EN_MM_VDEC_2ND	BIT(25)
++#define MT6885_TOP_AXI_PROT_EN_MM_2_VDEC2	BIT(6)
++#define MT6885_TOP_AXI_PROT_EN_MM_2_VDEC2_2ND	BIT(7)
++#define MT6885_TOP_AXI_PROT_EN_MM_VENC		BIT(26)
++#define MT6885_TOP_AXI_PROT_EN_MM_2_VENC	BIT(0)
++#define MT6885_TOP_AXI_PROT_EN_MM_VENC_2ND	BIT(27)
++#define MT6885_TOP_AXI_PROT_EN_MM_2_VENC_2ND	BIT(1)
++#define MT6885_TOP_AXI_PROT_EN_MM_VENC_CORE1	(BIT(28) | BIT(30))
++#define MT6885_TOP_AXI_PROT_EN_MM_VENC_CORE1_2ND (BIT(29) | BIT(31))
++/* MDP / ADSP (BSP clk-mt6885-pg.c MDP_PROT_STEP*, ADSP_PROT_STEP1_0) */
++#define MT6885_TOP_AXI_PROT_EN_MDP		BIT(10)
++#define MT6885_TOP_AXI_PROT_EN_MM_MDP		(BIT(2) | BIT(4) | BIT(6) | BIT(8) | \
++						 BIT(18) | BIT(22) | BIT(28) | BIT(30))
++#define MT6885_TOP_AXI_PROT_EN_MM_2_MDP		(BIT(0) | BIT(2) | BIT(4) | BIT(6) | BIT(8))
++#define MT6885_TOP_AXI_PROT_EN_MDP_2ND		BIT(23)
++#define MT6885_TOP_AXI_PROT_EN_MM_MDP_2ND	(BIT(3) | BIT(5) | BIT(7) | BIT(9) | \
++						 BIT(19) | BIT(23) | BIT(29) | BIT(31))
++#define MT6885_TOP_AXI_PROT_EN_MM_2_MDP_2ND	(BIT(1) | BIT(7) | BIT(9) | BIT(11))
++#define MT6885_TOP_AXI_PROT_EN_VDNR_MDP		BIT(20)
++#define MT6885_TOP_AXI_PROT_EN_2_ADSP		BIT(3)
+ /*
+  * BSP spm_mtcmos_ctrl_dis(): DIS_PROT_STEP1_0, STEP2_0, STEP2_1, STEP2_2,
+  * without the MM bits of the CAM subtree it also lists (0/1 CAM, 20/21
+@@ -316,6 +340,135 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 		},
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
++	[MT6885_POWER_DOMAIN_VDEC] = {
++		.name = "vdec",
++		.sta_mask = BIT(15),
++		.ctl_offs = 0x033c,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_VDEC,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_VDEC_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++		},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_VDEC2] = {
++		.name = "vdec2",
++		.sta_mask = BIT(16),
++		.ctl_offs = 0x0340,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_2_VDEC2,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_SET, MT6885_TOP_AXI_PROT_EN_MM_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_2_VDEC2_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_SET, MT6885_TOP_AXI_PROT_EN_MM_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_STA1),
++		},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_VENC] = {
++		.name = "venc",
++		.sta_mask = BIT(17),
++		.ctl_offs = 0x0344,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_VENC,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_2_VENC,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_SET, MT6885_TOP_AXI_PROT_EN_MM_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_VENC_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_2_VENC_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_SET, MT6885_TOP_AXI_PROT_EN_MM_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_STA1),
++		},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_VENC_CORE1] = {
++		.name = "venc_core1",
++		.sta_mask = BIT(18),
++		.ctl_offs = 0x0348,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_VENC_CORE1,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_VENC_CORE1_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++		},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	/*
++	 * MDP and ADSP: lk leaves both on, and either blocks every SPM
++	 * low-power constraint. Not default-off, so genpd turns them off at
++	 * late init when unused (needs no pd_ignore_unused).
++	 */
++	[MT6885_POWER_DOMAIN_MDP] = {
++		.name = "mdp",
++		.sta_mask = BIT(19),
++		.ctl_offs = 0x034c,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MDP,
++				    MT6885_TOP_AXI_PROT_EN_SET, MT6885_TOP_AXI_PROT_EN_CLR,
++				    MT6885_TOP_AXI_PROT_EN_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_MDP,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_2_MDP,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_SET, MT6885_TOP_AXI_PROT_EN_MM_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MDP_2ND,
++				    MT6885_TOP_AXI_PROT_EN_SET, MT6885_TOP_AXI_PROT_EN_CLR,
++				    MT6885_TOP_AXI_PROT_EN_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_MDP_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_2_MDP_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_SET, MT6885_TOP_AXI_PROT_EN_MM_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_2_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_VDNR_MDP,
++				    MT6885_TOP_AXI_PROT_EN_VDNR_SET, MT6885_TOP_AXI_PROT_EN_VDNR_CLR,
++				    MT6885_TOP_AXI_PROT_EN_VDNR_STA1),
++		},
++	},
++	[MT6885_POWER_DOMAIN_ADSP] = {
++		.name = "adsp",
++		.sta_mask = BIT(22),
++		.ctl_offs = 0x0358,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_2_ADSP,
++				    MT6885_TOP_AXI_PROT_EN_2_SET, MT6885_TOP_AXI_PROT_EN_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_2_STA1),
++		},
++	},
+ };
+ 
+ static const struct scpsys_soc_data mt6885_scpsys_data = {
+diff --git a/drivers/soc/mediatek/mt6885-lpm.c b/drivers/soc/mediatek/mt6885-lpm.c
+index 576a2564a..478bf41aa 100644
+--- a/drivers/soc/mediatek/mt6885-lpm.c
++++ b/drivers/soc/mediatek/mt6885-lpm.c
+@@ -12,10 +12,17 @@
+  * The BSP also sets MCUPM_CM_CTRL (CPU -> DRAM frequency coupling, cm_mgr);
+  * nothing drives that here, so it stays off.
+  *
++ * Also gates the clocks listed in the "cezanne,mt6885-lpm-unused-clocks"
++ * node: lk leaves them running, nothing on Arch uses them, and they block
++ * the SPM constraints. With clk_ignore_unused (needed: blanket gating hits
++ * firmware clocks nothing references) they would stay on, so take and drop
++ * each once; a clock some driver holds stays on.
++ *
+  * Only done when ATF runs the SPM resource constraints, i.e. lk loaded the
+  * SPM firmware (normal / boot-slot boot; a recovery-slot boot has none).
+  */
+ #include <linux/arm-smccc.h>
++#include <linux/clk.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+ #include <linux/of.h>
+@@ -84,6 +91,30 @@ static bool mt6885_spm_constraints_on(void)
+ 	return r.a0 && r.a0 != SMCCC_RET_NOT_SUPPORTED;
+ }
+ 
++static void __init mt6885_lpm_gate_unused(void)
++{
++	struct device_node *np;
++	int i, n, gated = 0;
++
++	np = of_find_compatible_node(NULL, NULL, "cezanne,mt6885-lpm-unused-clocks");
++	if (!np)
++		return;
++	n = of_count_phandle_with_args(np, "clocks", "#clock-cells");
++	for (i = 0; i < n; i++) {
++		struct clk *clk = of_clk_get(np, i);
++
++		if (IS_ERR(clk))
++			continue;
++		if (!clk_prepare_enable(clk)) {
++			clk_disable_unprepare(clk);
++			gated++;
++		}
++		clk_put(clk);
++	}
++	of_node_put(np);
++	pr_info("mt6885-lpm: dropped %d of %d unused clocks\n", gated, n);
++}
++
+ static int __init mt6885_lpm_init(void)
+ {
+ 	if (!of_machine_is_compatible("mediatek,mt6885"))
+@@ -92,6 +123,7 @@ static int __init mt6885_lpm_init(void)
+ 		pr_info("mt6885-lpm: no SPM constraints (no SPM firmware), skipped\n");
+ 		return 0;
+ 	}
++	mt6885_lpm_gate_unused();
+ 	mbox = ioremap(MCUPM_MBOX3_SRAM, MCUPM_MBOX3_SIZE);
+ 	if (!mbox)
+ 		return -ENOMEM;
+diff --git a/include/dt-bindings/clock/mt6885-clk.h b/include/dt-bindings/clock/mt6885-clk.h
+index af5a1e5b6..4072ab705 100644
+--- a/include/dt-bindings/clock/mt6885-clk.h
++++ b/include/dt-bindings/clock/mt6885-clk.h
+@@ -436,4 +436,21 @@
+ #define MM_32KHZ                54
+ #define MM_NR_CLK               55
+ 
++/* vdecsys_soc (0x1600f000) and vdecsys (0x1602f000): same ids */
++#define VDEC_VDEC		0
++#define VDEC_ACTIVE		1
++#define VDEC_LAT		2
++#define VDEC_LAT_ACTIVE		3
++#define VDEC_LARB1		4
++#define VDEC_NR_CLK		5
++
++/* vencsys (0x17000000) and vencsys_c1 (0x17800000): same ids */
++#define VENC_SET0_LARB		0
++#define VENC_SET1_VENC		1
++#define VENC_SET2_JPGENC	2
++#define VENC_SET3_JPGDEC	3
++#define VENC_SET4_JPGDEC_C1	4
++#define VENC_SET5_GALS		5
++#define VENC_NR_CLK		6
++
+ #endif
+diff --git a/include/dt-bindings/power/mt6885-power.h b/include/dt-bindings/power/mt6885-power.h
+index 987db2aeb..44c0c7943 100644
+--- a/include/dt-bindings/power/mt6885-power.h
++++ b/include/dt-bindings/power/mt6885-power.h
+@@ -20,5 +20,11 @@
+ #define MT6885_POWER_DOMAIN_CAM_RAWA	11
+ #define MT6885_POWER_DOMAIN_CAM_RAWB	12
+ #define MT6885_POWER_DOMAIN_CAM_RAWC	13
++#define MT6885_POWER_DOMAIN_VDEC	14	/* vdec_soc + LAT */
++#define MT6885_POWER_DOMAIN_VDEC2	15	/* vdec core */
++#define MT6885_POWER_DOMAIN_VENC	16
++#define MT6885_POWER_DOMAIN_VENC_CORE1	17
++#define MT6885_POWER_DOMAIN_MDP		18	/* mdpsys: MDP SMI (camera larb13 path) */
++#define MT6885_POWER_DOMAIN_ADSP	19	/* audio DSP, unused; lk leaves it on */
+ 
+ #endif /* _DT_BINDINGS_POWER_MT6885_POWER_H */

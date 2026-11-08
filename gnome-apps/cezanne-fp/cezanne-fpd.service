@@ -1,0 +1,15 @@
+[Unit]
+Description=Fingerprint service (cezanne, fprintd D-Bus API)
+Requires=cezanne-tee.service
+After=cezanne-tee.service
+
+[Service]
+Type=dbus
+BusName=net.reactivated.Fprint
+ExecStart=/usr/bin/cezanne-fpd
+StateDirectory=cezanne-fpd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

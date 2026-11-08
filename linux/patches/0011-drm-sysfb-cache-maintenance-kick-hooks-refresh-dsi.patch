@@ -1,0 +1,311 @@
+diff --git a/drivers/gpu/drm/sysfb/drm_sysfb_helper.h b/drivers/gpu/drm/sysfb/drm_sysfb_helper.h
+index 547f2327a..bbcdc2597 100644
+--- a/drivers/gpu/drm/sysfb/drm_sysfb_helper.h
++++ b/drivers/gpu/drm/sysfb/drm_sysfb_helper.h
+@@ -74,12 +74,24 @@ struct drm_sysfb_device {
+ 
+ 	/* hardware settings */
+ 	struct drm_display_mode fb_mode;
++	/* local extension: the same mode at another refresh rate (0 = none) */
++	unsigned int fb_alt_refresh;
+ 	const struct drm_format_info *fb_format;
+ 	unsigned int fb_pitch;
+ 	unsigned int fb_gamma_lut_size;
+ 
+ 	/* hardware-framebuffer kernel address */
+ 	struct iosys_map fb_addr;
++
++	/*
++	 * local extension: optional second hardware buffer for display engines
++	 * that can be pointed at another address (flip on each update).
++	 */
++	struct iosys_map fb_addr_alt;
++	phys_addr_t fb_phys[2];		/* fb_phys[1] == 0: single buffer */
++	unsigned int fb_front;		/* index being scanned out */
++	bool fb_valid[2];		/* buffer holds a complete earlier frame */
++	struct drm_rect fb_prev_damage;	/* damage of the frame in fb_front */
+ };
+ 
+ static inline struct drm_sysfb_device *to_drm_sysfb_device(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c b/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c
+index d2de29caf..4e97cf25c 100644
+--- a/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c
++++ b/drivers/gpu/drm/sysfb/drm_sysfb_modeset.c
+@@ -1,7 +1,13 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
+ #include <linux/export.h>
++#include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/soc/mediatek/mtk-dsi-cmd-kick.h>
++
++#ifdef CONFIG_ARM64
++#include <asm/cacheflush.h>
++#endif
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -10,6 +16,7 @@
+ #include <drm/drm_drv.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_fourcc.h>
++#include <drm/drm_gem.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_panic.h>
+@@ -282,6 +289,10 @@ int drm_sysfb_plane_helper_begin_fb_access(struct drm_plane *plane,
+ }
+ EXPORT_SYMBOL(drm_sysfb_plane_helper_begin_fb_access);
+ 
++static bool reject_imported = true;
++module_param(reject_imported, bool, 0644);
++MODULE_PARM_DESC(reject_imported, "refuse imported (GPU) framebuffers so compositors do not use them for direct scanout");
++
+ int drm_sysfb_plane_helper_atomic_check(struct drm_plane *plane,
+ 					struct drm_atomic_commit *new_state)
+ {
+@@ -307,6 +318,17 @@ int drm_sysfb_plane_helper_atomic_check(struct drm_plane *plane,
+ 	else if (!new_plane_state->visible)
+ 		return 0;
+ 
++	/*
++	 * local extension: every update is a CPU copy, and reading a buffer
++	 * imported from a GPU goes through its uncached mapping (a fullscreen
++	 * client managed 5 fps). Refuse such framebuffers so compositors probing
++	 * direct scanout fall back to composing into their own buffers.
++	 */
++	if (reject_imported && new_fb->obj[0] && drm_gem_is_imported(new_fb->obj[0])) {
++		drm_dbg_kms(plane->dev, "no direct scanout of imported buffers\n");
++		return -EINVAL;
++	}
++
+ 	new_crtc_state = drm_atomic_get_new_crtc_state(new_state, new_plane_state->crtc);
+ 
+ 	new_sysfb_crtc_state = to_drm_sysfb_crtc_state(new_crtc_state);
+@@ -326,6 +348,31 @@ int drm_sysfb_plane_helper_atomic_check(struct drm_plane *plane,
+ }
+ EXPORT_SYMBOL(drm_sysfb_plane_helper_atomic_check);
+ 
++/* debugging aid (cezanne): ignore damage clips and copy the whole plane */
++static bool full_copy;
++module_param(full_copy, bool, 0644);
++MODULE_PARM_DESC(full_copy, "copy the whole framebuffer on every update");
++
++/*
++ * The source buffers may have been written by a non-coherent GPU (Panfrost via
++ * kmsro) while the CPU still holds lines of them from an earlier copy; nothing
++ * else does cache maintenance on this path. Clean+invalidate the damaged rows
++ * of the cached shadow mapping before reading them.
++ */
++static void drm_sysfb_sync_src_rows(const struct iosys_map *src, unsigned int pitch,
++				    const struct drm_rect *damage)
++{
++#ifdef CONFIG_ARM64
++	unsigned long start, end;
++
++	if (src->is_iomem || !src->vaddr)
++		return;
++	start = (unsigned long)src->vaddr + damage->y1 * pitch;
++	end = (unsigned long)src->vaddr + damage->y2 * pitch;
++	dcache_clean_inval_poc(start, end);
++#endif
++}
++
+ void drm_sysfb_plane_helper_atomic_update(struct drm_plane *plane, struct drm_atomic_commit *state)
+ {
+ 	struct drm_device *dev = plane->dev;
+@@ -341,7 +388,10 @@ void drm_sysfb_plane_helper_atomic_update(struct drm_plane *plane, struct drm_at
+ 	const struct drm_format_info *dst_format = sysfb_crtc_state->format;
+ 	drm_sysfb_blit_func blit_to_crtc = sysfb_plane_state->blit_to_crtc;
+ 	struct drm_atomic_helper_damage_iter iter;
+-	struct drm_rect damage;
++	struct drm_rect damage, cur_damage;
++	struct iosys_map base;
++	bool double_buf, whole, extra;
++	unsigned int back;
+ 	int ret, idx;
+ 
+ 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+@@ -351,17 +401,79 @@ void drm_sysfb_plane_helper_atomic_update(struct drm_plane *plane, struct drm_at
+ 	if (!drm_dev_enter(dev, &idx))
+ 		goto out_drm_gem_fb_end_cpu_access;
+ 
++	if (sysfb->fb_alt_refresh)
++		mtk_dsi_cmd_kick_set_refresh(drm_mode_vrefresh(&crtc_state->mode));
++
++	/*
++	 * Double buffering: write the buffer not being scanned out. It holds the
++	 * frame before the current one, so it also needs the previous damage; a
++	 * buffer never written by us gets the whole plane.
++	 */
++	double_buf = sysfb->fb_phys[1] != 0;
++	back = double_buf ? !sysfb->fb_front : 0;
++	base = back ? sysfb->fb_addr_alt : sysfb->fb_addr;
++	whole = double_buf && !sysfb->fb_valid[back];
++	extra = double_buf && !whole && drm_rect_visible(&sysfb->fb_prev_damage);
++	cur_damage = (struct drm_rect){ INT_MAX, INT_MAX, INT_MIN, INT_MIN };
++
++	/* skip the catch-up copy when this frame's damage already covers it */
++	if (extra) {
++		struct drm_rect clip;
++
++		drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
++		drm_atomic_for_each_plane_damage(&iter, &clip) {
++			if (clip.x1 <= sysfb->fb_prev_damage.x1 &&
++			    clip.y1 <= sysfb->fb_prev_damage.y1 &&
++			    clip.x2 >= sysfb->fb_prev_damage.x2 &&
++			    clip.y2 >= sysfb->fb_prev_damage.y2) {
++				extra = false;
++				break;
++			}
++		}
++	}
++
++	mtk_dsi_cmd_kick_begin(!double_buf);
+ 	drm_atomic_helper_damage_iter_init(&iter, old_plane_state, plane_state);
+-	drm_atomic_for_each_plane_damage(&iter, &damage) {
+-		struct iosys_map dst = sysfb->fb_addr;
++	for (;;) {
++		struct iosys_map dst = base;
+ 		struct drm_rect dst_clip = plane_state->dst;
+ 
++		bool own = true;
++
++		if (extra) {
++			damage = sysfb->fb_prev_damage;
++			extra = false;
++			own = false;	/* catch-up only, not this frame's change */
++		} else if (!drm_atomic_helper_damage_iter_next(&iter, &damage)) {
++			break;
++		}
++		if (full_copy || whole)
++			damage = plane_state->dst;
+ 		if (!drm_rect_intersect(&dst_clip, &damage))
+ 			continue;
++		if (own) {
++			cur_damage.x1 = min(cur_damage.x1, damage.x1);
++			cur_damage.y1 = min(cur_damage.y1, damage.y1);
++			cur_damage.x2 = max(cur_damage.x2, damage.x2);
++			cur_damage.y2 = max(cur_damage.y2, damage.y2);
++		}
+ 
++		drm_sysfb_sync_src_rows(&shadow_plane_state->data[0], fb->pitches[0], &damage);
+ 		iosys_map_incr(&dst, drm_fb_clip_offset(dst_pitch, dst_format, &dst_clip));
+ 		blit_to_crtc(&dst, &dst_pitch, shadow_plane_state->data, fb, &damage,
+ 			     &shadow_plane_state->fmtcnv_state);
++		if (full_copy || whole)
++			break;
++	}
++	if (double_buf) {
++		sysfb->fb_valid[back] = true;
++		/* what the new front differs by from the frame now in the other buffer */
++		sysfb->fb_prev_damage = drm_rect_visible(&cur_damage) ? cur_damage :
++					(struct drm_rect){ 0, 0, 0, 0 };
++		sysfb->fb_front = back;
++		mtk_dsi_cmd_kick_end(sysfb->fb_phys[back]);
++	} else {
++		mtk_dsi_cmd_kick_end(0);
+ 	}
+ 
+ 	drm_dev_exit(idx);
+@@ -595,6 +707,7 @@ int drm_sysfb_connector_helper_get_modes(struct drm_connector *connector)
+ {
+ 	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(connector->dev);
+ 	const struct drm_edid *drm_edid;
++	int ret;
+ 
+ 	if (sysfb->edid) {
+ 		drm_edid = drm_edid_read_custom(connector, drm_sysfb_get_edid_block, sysfb);
+@@ -603,6 +716,19 @@ int drm_sysfb_connector_helper_get_modes(struct drm_connector *connector)
+ 	}
+ 
+ 	/* Return the fixed mode even with EDID */
+-	return drm_connector_helper_get_modes_fixed(connector, &sysfb->fb_mode);
++	ret = drm_connector_helper_get_modes_fixed(connector, &sysfb->fb_mode);
++	if (ret > 0 && sysfb->fb_alt_refresh) {
++		struct drm_display_mode *mode = drm_mode_duplicate(connector->dev, &sysfb->fb_mode);
++
++		if (mode) {
++			mode->clock = mode->clock * sysfb->fb_alt_refresh /
++				      drm_mode_vrefresh(&sysfb->fb_mode);
++			mode->type = DRM_MODE_TYPE_DRIVER;
++			drm_mode_set_name(mode);
++			drm_mode_probed_add(connector, mode);
++			ret++;
++		}
++	}
++	return ret;
+ }
+ EXPORT_SYMBOL(drm_sysfb_connector_helper_get_modes);
+diff --git a/drivers/gpu/drm/sysfb/simpledrm.c b/drivers/gpu/drm/sysfb/simpledrm.c
+index 21ddf4502..11eb3c0df 100644
+--- a/drivers/gpu/drm/sysfb/simpledrm.c
++++ b/drivers/gpu/drm/sysfb/simpledrm.c
+@@ -632,6 +632,7 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 	struct drm_crtc *crtc;
+ 	struct drm_encoder *encoder;
+ 	struct drm_connector *connector;
++	int connector_type;
+ 	unsigned long max_width, max_height;
+ 	size_t nformats;
+ 	int ret;
+@@ -733,6 +734,19 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 	}
+ 
+ 	sysfb->fb_mode = drm_sysfb_mode(width, height, width_mm, height_mm);
++	/*
++	 * local extension: refresh-rates = <preferred [alternative]>, for panels
++	 * driven at other rates than 60 Hz (the alternative is a second mode).
++	 */
++	if (of_node) {
++		u32 hz[2] = { 0, 0 };
++		int n = of_property_read_variable_u32_array(of_node, "refresh-rates", hz, 1, 2);
++
++		if (n >= 1 && hz[0])
++			sysfb->fb_mode.clock = sysfb->fb_mode.clock * hz[0] / 60;
++		if (n == 2 && hz[1] && hz[1] != hz[0])
++			sysfb->fb_alt_refresh = hz[1];
++	}
+ 	sysfb->fb_format = format;
+ 	sysfb->fb_pitch = stride;
+ 
+@@ -808,6 +822,21 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 			return ERR_PTR(-ENOMEM);
+ 
+ 		iosys_map_set_vaddr_iomem(&sysfb->fb_addr, screen_base);
++
++		/* local extension: a second "reg" entry is a back buffer to flip to */
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++		if (res && resource_size(res) >= resource_size(mem)) {
++			void __iomem *alt = devm_ioremap_wc(&pdev->dev, res->start,
++							    resource_size(res));
++
++			if (alt) {
++				iosys_map_set_vaddr_iomem(&sysfb->fb_addr_alt, alt);
++				sysfb->fb_phys[0] = mem->start;
++				sysfb->fb_phys[1] = res->start;
++				drm_info(dev, "double buffered: %pa / %pa\n",
++					 &sysfb->fb_phys[0], &sysfb->fb_phys[1]);
++			}
++		}
+ 	}
+ 
+ 	/*
+@@ -864,8 +893,16 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 	/* Connector */
+ 
+ 	connector = &sdev->connector;
++	/*
++	 * local extension: a built-in panel can say what it is connected by, so
++	 * compositors treat it as internal (brightness control, no "unplug").
++	 */
++	connector_type = DRM_MODE_CONNECTOR_Unknown;
++	if (pdev->dev.of_node &&
++	    of_property_match_string(pdev->dev.of_node, "connector-type", "dsi") >= 0)
++		connector_type = DRM_MODE_CONNECTOR_DSI;
+ 	ret = drm_connector_init(dev, connector, &simpledrm_connector_funcs,
+-				 DRM_MODE_CONNECTOR_Unknown);
++				 connector_type);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 	drm_connector_helper_add(connector, &simpledrm_connector_helper_funcs);

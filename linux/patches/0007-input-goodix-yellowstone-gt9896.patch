@@ -1,0 +1,275 @@
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 9b9ae8ac3..f65f0bf05 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -398,6 +398,16 @@ config TOUCHSCREEN_GOODIX
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called goodix.
+ 
++config TOUCHSCREEN_GOODIX_YELLOWSTONE
++	tristate "Goodix yellowstone (GT9896) I2C touchscreen"
++	depends on I2C
++	help
++	  Say Y here if you have a Goodix GT9896 ("yellowstone") touchscreen
++	  connected over I2C, as found on the Redmi K30 Ultra.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called goodix_yellowstone.
++
+ config TOUCHSCREEN_GOODIX_BERLIN_CORE
+ 	tristate
+ 
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index bfd9de833..2e02e0181 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -45,6 +45,7 @@ obj-$(CONFIG_TOUCHSCREEN_EGALAX_SERIAL)	+= egalax_ts_serial.o
+ obj-$(CONFIG_TOUCHSCREEN_EXC3000)	+= exc3000.o
+ obj-$(CONFIG_TOUCHSCREEN_FUJITSU)	+= fujitsu_ts.o
+ obj-$(CONFIG_TOUCHSCREEN_GOODIX)	+= goodix_ts.o
++obj-$(CONFIG_TOUCHSCREEN_GOODIX_YELLOWSTONE)	+= goodix_yellowstone.o
+ obj-$(CONFIG_TOUCHSCREEN_GOODIX_BERLIN_CORE)	+= goodix_berlin_core.o
+ obj-$(CONFIG_TOUCHSCREEN_GOODIX_BERLIN_I2C)	+= goodix_berlin_i2c.o
+ obj-$(CONFIG_TOUCHSCREEN_GOODIX_BERLIN_SPI)	+= goodix_berlin_spi.o
+diff --git a/drivers/input/touchscreen/goodix_yellowstone.c b/drivers/input/touchscreen/goodix_yellowstone.c
+new file mode 100644
+index 000000000..ff118f920
+--- /dev/null
++++ b/drivers/input/touchscreen/goodix_yellowstone.c
+@@ -0,0 +1,236 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Goodix "yellowstone" family touchscreens (GT9896) on I2C.
++ *
++ * Minimal driver written from the protocol used by the vendor gtx8 driver
++ * (MediaTek 4.14 BSP, drivers/input/touchscreen/GT9896): firmware and
++ * configuration are expected to already be in the controller's flash, so
++ * only reset, coordinate reporting and IRQ acknowledgement are done here.
++ *
++ * Register map (from the vendor cfg bin for cezanne): 16-bit big-endian
++ * register addresses, coordinates at 0x4180:
++ *   [0]    event status (0x80 = touch)
++ *   [2]    number of points (low nibble)
++ *   [0..7] header, u8 sum of [0..5] == be16 [6..7]
++ *   [8..]  8 bytes per point: id << 4 | type, -, x be16, y be16, w be16
++ *          followed by be16 checksum over the point data
++ * Writing 0 to the status byte acknowledges the event.
++ */
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/input/touchscreen.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/regulator/consumer.h>
++#include <linux/unaligned.h>
++
++#define GOODIX_YS_REG_PID	0x4022
++#define GOODIX_YS_REG_ESD	0x4166
++#define GOODIX_YS_REG_COOR	0x4180
++
++#define GOODIX_YS_HEAD_LEN	8
++#define GOODIX_YS_POINT_LEN	8
++#define GOODIX_YS_MAX_TOUCH	10
++#define GOODIX_YS_TOUCH_EVENT	0x80
++
++struct goodix_ys {
++	struct i2c_client *client;
++	struct input_dev *input;
++	struct gpio_desc *reset_gpio;
++	struct touchscreen_properties prop;
++	u8 buf[GOODIX_YS_HEAD_LEN + GOODIX_YS_POINT_LEN * GOODIX_YS_MAX_TOUCH + 4];
++};
++
++static const char * const goodix_ys_supplies[] = { "vdd", "vddio" };
++
++static int goodix_ys_read(struct goodix_ys *ts, u16 reg, u8 *data, int len)
++{
++	u8 addr[2];
++	struct i2c_msg msgs[] = {
++		{ .addr = ts->client->addr, .len = 2, .buf = addr },
++		{ .addr = ts->client->addr, .flags = I2C_M_RD, .len = len, .buf = data },
++	};
++	int ret;
++
++	put_unaligned_be16(reg, addr);
++	ret = i2c_transfer(ts->client->adapter, msgs, ARRAY_SIZE(msgs));
++	return ret == ARRAY_SIZE(msgs) ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++static int goodix_ys_write_u8(struct goodix_ys *ts, u16 reg, u8 val)
++{
++	u8 buf[3];
++	int ret;
++
++	put_unaligned_be16(reg, buf);
++	buf[2] = val;
++	ret = i2c_master_send(ts->client, buf, sizeof(buf));
++	return ret == sizeof(buf) ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++/* u8 sum over data[0..len-3] must equal the be16 at data[len-2] */
++static bool goodix_ys_csum_ok(const u8 *data, int len)
++{
++	u16 sum = 0;
++	int i;
++
++	for (i = 0; i < len - 2; i++)
++		sum += data[i];
++	return sum == get_unaligned_be16(data + len - 2);
++}
++
++static void goodix_ys_report(struct goodix_ys *ts, int num)
++{
++	const u8 *p = ts->buf + GOODIX_YS_HEAD_LEN;
++	int i;
++
++	for (i = 0; i < num; i++, p += GOODIX_YS_POINT_LEN) {
++		int id = p[0] >> 4;
++		int type = p[0] & 0x0f;
++
++		/* types 1 and 3 are stylus points */
++		if (id >= GOODIX_YS_MAX_TOUCH || type == 1 || type == 3)
++			continue;
++		input_mt_slot(ts->input, id);
++		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
++		touchscreen_report_pos(ts->input, &ts->prop,
++				       get_unaligned_be16(p + 2),
++				       get_unaligned_be16(p + 4), true);
++		input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR,
++				 get_unaligned_be16(p + 6));
++	}
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++}
++
++static irqreturn_t goodix_ys_irq(int irq, void *data)
++{
++	struct goodix_ys *ts = data;
++	/* header, first point and its checksum in one read */
++	int len = GOODIX_YS_HEAD_LEN + GOODIX_YS_POINT_LEN + 2;
++	int num;
++
++	if (goodix_ys_read(ts, GOODIX_YS_REG_COOR, ts->buf, len))
++		return IRQ_HANDLED;
++
++	if (!(ts->buf[0] & GOODIX_YS_TOUCH_EVENT) ||
++	    !goodix_ys_csum_ok(ts->buf, GOODIX_YS_HEAD_LEN))
++		goto ack;
++
++	num = ts->buf[2] & 0x0f;
++	if (num > GOODIX_YS_MAX_TOUCH)
++		goto ack;
++	if (num > 1 &&
++	    goodix_ys_read(ts, GOODIX_YS_REG_COOR + len, ts->buf + len,
++			   (num - 1) * GOODIX_YS_POINT_LEN))
++		goto ack;
++	if (num &&
++	    !goodix_ys_csum_ok(ts->buf + GOODIX_YS_HEAD_LEN,
++			       num * GOODIX_YS_POINT_LEN + 2))
++		goto ack;
++
++	goodix_ys_report(ts, num);
++ack:
++	goodix_ys_write_u8(ts, GOODIX_YS_REG_COOR, 0);
++	return IRQ_HANDLED;
++}
++
++static void goodix_ys_reset(struct goodix_ys *ts)
++{
++	if (!ts->reset_gpio)
++		return;
++	gpiod_set_value_cansleep(ts->reset_gpio, 1);
++	usleep_range(2000, 2500);
++	gpiod_set_value_cansleep(ts->reset_gpio, 0);
++	msleep(100);
++}
++
++static int goodix_ys_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct goodix_ys *ts;
++	u8 pid[4];
++	int ret;
++
++	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++	ts->client = client;
++	i2c_set_clientdata(client, ts);
++
++	ret = devm_regulator_bulk_get_enable(dev, ARRAY_SIZE(goodix_ys_supplies),
++					     goodix_ys_supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to enable supplies\n");
++	/* goodix,power-on-delay-us in the vendor DT */
++	usleep_range(10000, 11000);
++
++	ts->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(ts->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ts->reset_gpio), "reset gpio\n");
++
++	goodix_ys_reset(ts);
++	/* "dynamic esd" init, as the vendor driver does after every reset */
++	goodix_ys_write_u8(ts, GOODIX_YS_REG_ESD, 0);
++
++	ret = goodix_ys_read(ts, GOODIX_YS_REG_PID, pid, sizeof(pid));
++	if (ret)
++		return dev_err_probe(dev, ret, "no response from controller\n");
++	dev_info(dev, "Goodix GT%.4s (yellowstone)\n", pid);
++
++	ts->input = devm_input_allocate_device(dev);
++	if (!ts->input)
++		return -ENOMEM;
++	ts->input->name = "Goodix Capacitive TouchScreen";
++	ts->input->phys = "input/ts";
++	ts->input->id.bustype = BUS_I2C;
++	ts->input->id.vendor = 0x0416;
++	ts->input->id.product = 0x9896;
++
++	input_set_capability(ts->input, EV_ABS, ABS_MT_POSITION_X);
++	input_set_capability(ts->input, EV_ABS, ABS_MT_POSITION_Y);
++	input_set_abs_params(ts->input, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
++	touchscreen_parse_properties(ts->input, true, &ts->prop);
++	if (!ts->prop.max_x || !ts->prop.max_y)
++		return dev_err_probe(dev, -EINVAL, "touchscreen-size-x/y missing\n");
++
++	ret = input_mt_init_slots(ts->input, GOODIX_YS_MAX_TOUCH,
++				  INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (ret)
++		return ret;
++	ret = input_register_device(ts->input);
++	if (ret)
++		return ret;
++
++	/* trigger type comes from the device tree */
++	return devm_request_threaded_irq(dev, client->irq, NULL, goodix_ys_irq,
++					 IRQF_ONESHOT, client->name, ts);
++}
++
++static const struct of_device_id goodix_ys_of_match[] = {
++	{ .compatible = "goodix,gt9896" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, goodix_ys_of_match);
++
++static const struct i2c_device_id goodix_ys_id[] = {
++	{ "gt9896" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, goodix_ys_id);
++
++static struct i2c_driver goodix_ys_driver = {
++	.driver = {
++		.name = "goodix-yellowstone",
++		.of_match_table = goodix_ys_of_match,
++	},
++	.probe = goodix_ys_probe,
++	.id_table = goodix_ys_id,
++};
++module_i2c_driver(goodix_ys_driver);
++
++MODULE_DESCRIPTION("Goodix yellowstone (GT9896) touchscreen driver");
++MODULE_LICENSE("GPL");

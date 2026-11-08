@@ -1,0 +1,35 @@
+diff --git a/drivers/usb/mtu3/mtu3_core.c b/drivers/usb/mtu3/mtu3_core.c
+--- a/drivers/usb/mtu3/mtu3_core.c
++++ b/drivers/usb/mtu3/mtu3_core.c
+@@ -1046,8 +1046,18 @@
+ {
+ 	struct mtu3 *mtu = ssusb->u3d;
+ 
+-	if (!mtu->gadget_driver)
++	/*
++	 * No gadget bound (dual role, device side started): suspend the
++	 * device MAC anyway. The OTG path powers port 0 down with the host
++	 * ports and leaves it to ssusb_gadget_resume(); with its interrupts
++	 * still enabled a latched U2 interrupt then fired ~400k times a
++	 * second, since its status register went dark with the port.
++	 */
++	if (!mtu->gadget_driver) {
++		mtu3_dev_suspend(mtu);
++		synchronize_irq(mtu->irq);
+ 		return 0;
++	}
+ 
+ 	/* Prevent runtime suspend when active connection exists */
+ 	if (mtu->connected && PMSG_IS_AUTO(msg))
+@@ -1071,8 +1081,10 @@
+ {
+ 	struct mtu3 *mtu = ssusb->u3d;
+ 
+-	if (!mtu->gadget_driver)
++	if (!mtu->gadget_driver) {
++		mtu3_dev_resume(mtu);		/* see ssusb_gadget_suspend() */
+ 		return 0;
++	}
+ 
+ 	if (ssusb->force_vbus && !PMSG_IS_AUTO(msg))
+ 		mtu3_setbits(mtu->mac_base, U3D_MISC_CTRL, VBUS_FRC_EN | VBUS_ON);

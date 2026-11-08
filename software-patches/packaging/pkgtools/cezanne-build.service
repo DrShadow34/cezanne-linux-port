@@ -1,0 +1,14 @@
+[Unit]
+Description=Rebuild stale cezanne packages into the local repo
+Documentation=file:///home/alarm/cezanne-pkg/packaging/README.md
+After=network-online.target
+Wants=network-online.target
+# a phone: only on the charger
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemd-inhibit --what=sleep --why="cezanne package build" /usr/bin/cezanne-build
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=12h

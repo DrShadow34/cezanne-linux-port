@@ -1,0 +1,7 @@
+SUBSYSTEM=="power_supply", KERNEL=="mt6360-chg*", ACTION=="add|change", RUN+="/usr/local/bin/mt6360-chg-setup %k"
+# USB PD contract changes (TCPM): re-apply the MT6360 input limit
+SUBSYSTEM=="power_supply", KERNEL=="tcpm-source-psy-*", ACTION=="add|change", RUN+="/usr/local/bin/mt6360-chg-setup"
+# battery updates (~30 s): JEITA bands follow the battery temperature
+SUBSYSTEM=="power_supply", KERNEL=="battery", ACTION=="change", RUN+="/usr/local/bin/mt6360-chg-setup"
+# charger type from the XMUSB350 (BC1.2 / QC detection): input limit, USB gadget
+SUBSYSTEM=="power_supply", KERNEL=="xmusb350", ACTION=="add|change", RUN+="/usr/local/bin/mt6360-chg-setup"

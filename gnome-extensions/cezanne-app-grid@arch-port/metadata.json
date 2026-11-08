@@ -1,0 +1,12 @@
+{
+  "uuid": "cezanne-app-grid@arch-port",
+  "name": "Cezanne App Grid",
+  "description": "Phone app grid: 4 columns of large icons in portrait (8 in landscape), the full screen width, no workspaces above the grid.",
+  "shell-version": [
+    "51"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

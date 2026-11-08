@@ -1,0 +1,7 @@
+# The file indexer covers the whole home directory: every folder that is not
+# hidden (LocalSearch never enters dot-directories, nor folders holding a
+# .nomedia or .trackerignore file). The gallery (cezanne-gallery) lists the
+# photos and videos it finds. LocalSearch 3.12's default is the same; pinned.
+[org.freedesktop.Tracker3.Miner.Files]
+index-recursive-directories=['$HOME']
+index-single-directories=@as []

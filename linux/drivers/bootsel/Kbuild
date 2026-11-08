@@ -1,0 +1,3 @@
+# boot chooser: one-shot "boot MIUI next" flag for the boot-slot shim
+ccflags-y += -I$(src)/../shim
+obj-m += cezanne-bootsel.o

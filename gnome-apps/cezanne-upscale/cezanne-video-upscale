@@ -1,0 +1,144 @@
+#!/usr/bin/python3
+"""cezanne-video-upscale: a video 2x (or 4x) larger with the compact
+Real-ESRGAN on the APU, through cezanne-upscaled's frame session (the
+gallery's "Upscale 2x (AI)" for videos).
+
+    cezanne-video-upscale [--scale 2|4] [--encoder hw|x264] in out.mp4
+
+ffmpeg decodes (its rotation applied, at a constant rate: the stream's
+average, so a variable rate recording keeps its timing; cropped at the
+centre to multiples of 8 px: the hardware encoder timed out on a 2876 px
+wide frame and needed a reboot), the frames go to the daemon through two
+memfds, ffmpeg encodes and copies the audio: H.264 on the phone's encoder
+(cezanne-venc through h264_v4l2m2m, ~0.2 bit per pixel) or libx264 CRF 18.
+While the APU works on a frame the previous one goes to the encoder. The
+result is written as <out>.part and renamed when done. Progress on stderr:
+"frame i / n". Frames up to 1080p (2x: 4K)."""
+import argparse
+import json
+import mmap
+import os
+import socket
+import subprocess
+import sys
+from fractions import Fraction
+
+SOCK = '/run/cezanne-upscale.sock'
+
+
+def probe(path):
+    r = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                        'stream=width,height,avg_frame_rate,nb_frames,duration:stream_side_data=rotation'
+                        ':format=duration', '-of', 'json', path],
+                       capture_output=True, text=True, check=True)
+    info = json.loads(r.stdout)
+    st = info['streams'][0]
+    w, h = int(st['width']), int(st['height'])
+    rot = 0
+    for sd in st.get('side_data_list', []):
+        rot = int(sd.get('rotation', 0))
+    if rot % 180:			# the decoder turns it
+        w, h = h, w
+    fps = Fraction(st.get('avg_frame_rate', '30/1'))
+    if fps <= 0:
+        fps = Fraction(30)
+    dur = float(st.get('duration') or info.get('format', {}).get('duration') or 0)
+    n = int(st.get('nb_frames') or 0) or round(dur * fps)
+    return w, h, fps, max(n, 1)
+
+
+def encoder_args(a, w, h, fps):
+    if a.encoder == 'x264':
+        return ['-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pix_fmt', 'yuv420p']
+    rate = int(w * h * float(fps) * 0.2)
+    return ['-c:v', 'h264_v4l2m2m', '-b:v', str(rate), '-pix_fmt', 'nv12']
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--scale', type=int, default=2, choices=(2, 4))
+    ap.add_argument('--encoder', default='hw', choices=('hw', 'x264'))
+    ap.add_argument('input')
+    ap.add_argument('output')
+    a = ap.parse_args()
+    w0, h0, fps, n = probe(a.input)
+    w, h = w0 - w0 % 8, h0 - h0 % 8		# the encoder: multiples of 16 out
+    crop = f'crop={w}:{h},' if (w, h) != (w0, h0) else ''
+    s = a.scale
+    fin, fout = w * h * 3, s * s * w * h * 3
+
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    conn.connect(SOCK)
+    mi_fd, mo_fd = os.memfd_create('frame-in'), os.memfd_create('frame-out')
+    os.ftruncate(mi_fd, fin)
+    os.ftruncate(mo_fd, fout)
+    mi, mo = mmap.mmap(mi_fd, fin), mmap.mmap(mo_fd, fout)
+    socket.send_fds(conn, [json.dumps(dict(job='frames', width=w, height=h, scale=s,
+                                           order='rgb')).encode()], [mi_fd, mo_fd])
+    os.close(mi_fd)
+    os.close(mo_fd)
+
+    def answer():
+        r = json.loads(conn.recv(4096) or b'{"error": "the service went away"}')
+        if 'error' in r:
+            sys.exit(f'cezanne-video-upscale: {r["error"]}')
+        return r
+    answer()				# ready
+
+    part = a.output + '.part'
+    dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', a.input, '-an', '-sn', '-dn',
+                            '-vf', f'{crop}fps={fps}', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'],
+                           stdout=subprocess.PIPE)
+    enc = subprocess.Popen(['ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+                            '-s', f'{s * w}x{s * h}', '-framerate', str(fps), '-i', 'pipe:0',
+                            '-i', a.input, '-map', '0:v:0', '-map', '1:a?',
+                            *encoder_args(a, s * w, s * h, fps), '-c:a', 'copy',
+                            '-movflags', '+faststart', '-f', 'mp4', part],
+                           stdin=subprocess.PIPE)
+
+    def read_frame():
+        buf = dec.stdout.read(fin)
+        return buf if buf and len(buf) == fin else None
+
+    ok = False
+    try:
+        frame, i = read_frame(), 0
+        if frame is None:
+            sys.exit('cezanne-video-upscale: no frames')
+        mi[:] = frame
+        conn.send(json.dumps(dict(frame=0)).encode())
+        while True:
+            answer()			# done i
+            result = bytes(mo)
+            frame = read_frame()
+            if frame is not None:
+                mi[:] = frame
+                conn.send(json.dumps(dict(frame=i + 1)).encode())
+            enc.stdin.write(result)	# while the APU works on the next one
+            print(f'frame {i + 1} / {max(n, i + 1)}', file=sys.stderr, flush=True)
+            i += 1
+            if frame is None:
+                break
+        conn.send(b'{"end": true}')
+        answer()
+        enc.stdin.close()
+        ok = enc.wait() == 0
+    finally:
+        dec.kill()
+        dec.wait()
+        if enc.poll() is None:
+            enc.kill()
+            enc.wait()
+        mi.close()
+        mo.close()
+        conn.close()
+        if ok:
+            os.replace(part, a.output)
+        elif os.path.exists(part):
+            os.remove(part)
+    if not ok:
+        sys.exit('cezanne-video-upscale: encoding failed')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,36 @@
+From dcb32ab8865df21be6697eeb4b12d1516a00a47f Mon Sep 17 00:00:00 2001
+From: arch-port <26345330+DrShadow34@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 11:11:16 +0100
+Subject: [PATCH 10/11] panvk: frame shaders load cube attachments as 2D arrays
+
+The preload shaders (pan_fb_nir.c) sample cube views (layered rendering
+into a cube or cube array) as 2D arrays, but the texture descriptor kept
+the cube dimension: layer N then addressed cube N and every layer past
+the first loaded out of bounds. CTS geometry.layered.cube*.readback /
+secondary_cmd_buffer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013fD3if93WntovhmD8fGa8C
+---
+ src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+index 6219e7a..12d3bdf 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+@@ -357,6 +357,11 @@ fill_textures(struct panvk_cmd_buffer *cmdbuf,
+       }
+ 
+       struct pan_image_view pview = *iview;
++      /* the frame shaders load cube views (layered rendering) as 2D arrays
++       * (pan_fb_nir.c), the descriptor has to match: as a cube one, layer N
++       * would be cube N */
++      if (pview.dim == MALI_TEXTURE_DIMENSION_CUBE)
++         pview.dim = MALI_TEXTURE_DIMENSION_2D;
+       if (loc == FRAG_RESULT_DEPTH)
+          pview.format = util_format_get_depth_only(pview.format);
+       else if (loc == FRAG_RESULT_STENCIL)
+-- 
+2.56.0
+

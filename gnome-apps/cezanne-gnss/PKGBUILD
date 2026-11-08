@@ -1,0 +1,31 @@
+# GNSS location for the Redmi K30 Ultra (cezanne): our own receiver for the
+# MediaTek CONNSYS GNSS DSPs (kernel gps_drv_dl_v010, cezanne-gps.service),
+# GPS + BeiDou fixes served as NMEA to GeoClue. Needs the DSP images
+# gnss-l1.bin / gnss-l5.bin in /usr/lib/firmware/mediatek/cezanne
+# (mainline/gnss/tools/extract-dsp.py, from the stock firmware) and network
+# for the broadcast orbits (IGS, BKG mirror).
+pkgname=cezanne-gnss
+pkgver=1.0
+pkgrel=20
+pkgdesc="GNSS receiver for the cezanne (NMEA for GeoClue)"
+arch=(any)
+license=(MIT)
+depends=(python python-numpy geoclue)
+backup=(etc/geoclue/conf.d/90-cezanne-gnss.conf etc/cezanne-gnss.conf)
+source=(cezanne-gnssd
+        cezanne-gnss.service
+        cezanne-gnss.conf
+        90-cezanne-gnss.conf)
+sha256sums=(SKIP SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 cezanne-gnssd "$pkgdir/usr/bin/cezanne-gnssd"
+  # the module directory sits next to this PKGBUILD (makepkg only takes
+  # local sources by their file name)
+  for f in "$startdir"/cezanne_gnss/*.py; do
+    install -Dm644 "$f" "$pkgdir/usr/lib/cezanne-gnss/cezanne_gnss/${f##*/}"
+  done
+  install -Dm644 cezanne-gnss.service "$pkgdir/usr/lib/systemd/system/cezanne-gnss.service"
+  install -Dm644 90-cezanne-gnss.conf "$pkgdir/etc/geoclue/conf.d/90-cezanne-gnss.conf"
+  install -Dm644 cezanne-gnss.conf "$pkgdir/etc/cezanne-gnss.conf"
+}

@@ -1,0 +1,36 @@
+From 3b5f7a33be753e2c4bd668d50be712746d7c1358 Mon Sep 17 00:00:00 2001
+From: cezanne <port@local>
+Date: Sun, 1 Nov 2026 04:30:25 +0100
+Subject: [PATCH 6/9] panvk: v9 polygon mode POINT as a point list
+
+The tiler has no polygon modes. Triangles with VK_POLYGON_MODE_POINT
+are drawn as a point list of the same vertices (the v9 vertex shader
+always has a points position program). Differences from real point
+fill: each vertex is drawn once rather than once per triangle, and
+there is no face culling. Only reachable while fillModeNonSolid is
+claimed (PANVK_DEBUG=dxvk); LINE still draws solid.
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+index fc4e602..1cac733 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+@@ -783,6 +783,13 @@ emit_idvs_job(struct panvk_cmd_buffer *cmdbuf,
+    enum mesa_prim prim = cmdbuf->state.gfx.idvs.prim;
+    bool secondary = vs->info.vs.secondary_enable && fs != NULL;
+ 
++   /* No polygon modes in the tiler. VK_POLYGON_MODE_POINT: the vertices of
++    * the triangles as a point list (each vertex once, not once per
++    * triangle; no face culling). */
++   if (u_reduced_prim(prim) == MESA_PRIM_TRIANGLES &&
++       rs->polygon_mode == VK_POLYGON_MODE_POINT)
++      prim = MESA_PRIM_POINTS;
++
+    VkResult result = panvk_per_arch(cmd_prepare_tiler_context)(cmdbuf, layer);
+    if (result != VK_SUCCESS)
+       return result;
+-- 
+2.56.0
+

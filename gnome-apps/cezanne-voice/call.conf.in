@@ -1,0 +1,122 @@
+# cezanne-voice call chain: a PipeWire client process that cezanne-speechd
+# runs as the desktop user for the length of a cellular call, with the AFE
+# routing the modem's PCM 2 through the AP (uplink from DL2 = hw:0,2, the
+# downlink to UL_MONO_1 = hw:0,18; speechd creates those two ALSA nodes in
+# the server and fills in their names here):
+#
+#   mic (FL) -> echo canceller -> RNNoise -> @UPLINK@ -> modem
+#   modem -> @DOWNLINK@ -> echo canceller's sink (the reference) -> speaker
+#
+# The canceller (WebRTC AEC3) comes first: noise suppression is not linear
+# and would hide the echo path from it. Its own noise suppression and gain
+# control are off (RNNoise, and the modem's UL gain). Its capture is not
+# autoconnected: speechd links it to the hardware source's FL port itself,
+# as WirePlumber would route even a named target through the microphone's
+# smart filter (cezanne-voice.conf). RNNoise follows the Power app's switch.
+
+context.properties = {
+    log.level = 0
+}
+
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+
+context.modules = [
+    { name = libpipewire-module-rt
+        args = { }
+        flags = [ ifexists nofail ]
+    }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+
+    { name = libpipewire-module-echo-cancel
+        args = {
+            library.name   = aec/libspa-aec-webrtc
+            node.latency   = 480/48000
+            audio.rate     = 48000
+            audio.channels = 1
+            audio.position = [ MONO ]
+            aec.args = {
+                webrtc.high_pass_filter      = true
+                webrtc.noise_suppression     = false
+                webrtc.gain_control          = false
+                webrtc.voice_detection       = false
+                webrtc.transient_suppression = false
+            }
+            capture.props = {
+                node.name        = "cezanne_call.mic"
+                node.autoconnect = false
+                audio.position   = [ FL ]
+            }
+            source.props = {
+                node.name        = "cezanne_call.aec_source"
+                node.description = "Call microphone (echo cancelled)"
+                priority.session = 1
+                priority.driver  = 1
+            }
+            sink.props = {
+                node.name        = "cezanne_call.aec_sink"
+                node.description = "Call downlink (echo reference)"
+                priority.session = 1
+                priority.driver  = 1
+            }
+            playback.props = {
+                node.name = "cezanne_call.speaker"
+            }
+        }
+    }
+
+    { name = libpipewire-module-filter-chain
+        args = {
+            node.description = "Call noise reduction"
+            media.name       = "Call noise reduction"
+            node.latency     = 480/48000
+            filter.graph = {
+                nodes = [
+                    {
+                        type   = ladspa
+                        name   = rnnoise
+                        plugin = /usr/lib/ladspa/cezanne-rnnoise.so
+                        label  = cezanne_rnnoise
+                    }
+                ]
+            }
+            audio.rate     = 48000
+            audio.channels = 1
+            audio.position = [ MONO ]
+            capture.props = {
+                node.name     = "cezanne_call.nr_in"
+                target.object = "cezanne_call.aec_source"
+                node.dont-reconnect = true
+            }
+            playback.props = {
+                node.name     = "cezanne_call.uplink_out"
+                target.object = "@UPLINK@"
+                node.dont-reconnect = true
+            }
+        }
+    }
+
+    { name = libpipewire-module-loopback
+        args = {
+            node.description = "Call downlink"
+            node.latency     = 480/48000
+            audio.rate       = 48000
+            audio.channels   = 1
+            audio.position   = [ MONO ]
+            capture.props = {
+                node.name     = "cezanne_call.downlink_in"
+                target.object = "@DOWNLINK@"
+                node.dont-reconnect = true
+            }
+            playback.props = {
+                node.name     = "cezanne_call.downlink_out"
+                target.object = "cezanne_call.aec_sink"
+                node.dont-reconnect = true
+            }
+        }
+    }
+]

@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-initialise the MT6360 Type-C controller when it loses its setup
+
+[Service]
+ExecStart=/usr/local/bin/cezanne-tcpc-guard
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

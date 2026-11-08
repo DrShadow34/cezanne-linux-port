@@ -1,0 +1,3 @@
+# Redmi K30 Ultra pop-up camera
+obj-m += popup-motor.o ak09970.o
+popup-motor-y := popup_motor.o

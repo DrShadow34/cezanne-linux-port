@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+# cezanne-speechd: call audio for the cezanne modem. While ModemManager has
+# a call dialing or up, it switches the modem's speech path on over
+# /dev/ccci_aud (cezanne-ccci) and holds the sound card's hostless speech
+# stream open, which powers the AFE route modem PCM 2 <-> microphones /
+# earpiece (or the headset when the sound server has it selected).
+#
+# Speech control protocol (as MIUI's audio HAL speaks it, see NOTES.md
+# "Call audio"): 16-byte CCCI messages on channel 5 / 4. Mailbox: data0
+# 0xffffffff, u16 param, u16 message id, channel, u32 param. Payload: data0
+# 0, length, channel, u16 size + 6, u16 id, then u16 0xa2a2, u16 type, u16
+# size and the data (modem payloads: 0x1234, type, size, index, total).
+# The modem acks a message with its id | 0x8000.
+#
+#   cezanne-speechd [-v] [--loopback SECONDS [--no-stream]]
+#
+# --loopback: the modem returns the uplink on the downlink for a while (no
+# call); --no-stream leaves the PCMs to the caller (digital tests).
+#
+# During a call it follows the desktop user's controls: callaudiod's speaker
+# and mic state (GNOME Calls' buttons) switch earpiece / speakerphone and the
+# modem's uplink mute; the default sink's volume (the volume keys) is the call
+# volume, kept apart from the media volume.
+#
+# With cezanne-voice installed the call's audio goes through the AP (SPH_AP=0:
+# the direct path): the AFE connects PCM 2 to the AP's DL2 (uplink) and
+# UL_MONO_1 (downlink) instead of the mics and amps, and the desktop user's
+# sound server runs cezanne-voice's call chain: mic -> echo cancelling ->
+# RNNoise -> modem, modem -> the default sink (the echo reference). The
+# volume then works in the sound server, the modem's DL gain stays 0 dB.
+# Without it (or if that chain does not come up) the mics and amps talk to
+# the modem directly and the sink's volume sets the DL gain.
+import argparse
+import ctypes
+import json
+import math
+import mmap
+import os
+import pwd
+import re
+import select
+import struct
+import subprocess
+import sys
+import time
+
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib  # noqa: E402
+
+DEV = '/dev/ccci_aud'
+STATE = '/sys/devices/platform/cezanne-ccci/state'
+SHM_SIZE = 0xd000
+MAGIC = 0xffffffff
+ACK = 0x8000
+
+MSG_DL_GAIN = 0x2f00		# param16: gain, 0 = 0 dB, 0x8000 = mute
+MSG_UL_GAIN = 0x2f01
+MSG_UL_MUTE = 0x2f02
+MSG_DL_MUTE = 0x2f03
+MSG_UL_SOURCE_MUTE = 0x2f08
+MSG_DL_MUTE_CODEC = 0x2f09
+MSG_DL_MUTE_DYNAMIC = 0x2f0a
+MSG_SPH_ENH = 0x2f23		# param16: speech enhancement on / off
+MSG_SPH_ON = 0x2f20
+MSG_SPH_OFF = 0x2f21
+MSG_SPH_INFO = 0x2f7b		# the info again, after the call setup
+MSG_MD_ALIVE_ACK = 0x2fa0	# answers the modem's "alive" (0xafa0)
+TYPE_SPH_INFO = 0x19
+MD_NAMES = {0xaf70: 'speech status', 0xaf75: 'RAT info', 0xaf78: 'EPOF',
+            0xafa0: 'MD alive'}
+
+# 1 = MIUI's info (its audio DSP does the speech processing): the downlink
+# then comes through too, but hot (clipping); 0 = the modem processes it
+OPENDSP = int(os.environ.get('SPH_OPENDSP', '0'))
+UL_GAIN = int(os.environ.get('SPH_UL_GAIN', '0'), 0)
+ENHANCE = int(os.environ.get('SPH_ENH', '0'))
+PCM = b'hw:0,22'		# Hostless_Speech
+RATE = 48000
+# mics -> modem; modem -> amplifiers (I2S3) or, with the headset in use (the
+# sound server's Headphones device sets HP Mux), the MT6359 headphone path
+UL_ROUTES = ('PCM_2_PB_CH1 ADDA_UL_CH1', 'PCM_2_PB_CH2 ADDA_UL_CH2')
+AMP_ROUTES = ('I2S3_CH1 PCM_2_CAP_CH1', 'I2S3_CH2 PCM_2_CAP_CH1')
+HP_ROUTES = ('ADDA_DL_CH1 PCM_2_CAP_CH1', 'ADDA_DL_CH2 PCM_2_CAP_CH1')
+# the UCM Earpiece device (top amplifier alone, ASP, amp gain 0); the
+# sound server's own settings come back after the call
+EARPIECE = (('Speakers Switch', 'off'), ('Earpiece Switch', 'on'),
+            ('Top PCM Source', 'ASP'), ('Top Analog PCM Volume', '0'),
+            ('Top DSP RX2 Source', 'ASPRX1'))
+# speakerphone: both amplifiers, as MIUI's voice speaker path (the same
+# settings as the UCM Speaker2 device: the top DSP takes both inputs from
+# its own slot), with MIUI's handsfree tuning deltas while it is on
+SPEAKERS = (('Speakers Switch', 'on'), ('Earpiece Switch', 'on'),
+            ('Top PCM Source', 'DSP'), ('Top Analog PCM Volume', '17'),
+            ('Top DSP RX2 Source', 'ASPRX1'))
+AMP_USECASE = '/usr/local/bin/cezanne-amp-usecase'
+# call volume (percent of the default sink) -> DL gain in 0.25 dB as the
+# sink's own cubic volume curve, never muted; kept between calls
+CALL_VOLUME = os.path.join(os.environ.get('STATE_DIRECTORY', '/var/lib/cezanne-speechd'),
+                           'call-volume')
+CALL_VOLUME_DEFAULT = 80
+DL_GAIN_MIN = -40 * 4
+DL_GAIN_MAX = 6 * 4
+CALLAUDIO = ('org.mobian_project.CallAudio', '/org/mobian_project/CallAudio')
+# the AP path: uplink from DL2 (Playback_2), downlink to UL_MONO_1
+# (Capture_Mono_1); the two PCMs become nodes in the user's sound server
+# (name, description, factory, ALSA device, channels) for call.conf.in
+CALL_CONF = '/usr/share/cezanne-voice/call.conf.in'
+AP_PATH = os.environ.get('SPH_AP', '1') != '0' and os.path.exists(CALL_CONF)
+AP_ROUTES = ('PCM_2_PB_CH1 DL2_CH1', 'PCM_2_PB_CH2 DL2_CH2', 'UL_MONO_1_CH1 PCM_2_CAP_CH1')
+UPLINK = ('cezanne_modem.uplink', 'Modem uplink', 'api.alsa.pcm.sink', 'hw:0,2', 2)
+DOWNLINK = ('cezanne_modem.downlink', 'Modem downlink', 'api.alsa.pcm.source', 'hw:0,18', 1)
+
+MM = 'org.freedesktop.ModemManager1'
+CALL_IFACE = MM + '.Call'
+VOICE_IFACE = MM + '.Modem.Voice'
+# MMCallState: dialing, ringing out, active, held
+SPEECH_STATES = (1, 2, 4, 5)
+
+verbose = False
+
+
+def log(*a):
+    print('%.1f' % time.clock_gettime(time.CLOCK_BOOTTIME), *a, flush=True)
+
+
+def sph_info(app=0):
+    """sph_info_t (128 bytes) as MIUI sends it for a handset call"""
+    b = bytearray(128)
+    b[0] = app		# application: 0 phone call, 2 loopback
+    b[1] = 0		# no Bluetooth
+    b[2] = 3		# 48 kHz
+    b[3] = OPENDSP	# enhancement in the audio DSP (MIUI) instead of the modem
+    struct.pack_into('<H', b, 0x12, 3)	# dynamic enhancement control
+    # common parameters (MIUI's SpeechGeneral values), debug info
+    struct.pack_into('<5H', b, 0x1c, 6, 0xdabd, 0x7918, 0x2a00, 0x8001)
+    struct.pack_into('<H', b, 0x34, 3)
+    b[0x54] = 2		# two smart amplifiers
+    if app == 2:
+        b[0xc] = 2	# loopback without the speech codec
+        b[0xd] = 0	# delay frames
+    return bytes(b)
+
+
+class Modem:
+    """speech messages on /dev/ccci_aud"""
+    def __init__(self):
+        self.fd = os.open(DEV, os.O_RDWR | os.O_NONBLOCK)
+        self.shm = mmap.mmap(self.fd, SHM_SIZE)
+        self.format_shm()
+
+    def format_shm(self):
+        """sph_shm_t: guards, AP / MD flags, speech parameter, AP data and MD
+        data regions (offset, size, read / write index), checksum field"""
+        s = self.shm
+        s[:SHM_SIZE] = bytes(SHM_SIZE)
+        s[0:0x20] = b'\n' * 0x20
+        struct.pack_into('<2I', s, 0x20, 1, 0)
+        for i, (off, size) in enumerate(((0x80, 0x3000), (0x3080, 0x2000),
+                                         (0x5080, 0x7f60))):
+            struct.pack_into('<4I', s, 0x28 + 0x10 * i, off, size, 0, 0)
+        struct.pack_into('<I', s, 0x7c, 0x7c)
+        s[0xcfe0:0xd000] = b'\n' * 0x20
+
+    def send(self, pkt):
+        os.write(self.fd, pkt)
+
+    def mailbox(self, msg, p16=0, p32=0):
+        self.send(struct.pack('<IHHII', MAGIC, p16, msg, 0, p32))
+
+    def payload(self, msg, dtype, data):
+        n = len(data)
+        self.send(struct.pack('<IIIHH', 0, 0, 0, n + 6, msg) +
+                  struct.pack('<HHH', 0xa2a2, dtype, n) + data)
+
+    def receive(self):
+        """one message from the modem: (id, param16 or type, param32 or data)"""
+        try:
+            pkt = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return None
+        if len(pkt) < 16:
+            return None
+        d0, p16, msg, ch, p32 = struct.unpack_from('<IHHII', pkt)
+        if d0 == MAGIC:
+            return msg, p16, p32
+        msg = p32 >> 16
+        sync, dtype, size = struct.unpack_from('<HHH', pkt, 16)
+        return msg, dtype, pkt[26:26 + size]
+
+    def handle(self, m):
+        """a modem message outside a request (acks share the 0xafxx ids)"""
+        msg, a, b = m
+        name = MD_NAMES.get(msg)
+        if name:
+            log('modem: %s (%#x)' % (name, msg))
+        if msg == 0xafa0:
+            try:
+                self.mailbox(MSG_MD_ALIVE_ACK)
+            except OSError as e:
+                log('alive ack:', e)
+        elif verbose:
+            log('modem: %#x %r %r' % (msg, a, b))
+
+    def request(self, msg, send, timeout=1.0):
+        """send, then process modem messages until msg's ack (or timeout)"""
+        send()
+        end = time.monotonic() + timeout
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                log('no ack for %#x' % msg)
+                return False
+            select.select([self.fd], [], [], left)
+            m = self.receive()
+            if not m:
+                continue
+            if m[0] == msg | ACK:
+                return True
+            self.handle(m)
+
+
+class Hostless:
+    """the hostless speech stream: opened and started, it powers the path;
+    no data moves (stop threshold = boundary, so playback may run empty)"""
+    def __init__(self):
+        self.a = ctypes.CDLL('libasound.so.2')
+        self.pcms = []
+
+    def _open(self, stream):
+        a = self.a
+        pcm = ctypes.c_void_p()
+        hw = ctypes.c_void_p()
+        sw = ctypes.c_void_p()
+        boundary = ctypes.c_ulong()
+        if a.snd_pcm_open(ctypes.byref(pcm), PCM, stream, 0) < 0:
+            raise OSError('snd_pcm_open %s' % PCM.decode())
+        try:
+            a.snd_pcm_hw_params_malloc(ctypes.byref(hw))
+            a.snd_pcm_hw_params_any(pcm, hw)
+            a.snd_pcm_hw_params_set_access(pcm, hw, 3)	# RW_INTERLEAVED
+            a.snd_pcm_hw_params_set_format(pcm, hw, 2)	# S16_LE
+            a.snd_pcm_hw_params_set_channels(pcm, hw, 2)
+            a.snd_pcm_hw_params_set_rate(pcm, hw, RATE, 0)
+            ret = a.snd_pcm_hw_params(pcm, hw)
+            a.snd_pcm_hw_params_free(hw)
+            if ret < 0:
+                raise OSError('hw_params %d' % ret)
+            a.snd_pcm_sw_params_malloc(ctypes.byref(sw))
+            a.snd_pcm_sw_params_current(pcm, sw)
+            a.snd_pcm_sw_params_get_boundary(sw, ctypes.byref(boundary))
+            a.snd_pcm_sw_params_set_stop_threshold(pcm, sw, boundary)
+            a.snd_pcm_sw_params(pcm, sw)
+            a.snd_pcm_sw_params_free(sw)
+            if a.snd_pcm_prepare(pcm) < 0 or a.snd_pcm_start(pcm) < 0:
+                raise OSError('start')
+        except OSError:
+            a.snd_pcm_close(pcm)
+            raise
+        self.pcms.append(pcm)
+
+    def start(self):
+        self._open(0)	# playback: powers modem DL -> amps, mics -> modem UL
+        self._open(1)	# capture: modem PCM 2 and ADDA capture
+
+    def stop(self):
+        while self.pcms:
+            self.a.snd_pcm_close(self.pcms.pop())
+
+
+def dl_gain(percent):
+    if percent <= 0:
+        return DL_GAIN_MIN
+    return max(DL_GAIN_MIN, min(DL_GAIN_MAX, round(240 * math.log10(percent / 100))))
+
+
+def cget(name):
+    """a control's raw values ('1', 'on,on', ...)"""
+    r = subprocess.run(['amixer', '-c0', 'cget', 'name=%s' % name],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if line.strip().startswith(': values='):
+            return line.split('=', 1)[1]
+    return None
+
+
+def cset(name, value):
+    subprocess.run(['amixer', '-q', '-c0', 'cset', 'name=%s' % name, value], check=False)
+
+
+def usecase(mode):
+    """the amps' tuning deltas (music / handsfree)"""
+    r = subprocess.run([AMP_USECASE, mode], capture_output=True, text=True)
+    if r.returncode:
+        log('amp tuning %s: %s' % (mode, (r.stderr or r.stdout).strip()))
+
+
+class Routes:
+    """the AFE interconnects and output device for a call"""
+    def __init__(self):
+        self.on = ()
+        self.saved = []
+        self.headset = False
+        self.speaker = False
+
+    def start(self, speaker=False, ap=False):
+        """ap: PCM 2 to the AP's memories, the downlink then plays through
+        the default sink (the amps' earpiece / speaker settings as below)"""
+        self.headset = cget('HP Mux') not in (None, '0')
+        self.on = AP_ROUTES if ap else UL_ROUTES + (HP_ROUTES if self.headset else AMP_ROUTES)
+        for r in self.on:
+            cset(r, 'on')
+        self.saved = []
+        if self.headset:
+            log('call audio to headset')
+            return
+        for name, value in EARPIECE:
+            old = cget(name)
+            if old is not None:
+                self.saved.append((name, old))
+        self.output(speaker, force=True)
+
+    def output(self, speaker, force=False):
+        """earpiece or speakerphone (the headset stays)"""
+        if not self.on or self.headset or (speaker == self.speaker and not force):
+            return
+        for name, value in (SPEAKERS if speaker else EARPIECE):
+            cset(name, value)
+        if speaker != self.speaker:
+            usecase('handsfree' if speaker else 'music')
+        self.speaker = speaker
+        log('call audio to', 'speakers' if speaker else 'earpiece')
+
+    def direct(self):
+        """from the AP path to the direct one (the call chain did not come up)"""
+        for r in self.on:
+            cset(r, 'off')
+        self.on = UL_ROUTES + (HP_ROUTES if self.headset else AMP_ROUTES)
+        for r in self.on:
+            cset(r, 'on')
+
+    def stop(self):
+        for r in self.on:
+            cset(r, 'off')
+        for name, value in reversed(self.saved):
+            cset(name, value)
+        if self.speaker:
+            usecase('music')
+        self.on = ()
+        self.saved = []
+        self.speaker = False
+
+
+class Session:
+    """the desktop user's call controls, while speech is on: callaudiod's
+    state (gdbus monitor) and the default sink's volume (pactl subscribe),
+    both run as the user of the graphical session"""
+    def __init__(self, speech):
+        self.speech = speech
+        self.cmd = None
+        self.procs = []
+        self.media = None	# (sink, volume) to restore after the call
+        self.volume = None
+        self.check = 0
+        self.graph = None	# the AP path's call chain (its process)
+        self.rundir = None	# the user's XDG_RUNTIME_DIR
+
+    def user(self):
+        for d in sorted(os.listdir('/run/user')):
+            run = '/run/user/' + d
+            if d.isdigit() and int(d) >= 1000 and os.path.exists(run + '/bus'):
+                pw = pwd.getpwuid(int(d))
+                self.rundir = run
+                return ['setpriv', '--reuid=%d' % pw.pw_uid, '--regid=%d' % pw.pw_gid,
+                        '--clear-groups', 'env', 'HOME=' + pw.pw_dir, 'XDG_RUNTIME_DIR=' + run,
+                        'DBUS_SESSION_BUS_ADDRESS=unix:path=%s/bus' % run]
+        return None
+
+    def run(self, *args):
+        try:
+            return subprocess.run(self.cmd + list(args), capture_output=True,
+                                  text=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log('%s: %s' % (args[0], e))
+            return ''
+
+    def watch(self, args, line):
+        """a long running command, its output lines to line()"""
+        p = subprocess.Popen(self.cmd + args, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+        os.set_blocking(p.stdout.fileno(), False)
+        buf = [b'']
+
+        def readable(fd, cond):
+            try:
+                data = os.read(fd, 4096)
+            except BlockingIOError:
+                return True
+            if not data:
+                p.watch = None
+                return False
+            *lines, buf[0] = (buf[0] + data).split(b'\n')
+            for ln in lines:
+                line(ln.decode(errors='replace'))
+            return True
+        p.watch = GLib.io_add_watch(p.stdout.fileno(), GLib.IO_IN | GLib.IO_HUP, readable)
+        self.procs.append(p)
+
+    def sink_volume(self, sink='@DEFAULT_SINK@', raw=False):
+        """percent (channel average), or each channel's raw volume"""
+        out = self.run('pactl', 'get-sink-volume', sink).split('\n')[0]
+        if raw:
+            return re.findall(r'(\d+) / ', out) or None
+        v = [int(x) for x in re.findall(r'(\d+)%', out)]
+        return sum(v) // len(v) if v else None
+
+    def callaudio(self, text):
+        m = re.search(r"'SpeakerState': <uint32 (\d+)>", text)
+        if m:
+            self.speech.speaker(int(m.group(1)) == 1)
+        m = re.search(r"'MicState': <uint32 (\d+)>", text)
+        if m:
+            self.speech.mute(int(m.group(1)) == 0)
+
+    def pulse_event(self, text):
+        if (' on sink ' in text or ' on server ' in text) and not self.check:
+            self.check = GLib.timeout_add(50, self.volume_changed)
+
+    def volume_changed(self):
+        self.check = 0
+        v = self.sink_volume()
+        if v is not None and v != self.volume:
+            self.volume = v
+            self.speech.volume(dl_gain(v))
+        return False
+
+    def start(self):
+        """before speech on: the speaker, mic and call volume to start with"""
+        self.cmd = self.user()
+        if not self.cmd:
+            return
+        try:
+            self.watch(['gdbus', 'monitor', '--session', '-d', CALLAUDIO[0]], self.callaudio)
+            self.watch(['pactl', 'subscribe'], self.pulse_event)
+        except OSError as e:
+            log('session:', e)
+        self.callaudio(self.run('gdbus', 'call', '--session', '-d', CALLAUDIO[0], '-o',
+                                CALLAUDIO[1], '-m', 'org.freedesktop.DBus.Properties.GetAll',
+                                CALLAUDIO[0]))
+        sink = self.run('pactl', 'get-default-sink').strip()
+        media = self.sink_volume(sink, raw=True) if sink else None
+        self.media = (sink, media) if media else None
+        try:
+            with open(CALL_VOLUME) as f:
+                self.volume = int(f.read())
+        except (OSError, ValueError):
+            self.volume = CALL_VOLUME_DEFAULT
+        if sink:
+            self.run('pactl', 'set-sink-volume', sink, '%d%%' % self.volume)
+        self.speech.volume(dl_gain(self.volume))
+        log('call volume %d%% (media %s)' % (self.volume, media and '/'.join(media)))
+
+    def start_graph(self):
+        """the AP path's call chain, as the user: the modem PCMs as nodes in
+        the sound server (the AFE routes are up: a DPCM front end without a
+        back end cannot be opened), then cezanne-voice's call.conf.in in a
+        PipeWire client, its mic capture linked to the hardware source by
+        hand (WirePlumber would put the mic's noise filter in front of it)"""
+        if not self.cmd:
+            return False
+        mic = self.run('pactl', 'get-default-source').strip()
+        self.destroy_nodes()	# left over from an interrupted call
+        for name, desc, factory, path, ch in (UPLINK, DOWNLINK):
+            props = ('{ factory.name = %s node.name = %s node.description = "%s" '
+                     'api.alsa.path = "%s" audio.rate = %d audio.channels = %d '
+                     'audio.position = %s priority.session = 1 priority.driver = 1 '
+                     'node.latency = 480/%d object.linger = true }'
+                     % (factory, name, desc, path, RATE, ch,
+                        '[ FL FR ]' if ch == 2 else '[ MONO ]', RATE))
+            self.run('pw-cli', 'create-node', 'adapter', props)	# prints nothing
+        ids = self.node_ids()
+        conf = os.path.join(self.rundir, 'cezanne-call.conf')
+        try:
+            with open(CALL_CONF) as f:
+                text = f.read().replace('@UPLINK@', UPLINK[0]).replace('@DOWNLINK@', DOWNLINK[0])
+            with open(conf, 'w') as f:
+                f.write(text)
+            os.chmod(conf, 0o644)
+            proc = subprocess.Popen(self.cmd + ['pipewire', '-c', conf],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            log('call chain:', e)
+            proc = None
+        self.graph = proc
+        linked = False
+        for _ in range(30):	# its ports show up within ~0.2 s
+            ports = self.run('pw-link', '-o').split()
+            inputs = self.run('pw-link', '-i').split()
+            src = [p for p in ports if p.startswith(mic + ':')]
+            if proc and len(ids) == 2 and src and 'cezanne_call.mic:input_FL' in inputs:
+                fl = [p for p in src if p.endswith('_FL')]
+                r = subprocess.run(self.cmd + ['pw-link', (fl or src)[0], 'cezanne_call.mic:input_FL'],
+                                   capture_output=True, text=True, timeout=5)
+                linked = r.returncode == 0
+                break
+            if not proc or proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        if not linked:
+            log('call chain did not come up (mic %r, nodes %s)' % (mic, ids))
+            self.stop_graph()
+            return False
+        log('call chain up: %s -> echo cancelling -> RNNoise -> modem' % (fl or src)[0])
+        return True
+
+    def node_ids(self):
+        """the modem PCMs' nodes in the sound server"""
+        try:
+            objs = json.loads(self.run('pw-dump') or '[]')
+        except ValueError:
+            return []
+        return [str(o['id']) for o in objs
+                if o.get('info', {}).get('props', {}).get('node.name') in (UPLINK[0], DOWNLINK[0])]
+
+    def destroy_nodes(self):
+        for i in self.node_ids():
+            self.run('pw-cli', 'destroy', i)
+
+    def stop_graph(self):
+        proc, self.graph = self.graph, None
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if self.cmd:
+            self.destroy_nodes()
+
+    def stop(self):
+        """after speech off: keep the call volume, the media volume back"""
+        if not self.cmd:
+            return
+        for p in self.procs:
+            if p.watch:
+                GLib.source_remove(p.watch)
+            p.terminate()
+            p.wait()
+            p.stdout.close()
+        self.procs = []
+        if self.check:
+            GLib.source_remove(self.check)
+            self.check = 0
+        try:
+            with open(CALL_VOLUME + '.new', 'w') as f:
+                f.write('%d\n' % self.volume)
+            os.replace(CALL_VOLUME + '.new', CALL_VOLUME)
+        except OSError as e:
+            log('call volume:', e)
+        if self.media:
+            self.run('pactl', 'set-sink-volume', self.media[0], *self.media[1])
+        self.media = None
+        self.cmd = None
+
+
+class Speech:
+    def __init__(self):
+        self.modem = None
+        self.stream = Hostless()
+        self.routes = Routes()
+        self.session = None
+        self.on = False
+        self.dl = 0		# DL gain
+        self.muted = False
+        self.speaker_on = False
+        self.ap = False		# the call runs through the AP (cezanne-voice)
+
+    def open_modem(self):
+        if self.modem:
+            return True
+        try:
+            with open(STATE) as f:
+                if f.read().strip() != 'ready':
+                    return False
+            self.modem = Modem()
+            GLib.io_add_watch(self.modem.fd, GLib.IO_IN, self.readable)
+            log('speech channel open')
+        except OSError as e:
+            log('speech channel:', e)
+            self.modem = None
+        return self.modem is not None
+
+    def readable(self, fd, cond):
+        m = self.modem.receive() if self.modem else None
+        if m:
+            self.modem.handle(m)
+        return True
+
+    def set(self, on, app=0, stream=True):
+        if on == self.on:
+            return
+        if on:
+            if not self.open_modem():
+                log('modem not ready, no call audio')
+                return
+            t0 = time.monotonic()
+            info = sph_info(app)
+            md = self.modem
+            self.dl, self.muted, self.speaker_on = 0, False, False
+            self.ap = stream and AP_PATH and self.session is not None
+            if self.session:
+                self.session.start()
+            # as MIUI: the AFE path first, then speech on
+            if stream:
+                self.routes.start(self.speaker_on, ap=self.ap)
+                try:
+                    self.stream.start()
+                except OSError as e:
+                    log('hostless stream:', e)
+            ok = md.request(MSG_SPH_ON, lambda: md.payload(MSG_SPH_ON, TYPE_SPH_INFO, info))
+            if not OPENDSP:
+                # the modem processes speech itself: its gains and mutes start
+                # muted (the downlink then carries only a -70 dBFS floor), no
+                # parameters for its enhancement yet. Gains and the codec mute
+                # are not acked.
+                md.mailbox(MSG_DL_GAIN, self.dl & 0xffff)
+                md.mailbox(MSG_UL_GAIN, UL_GAIN)
+                md.mailbox(MSG_DL_MUTE_CODEC, 0)
+                md.request(MSG_SPH_ENH, lambda: md.mailbox(MSG_SPH_ENH, ENHANCE))
+                for m in (MSG_DL_MUTE, MSG_DL_MUTE_DYNAMIC, MSG_UL_MUTE, MSG_UL_SOURCE_MUTE):
+                    v = int(self.muted and m == MSG_UL_MUTE)
+                    md.request(m, lambda m=m, v=v: md.mailbox(m, v))
+            md.request(MSG_SPH_INFO, lambda: md.payload(MSG_SPH_INFO, TYPE_SPH_INFO, info))
+            if self.ap and not self.session.start_graph():
+                self.ap = False
+                self.routes.direct()
+                if self.session.volume is not None:
+                    self.volume(dl_gain(self.session.volume))
+            log('speech on (%s, %s path, %.0f ms)' % ('acked' if ok else 'no ack',
+                                                       'AP' if self.ap else 'direct',
+                                                       (time.monotonic() - t0) * 1000))
+        elif self.modem:
+            md = self.modem
+            md.request(MSG_UL_MUTE, lambda: md.mailbox(MSG_UL_MUTE, 1))
+            md.request(MSG_SPH_OFF, lambda: md.mailbox(MSG_SPH_OFF))
+            md.request(MSG_UL_MUTE, lambda: md.mailbox(MSG_UL_MUTE, 0))
+            if self.session:
+                self.session.stop_graph()	# its PCMs before their routes
+            if self.stream.pcms:
+                self.stream.stop()
+            self.routes.stop()
+            if self.session:
+                self.session.stop()
+            self.ap = False
+            log('speech off')
+        self.on = on
+
+    # the user's call controls (Session); before speech on they only set
+    # what it starts with
+    def speaker(self, on):
+        self.speaker_on = on
+        self.routes.output(on)
+
+    def mute(self, muted):
+        if muted != self.muted and self.on and self.modem:
+            md = self.modem
+            md.request(MSG_UL_MUTE, lambda: md.mailbox(MSG_UL_MUTE, int(muted)))
+            log('mic', 'muted' if muted else 'on')
+        self.muted = muted
+
+    def volume(self, gain):
+        """the DL gain for the sink's volume; the AP path keeps 0 dB, the
+        sink's volume works on the downlink itself"""
+        if self.ap:
+            return
+        if gain != self.dl and self.on and self.modem:
+            self.modem.mailbox(MSG_DL_GAIN, gain & 0xffff)
+            log('DL gain %.2f dB' % (gain / 4))
+        self.dl = gain
+
+
+class Calls:
+    """ModemManager's calls (Modem.Voice "Calls", one proxy per call): speech
+    on while one is dialing, alerting, active or held"""
+    def __init__(self, speech):
+        self.speech = speech
+        self.voices = {}	# modem path -> Voice proxy
+        self.calls = {}		# call path -> Call proxy
+        self.om = Gio.DBusObjectManagerClient.new_for_bus_sync(
+            Gio.BusType.SYSTEM, Gio.DBusObjectManagerClientFlags.NONE, MM,
+            '/org/freedesktop/ModemManager1', None, None, None)
+        self.om.connect('object-added', lambda *a: self.sync())
+        self.om.connect('object-removed', lambda *a: self.sync())
+        self.om.connect('notify::name-owner', lambda *a: self.sync())
+        self.sync()
+
+    def sync(self):
+        """track every modem's Voice interface and its calls"""
+        modems = set()
+        for obj in self.om.get_objects():
+            path = obj.get_object_path()
+            if not obj.get_interface(VOICE_IFACE):
+                continue
+            modems.add(path)
+            if path not in self.voices:
+                v = Gio.DBusProxy.new_for_bus_sync(Gio.BusType.SYSTEM, 0, None, MM,
+                                                   path, VOICE_IFACE, None)
+                v.connect('g-signal', lambda *a: self.sync())
+                v.connect('g-properties-changed', lambda *a: self.sync())
+                self.voices[path] = v
+        for path in list(self.voices):
+            if path not in modems:
+                del self.voices[path]
+        paths = set()
+        for v in self.voices.values():
+            calls = v.get_cached_property('Calls')
+            paths.update(calls.unpack() if calls else [])
+        for path in paths - set(self.calls):
+            c = Gio.DBusProxy.new_for_bus_sync(Gio.BusType.SYSTEM, 0, None, MM,
+                                               path, CALL_IFACE, None)
+            c.connect('g-signal', lambda *a: self.update())
+            c.connect('g-properties-changed', lambda *a: self.update())
+            self.calls[path] = c
+        for path in set(self.calls) - paths:
+            del self.calls[path]
+        self.update()
+
+    def update(self):
+        states = []
+        for c in self.calls.values():
+            v = c.get_cached_property('State')
+            states.append(v.unpack() if v else 0)
+        if verbose:
+            log('call states', states)
+        self.speech.set(any(s in SPEECH_STATES for s in states))
+
+
+def main():
+    global verbose
+    ap = argparse.ArgumentParser()
+    ap.add_argument('-v', action='store_true')
+    ap.add_argument('--loopback', type=float, metavar='SECONDS')
+    ap.add_argument('--no-stream', action='store_true')
+    ap.add_argument('--alive-ack', action='store_true',
+                    help='answer a modem "alive" that came before we listened')
+    a = ap.parse_args()
+    verbose = a.v
+    speech = Speech()
+    if not speech.open_modem():
+        sys.exit('modem not ready')
+    if a.alive_ack:
+        speech.modem.mailbox(MSG_MD_ALIVE_ACK)
+    if a.loopback:
+        speech.set(True, app=2, stream=not a.no_stream)
+        time.sleep(a.loopback)
+        speech.set(False)
+        return
+    speech.session = Session(speech)
+    Calls(speech)
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    finally:
+        if speech.on:
+            speech.set(False)
+
+
+main()

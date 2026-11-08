@@ -1,0 +1,45 @@
+# Remote control app for the Redmi K30 Ultra (cezanne) IR blaster (gpio-ir-tx,
+# /dev/lirc0): TVs by brand and air conditioners, with IRext's open codes
+# (https://github.com/irext, MIT). The IRext decoder is built as a library
+# (AC codes depend on the whole state); the TV codes and AC protocol binaries
+# go into remotes.db (build-db.py).
+pkgname=cezanne-remote
+pkgver=1.1
+pkgrel=1
+pkgdesc="IR remote control for TVs and air conditioners (cezanne IR blaster, IRext codes)"
+arch=(aarch64)
+url="https://github.com/irext"
+license=(MIT)
+depends=(python python-gobject gtk4 libadwaita)
+makedepends=(gcc python)
+_core=ebf8360d94767b17a1f0ea91366b071ac18d71e2	# irext/core, 2026-10-02
+_db=fb3b471d73e118463cf609e096188f837fa8d684	# irext/database, 2026-10-02 (Git LFS files)
+source=("irext-core-$_core.tar.gz::https://github.com/irext/core/archive/$_core.tar.gz"
+        "irext_db_20260929_sqlite3.db::https://media.githubusercontent.com/media/irext/database/$_db/db/irext_db_20260929_sqlite3.db"
+        "irext-binaries_20260929.zip::https://media.githubusercontent.com/media/irext/database/$_db/binaries/irext-binaries_20260929.zip"
+        cezanne-remote
+        build-db.py
+        org.cezanne.Remote.desktop
+        org.cezanne.Remote.svg)
+noextract=(irext-binaries_20260929.zip)
+sha256sums=('bcb5b73d04d3bb059dc7d2292439437396c2fc8154dc9b2fa5e35f9edee9383a'
+            'fc9507bb6a0bd65fb7d407b7a65287e66ccaa00f80067ae9cc7a425cdfaca571'
+            '2dccd7c5fdc09d68eda10e864f1dc9da16c6b0e79402b665440f3edd39e89f79'
+            SKIP SKIP SKIP SKIP)
+
+build() {
+  # BOARD_PC_DLL: the library without the decoder's debug printing
+  local d="core-$_core/decoder/src"
+  gcc $CFLAGS $LDFLAGS -fPIC -shared -w -DBOARD_PC_DLL -DPLATFORM_LINUX -I"$d/include" \
+    -o libirdecode.so "$d"/ir_ac_*.c "$d"/ir_decode.c "$d"/ir_tv_control.c "$d"/ir_utils.c
+  python build-db.py irext_db_20260929_sqlite3.db irext-binaries_20260929.zip remotes.db
+}
+
+package() {
+  install -Dm755 cezanne-remote "$pkgdir/usr/bin/cezanne-remote"
+  install -Dm755 libirdecode.so "$pkgdir/usr/lib/cezanne-remote/libirdecode.so"
+  install -Dm644 remotes.db "$pkgdir/usr/share/cezanne-remote/remotes.db"
+  install -Dm644 org.cezanne.Remote.desktop "$pkgdir/usr/share/applications/org.cezanne.Remote.desktop"
+  install -Dm644 org.cezanne.Remote.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.cezanne.Remote.svg"
+  install -Dm644 "core-$_core/LICENSE.txt" "$pkgdir/usr/share/licenses/$pkgname/IRext-LICENSE"
+}

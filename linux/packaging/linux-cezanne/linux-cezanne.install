@@ -1,0 +1,11 @@
+_depmod() {
+  local d
+  # skip trees without pkgbase (a replaced kernel's leftovers: -cezanne9
+  # sorts after -cezanne10, its failed test was the scriptlet's status)
+  for d in /usr/lib/modules/*-cezanne*; do
+    [ -f "$d/pkgbase" ] || continue
+    depmod "${d##*/}"
+  done
+}
+post_install() { _depmod; }
+post_upgrade() { _depmod; }

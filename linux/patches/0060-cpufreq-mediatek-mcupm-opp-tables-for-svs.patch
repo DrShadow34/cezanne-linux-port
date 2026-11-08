@@ -1,0 +1,374 @@
+diff --git a/drivers/cpufreq/mediatek-cpufreq-mcupm.c b/drivers/cpufreq/mediatek-cpufreq-mcupm.c
+index 609df4507..6f1e4fae0 100644
+--- a/drivers/cpufreq/mediatek-cpufreq-mcupm.c
++++ b/drivers/cpufreq/mediatek-cpufreq-mcupm.c
+@@ -11,6 +11,10 @@
+  *   drivers/misc/mediatek/base/power/cpufreq_v1/src/mtk_cpufreq_hybrid.c
+  *   drivers/misc/mediatek/mcupm/mt6885/mcupm_ipi_table.h, drivers/rpmsg/mtk_rpmsg.c
+  * Only CPU_LEVEL_2 tables (efuse bin 0x10, 2.6 GHz big cores) are included.
++ *
++ * The OPPs are also registered as dynamic OPP tables on cpu0 (LL), cpu4 (L)
++ * and the "cci" device for the SVS (EEM) driver: voltage adjustments go to
++ * the CSRAM table, disabled OPPs pin a cluster (SVS init01 at Vboot).
+  */
+ #include <linux/cpufreq.h>
+ #include <linux/cpu.h>
+@@ -21,7 +25,9 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_opp.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/spinlock.h>
+ 
+ #include "mediatek-cpufreq-mcupm-mt6885.h"
+ 
+@@ -29,6 +35,8 @@
+ #define CSRAM_SIZE		0x1400
+ #define OFFS_TBL_S		0x0010
+ #define OFFS_DATA_S		0x02a0
++#define OFFS_CCI_VOLT_CLAMP	0x024c
++#define OFFS_EEM_S		0x0300
+ #define OFFS_PPM_LIMIT_S	0x0320
+ #define OFFS_CUR_FREQ_S		0x0354
+ #define OFFS_WFI_S		0x037c
+@@ -53,7 +61,20 @@
+ 
+ #define NR_FREQ			16
+ #define NR_DVFS_CLUSTERS	3	/* LL, L, CCI */
++#define CLUSTER_CCI		2
+ #define CPU_LEVEL		2
++#define VPROC_STEP_UV		6250
++#define VPROC_MIN		96	/* 0.6 V, the EEM VMIN */
++
++struct mcupm_cpufreq;
++
++/* OPP table of one DVFS cluster, for the SVS driver */
++struct mcupm_opp_dev {
++	struct mcupm_cpufreq *m;
++	struct device *dev;
++	struct notifier_block nb;
++	int c;
++};
+ 
+ struct mcupm_cpufreq {
+ 	struct device *dev;
+@@ -62,6 +83,11 @@ struct mcupm_cpufreq {
+ 	void __iomem *mbox_sram;
+ 	struct regulator *proc[2], *sram[2];	/* [0] = LL/CCI, [1] = L */
+ 	struct cpufreq_frequency_table table[2][NR_FREQ + 1];
++	struct mcupm_opp_dev opp[NR_DVFS_CLUSTERS];
++	u16 vproc[NR_DVFS_CLUSTERS][NR_FREQ];	/* current Vproc codes */
++	u32 disabled[NR_DVFS_CLUSTERS];		/* OPPs disabled in the OPP table */
++	u32 req[2];				/* last requested LL / L OPP */
++	spinlock_t lock;
+ };
+ 
+ static struct mcupm_cpufreq *mcf;
+@@ -109,7 +135,7 @@ static void mcupm_write_tables(struct mcupm_cpufreq *m)
+ 			const u16 *e = mt6885_lv2_pvt[c * NR_FREQ + i];
+ 
+ 			/* [31:16] Vproc, [15:0] MHz;  [31:16] clk_div, [15:0] post_div */
+-			writel((e[1] & 0xfff) << 16 | e[0], &tbl[c * 36 + i]);
++			writel((m->vproc[c][i] & 0xfff) << 16 | e[0], &tbl[c * 36 + i]);
+ 			writel((e[3] & 0xff) << 16 | (e[2] & 0xff), &tbl[c * 36 + NR_FREQ + i]);
+ 		}
+ 		writel(~0U, &tbl[c * 36 + 2 * NR_FREQ]);
+@@ -170,13 +196,40 @@ static unsigned int mcupm_cpufreq_get(unsigned int cpu)
+ 	return mt6885_lv2_pvt[c * NR_FREQ + idx][0] * 1000;
+ }
+ 
+-static int mcupm_cpufreq_target_index(struct cpufreq_policy *policy, unsigned int index)
++/* the nearest OPP to idx that is enabled in the OPP table, slower ones first */
++static u32 mcupm_allowed_opp(struct mcupm_cpufreq *m, int c, u32 idx)
++{
++	u32 en = ~m->disabled[c] & GENMASK(NR_FREQ - 1, 0);
++	u32 d;
++
++	if (!en || en & BIT(idx))
++		return idx;
++	for (d = 1; d < NR_FREQ; d++) {
++		if (idx + d < NR_FREQ && en & BIT(idx + d))
++			return idx + d;
++		if (idx >= d && en & BIT(idx - d))
++			return idx - d;
++	}
++	return idx;
++}
++
++static u32 mcupm_set_opp(struct mcupm_cpufreq *m, int c, u32 idx)
+ {
+-	int c = mcupm_cpu_cluster(policy->cpu);
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&m->lock, flags);
++	m->req[c] = idx;
++	idx = mcupm_allowed_opp(m, c, idx);
+ 	/* cpuhvfs_set_dvfs(): [3:0] OPP index */
+-	writel(policy->freq_table[index].driver_data,
+-	       mcf->csram + OFFS_WFI_S + 4 * c);
++	writel(idx, m->csram + OFFS_WFI_S + 4 * c);
++	spin_unlock_irqrestore(&m->lock, flags);
++	return idx;
++}
++
++static int mcupm_cpufreq_target_index(struct cpufreq_policy *policy, unsigned int index)
++{
++	mcupm_set_opp(mcf, mcupm_cpu_cluster(policy->cpu),
++		      policy->freq_table[index].driver_data);
+ 	return 0;
+ }
+ 
+@@ -185,10 +238,158 @@ static unsigned int mcupm_cpufreq_fast_switch(struct cpufreq_policy *policy,
+ {
+ 	unsigned int index = cpufreq_table_find_index_dl(policy, target_freq, false);
+ 
+-	mcupm_cpufreq_target_index(policy, index);
++	index = mcupm_set_opp(mcf, mcupm_cpu_cluster(policy->cpu),
++			      policy->freq_table[index].driver_data);
+ 	return policy->freq_table[index].frequency;
+ }
+ 
++/* cpuhvfs_update_volt(): new Vproc in the OPP's entry, then the cluster's EEM flag */
++static void mcupm_update_volt(struct mcupm_cpufreq *m, int c, int i, unsigned long uV)
++{
++	u32 __iomem *tbl = m->csram + OFFS_TBL_S;
++	const u16 *e = mt6885_lv2_pvt[c * NR_FREQ + i];
++	/* never above the signoff table */
++	u16 code = clamp_t(u16, DIV_ROUND_UP(uV, VPROC_STEP_UV), VPROC_MIN, e[1]);
++
++	if (code == m->vproc[c][i])
++		return;
++	m->vproc[c][i] = code;
++	writel((code & 0xfff) << 16 | e[0], &tbl[c * 36 + i]);
++	writel(1, m->csram + OFFS_EEM_S + 4 * c);
++}
++
++/*
++ * SVS init01 reads the buck right after pinning an OPP: wait until MCUPM has
++ * ramped it (it reports the new OPP index before the voltage settles).
++ */
++static void mcupm_wait_vproc(struct mcupm_cpufreq *m, int r, int uV)
++{
++	int v;
++
++	if (read_poll_timeout(regulator_get_voltage, v, v == uV, 100, 50000, false,
++			      m->proc[r]))
++		dev_warn(m->dev, "Vproc %d: %d uV, not %d uV\n", r, v, uV);
++}
++
++/* OPPs were enabled or disabled: move the cluster to an allowed OPP */
++static void mcupm_restrict(struct mcupm_cpufreq *m, int c)
++{
++	u32 en = ~m->disabled[c] & GENMASK(NR_FREQ - 1, 0), idx, cur;
++	bool pinned = hweight32(en) == 1;
++
++	if (c == CLUSTER_CCI) {
++		/*
++		 * MCUPM moves the CCI with the clusters (CCI map); while OPPs
++		 * are disabled, clamp the CCI voltage to the fastest one left
++		 * (mt_cpufreq_ctrl_cci_volt(), 10 uV units). The CCI shares
++		 * the LL buck and is pinned last.
++		 */
++		writel(m->disabled[c] && en ? m->vproc[c][__ffs(en)] * 625 : 0,
++		       m->csram + OFFS_CCI_VOLT_CLAMP);
++		if (pinned)
++			mcupm_wait_vproc(m, 0, m->vproc[c][__ffs(en)] * VPROC_STEP_UV);
++		return;
++	}
++
++	idx = mcupm_set_opp(m, c, m->req[c]);
++	if (!pinned)
++		return;
++	if (readl_poll_timeout(m->csram + OFFS_CUR_FREQ_S + 4 * c, cur, cur == idx,
++			       100, 100000))
++		dev_warn(m->dev, "cluster %d: OPP %u not reached (at %u)\n", c, idx, cur);
++	else if (c == 1)
++		mcupm_wait_vproc(m, 1, m->vproc[c][idx] * VPROC_STEP_UV);
++}
++
++static int mcupm_opp_notify(struct notifier_block *nb, unsigned long event, void *data)
++{
++	struct mcupm_opp_dev *od = container_of(nb, struct mcupm_opp_dev, nb);
++	struct mcupm_cpufreq *m = od->m;
++	unsigned long mhz = dev_pm_opp_get_freq(data) / 1000000;
++	unsigned long flags;
++	int c = od->c, i;
++
++	for (i = 0; i < NR_FREQ; i++)
++		if (mt6885_lv2_pvt[c * NR_FREQ + i][0] == mhz)
++			break;
++	if (i == NR_FREQ)
++		return NOTIFY_DONE;
++
++	switch (event) {
++	case OPP_EVENT_ADJUST_VOLTAGE:
++		mcupm_update_volt(m, c, i, dev_pm_opp_get_voltage(data));
++		break;
++	case OPP_EVENT_ENABLE:
++	case OPP_EVENT_DISABLE:
++		spin_lock_irqsave(&m->lock, flags);
++		if (event == OPP_EVENT_DISABLE)
++			m->disabled[c] |= BIT(i);
++		else
++			m->disabled[c] &= ~BIT(i);
++		spin_unlock_irqrestore(&m->lock, flags);
++		mcupm_restrict(m, c);
++		break;
++	default:
++		return NOTIFY_DONE;
++	}
++	return NOTIFY_OK;
++}
++
++static int mcupm_add_opps(struct mcupm_cpufreq *m, struct device *dev, int c)
++{
++	struct mcupm_opp_dev *od = &m->opp[c];
++	int i, ret;
++
++	for (i = 0; i < NR_FREQ; i++) {
++		const u16 *e = mt6885_lv2_pvt[c * NR_FREQ + i];
++
++		ret = dev_pm_opp_add(dev, e[0] * 1000000UL, e[1] * VPROC_STEP_UV);
++		if (ret)
++			goto err;
++	}
++
++	od->m = m;
++	od->dev = dev;
++	od->c = c;
++	od->nb.notifier_call = mcupm_opp_notify;
++	ret = dev_pm_opp_register_notifier(dev, &od->nb);
++	if (ret)
++		goto err;
++	return 0;
++
++err:
++	dev_pm_opp_remove_all_dynamic(dev);
++	return ret;
++}
++
++static void mcupm_remove_opps(struct mcupm_cpufreq *m, int c)
++{
++	struct mcupm_opp_dev *od = &m->opp[c];
++
++	if (!od->dev)
++		return;
++	dev_pm_opp_unregister_notifier(od->dev, &od->nb);
++	dev_pm_opp_remove_all_dynamic(od->dev);
++	od->dev = NULL;
++}
++
++static int mcupm_add_cpu_opps(struct mcupm_cpufreq *m, int c)
++{
++	struct device *cpu_dev = get_cpu_device(c ? 4 : 0);
++	struct cpumask cpus;
++	int cpu, ret;
++
++	ret = mcupm_add_opps(m, cpu_dev, c);
++	if (ret)
++		return ret;
++
++	cpumask_clear(&cpus);
++	for_each_possible_cpu(cpu)
++		if (mcupm_cpu_cluster(cpu) == c)
++			cpumask_set_cpu(cpu, &cpus);
++	return dev_pm_opp_set_sharing_cpus(cpu_dev, &cpus);
++}
++
+ static int mcupm_cpufreq_init(struct cpufreq_policy *policy)
+ {
+ 	int c = mcupm_cpu_cluster(policy->cpu), cpu;
+@@ -268,6 +469,7 @@ static int mcupm_cpufreq_probe(struct platform_device *pdev)
+ 	if (!m)
+ 		return -ENOMEM;
+ 	m->dev = dev;
++	spin_lock_init(&m->lock);
+ 	m->csram = devm_platform_ioremap_resource_byname(pdev, "csram");
+ 	if (IS_ERR(m->csram))
+ 		return PTR_ERR(m->csram);
+@@ -293,6 +495,9 @@ static int mcupm_cpufreq_probe(struct platform_device *pdev)
+ 		}
+ 		m->table[c][NR_FREQ].frequency = CPUFREQ_TABLE_END;
+ 	}
++	for (c = 0; c < NR_DVFS_CLUSTERS; c++)
++		for (i = 0; i < NR_FREQ; i++)
++			m->vproc[c][i] = mt6885_lv2_pvt[c * NR_FREQ + i][1];
+ 
+ 	ret = mcupm_dvfs_start(m);
+ 	if (ret)
+@@ -304,6 +509,11 @@ static int mcupm_cpufreq_probe(struct platform_device *pdev)
+ 		mcf = NULL;
+ 		return ret;
+ 	}
++	for (c = 0; c < 2; c++) {
++		ret = mcupm_add_cpu_opps(m, c);
++		if (ret)
++			dev_warn(dev, "cluster %d: no OPP table for SVS: %d\n", c, ret);
++	}
+ 	dev_info(dev, "MCUPM CPU DVFS: LL %u-%u MHz, L %u-%u MHz\n",
+ 		 mt6885_lv2_pvt[15][0], mt6885_lv2_pvt[0][0],
+ 		 mt6885_lv2_pvt[31][0], mt6885_lv2_pvt[16][0]);
+@@ -312,6 +522,8 @@ static int mcupm_cpufreq_probe(struct platform_device *pdev)
+ 
+ static void mcupm_cpufreq_remove(struct platform_device *pdev)
+ {
++	mcupm_remove_opps(mcf, 0);
++	mcupm_remove_opps(mcf, 1);
+ 	cpufreq_unregister_driver(&mcupm_cpufreq_driver);
+ 	mcf = NULL;
+ }
+@@ -330,7 +542,52 @@ static struct platform_driver mcupm_cpufreq_platdrv = {
+ 		.of_match_table = mcupm_cpufreq_of_match,
+ 	},
+ };
+-module_platform_driver(mcupm_cpufreq_platdrv);
++
++/* The CCI has no Linux DVFS, the device only carries its OPP table for SVS */
++static int mcupm_cci_probe(struct platform_device *pdev)
++{
++	if (!mcf)
++		return -EPROBE_DEFER;
++	return mcupm_add_opps(mcf, &pdev->dev, CLUSTER_CCI);
++}
++
++static void mcupm_cci_remove(struct platform_device *pdev)
++{
++	if (mcf)
++		mcupm_remove_opps(mcf, CLUSTER_CCI);
++}
++
++static const struct of_device_id mcupm_cci_of_match[] = {
++	{ .compatible = "mediatek,mt6885-cci" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mcupm_cci_of_match);
++
++static struct platform_driver mcupm_cci_platdrv = {
++	.probe	= mcupm_cci_probe,
++	.remove	= mcupm_cci_remove,
++	.driver	= {
++		.name = "mediatek-cci-mcupm",
++		.of_match_table = mcupm_cci_of_match,
++	},
++};
++
++static struct platform_driver * const mcupm_platdrvs[] = {
++	&mcupm_cpufreq_platdrv,
++	&mcupm_cci_platdrv,
++};
++
++static int __init mcupm_cpufreq_module_init(void)
++{
++	return platform_register_drivers(mcupm_platdrvs, ARRAY_SIZE(mcupm_platdrvs));
++}
++module_init(mcupm_cpufreq_module_init);
++
++static void __exit mcupm_cpufreq_module_exit(void)
++{
++	platform_unregister_drivers(mcupm_platdrvs, ARRAY_SIZE(mcupm_platdrvs));
++}
++module_exit(mcupm_cpufreq_module_exit);
+ 
+ MODULE_DESCRIPTION("MediaTek MT6885 MCUPM CPU DVFS driver");
+ MODULE_LICENSE("GPL");

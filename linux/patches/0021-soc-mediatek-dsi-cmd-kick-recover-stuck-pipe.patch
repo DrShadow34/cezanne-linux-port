@@ -1,0 +1,110 @@
+diff --git a/drivers/soc/mediatek/mtk-dsi-cmd-kick.c b/drivers/soc/mediatek/mtk-dsi-cmd-kick.c
+index a67cbe185..20b7bb5c0 100644
+--- a/drivers/soc/mediatek/mtk-dsi-cmd-kick.c
++++ b/drivers/soc/mediatek/mtk-dsi-cmd-kick.c
+@@ -32,6 +32,8 @@
+ 
+ #define DSI_START		0x000
+ #define DSI_INTSTA		0x00c
++#define DSI_CON_CTRL		0x010
++#define DSI_RESET		BIT(0)
+ #define DSI_CMD_DONE		BIT(1)
+ #define DSI_TE_RDY		BIT(2)
+ #define DSI_BUSY		BIT(31)
+@@ -87,6 +89,7 @@ static void rdma_cmd_mode_fifo(void __iomem *rdma)
+ #define OVL_L_CON(n)		(0x30 + 0x20 * (n))
+ #define OVL_L_ADDR(n)		(0xf40 + 0x20 * (n))
+ #define OVL_CON_AEN		BIT(8)
++#define OVL_RST			0x014
+ 
+ struct dsi_cmd_kick {
+ 	struct device *dev;
+@@ -94,6 +97,7 @@ struct dsi_cmd_kick {
+ 	void __iomem *dsi;
+ 	void __iomem *mmsys;
+ 	void __iomem *ovl[2];		/* both pipes, for scanout address flips */
++	void __iomem *ovl_all[4];	/* OVL + OVL_2L of both pipes, for recovery */
+ 	u32 ovl_layer;
+ 	u32 half_width_bytes;
+ 	u32 mutex_id;
+@@ -104,11 +108,36 @@ struct dsi_cmd_kick {
+ 	unsigned long waits;
+ 	unsigned long timeouts;
+ 	unsigned long te_timeouts;
++	unsigned long recoveries;
+ };
+ 
+ /* one panel per board; simpledrm has no handle to us */
+ static struct dsi_cmd_kick *kick;
+ 
++/*
++ * Under heavy CPU/memory load (e.g. a parallel compile) the overlay engines
++ * can stop mid-frame waiting for memory and never finish: DSI stays busy and
++ * the panel keeps showing the last frame.  Resetting the four OVL engines and
++ * the DSI engine (their configuration survives) gets frames going again.
++ */
++static void dsi_recover(struct dsi_cmd_kick *k)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(k->ovl_all); i++) {
++		if (!k->ovl_all[i])
++			continue;
++		writel(1, k->ovl_all[i] + OVL_RST);
++		writel(0, k->ovl_all[i] + OVL_RST);
++	}
++	writel(readl(k->dsi + DSI_CON_CTRL) | DSI_RESET, k->dsi + DSI_CON_CTRL);
++	writel(readl(k->dsi + DSI_CON_CTRL) & ~DSI_RESET, k->dsi + DSI_CON_CTRL);
++	writel(0, k->dsi + DSI_INTSTA);
++	k->recoveries++;
++	dev_warn_ratelimited(k->dev, "display pipe stuck, reset OVL + DSI (%lu)\n",
++			     k->recoveries);
++}
++
+ static void dsi_wait_idle(struct dsi_cmd_kick *k)
+ {
+ 	u32 val;
+@@ -116,8 +145,10 @@ static void dsi_wait_idle(struct dsi_cmd_kick *k)
+ 	if (!(readl(k->dsi + DSI_INTSTA) & DSI_BUSY))
+ 		return;
+ 	k->waits++;
+-	if (readl_poll_timeout(k->dsi + DSI_INTSTA, val, !(val & DSI_BUSY), 50, 50000))
++	if (readl_poll_timeout(k->dsi + DSI_INTSTA, val, !(val & DSI_BUSY), 50, 50000)) {
+ 		k->timeouts++;
++		dsi_recover(k);
++	}
+ }
+ 
+ void mtk_dsi_cmd_kick_begin(bool wait_idle)
+@@ -274,8 +305,8 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
+ {
+ 	struct dsi_cmd_kick *k = dev_get_drvdata(dev);
+ 
+-	return sysfs_emit(buf, "frames %lu waits %lu timeouts %lu te_timeouts %lu\n",
+-			  k->frames, k->waits, k->timeouts, k->te_timeouts);
++	return sysfs_emit(buf, "frames %lu waits %lu timeouts %lu te_timeouts %lu recoveries %lu\n",
++			  k->frames, k->waits, k->timeouts, k->te_timeouts, k->recoveries);
+ }
+ static DEVICE_ATTR_RO(stats);
+ 
+@@ -332,6 +363,20 @@ static int dsi_cmd_kick_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	/* overlay engines to reset when the pipe gets stuck */
++	{
++		static const char * const names[] = { "ovl0", "ovl1", "ovl0_2l", "ovl1_2l" };
++
++		for (i = 0; i < ARRAY_SIZE(names); i++) {
++			struct resource *res;
++
++			res = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);
++			if (res)
++				k->ovl_all[i] = devm_ioremap(dev, res->start,
++							     resource_size(res));
++		}
++	}
++
+ 	/* pipe 1 RDMA gets the thresholds lk set up for pipe 0 */
+ 	{
+ 		struct resource *r0, *r1;

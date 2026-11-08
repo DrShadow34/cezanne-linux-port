@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Battery use while the phone is locked, for the cezanne-power app.
+
+Each lock of the seat0 session (logind LockedHint) starts a period, the
+unlock ends it. A period records the gauge's charge counter (the MT6359
+coulomb counter, which counts through suspend), real time, time awake
+(CLOCK_MONOTONIC stops in suspend, CLOCK_BOOTTIME does not) and the number
+of suspends. The gauge driver updates the counter every 10 s in freezable
+work, so both ends wait for a fresh value. Periods appear in
+$STATE_DIRECTORY/standby.json (world-readable), newest last.
+"""
+import json
+import os
+import time
+
+from gi.repository import Gio, GLib
+
+STATE_DIR = os.environ.get('STATE_DIRECTORY', '/var/lib/cezanne-power')
+LOG = os.path.join(STATE_DIR, 'standby.json')
+BATTERY = '/sys/class/power_supply/battery'
+SUSPENDS = '/sys/power/suspend_stats/success'
+LOGIN1 = 'org.freedesktop.login1'
+SESSION_IFACE = 'org.freedesktop.login1.Session'
+PROPS_IFACE = 'org.freedesktop.DBus.Properties'
+FRESH_WAIT_S = 12	# the counter changes at least every 10 s awake
+MIN_PERIOD_S = 120
+KEEP = 200
+
+
+def read(path, fallback=''):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return fallback
+
+
+def read_int(path):
+    try:
+        return int(read(path))
+    except ValueError:
+        return None
+
+
+def plugged():
+    """a charger or cable present (any USB / AC supply online)"""
+    ps = '/sys/class/power_supply'
+    for name in os.listdir(ps):
+        if read(os.path.join(ps, name, 'type')) in ('USB', 'Mains') and \
+                read(os.path.join(ps, name, 'online'), '0') not in ('', '0'):
+            return True
+    return read(os.path.join(BATTERY, 'status')) not in ('Discharging', 'Not charging')
+
+
+def clocks():
+    return {
+        'time': time.time(),
+        'boot': time.clock_gettime(time.CLOCK_BOOTTIME),
+        'mono': time.clock_gettime(time.CLOCK_MONOTONIC),
+        'suspends': read_int(SUSPENDS) or 0,
+    }
+
+
+class StandbyLog:
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        self.period = None	# open period: start sample + 'plugged'
+        self.waiting = 0	# GLib source of a pending fresh-counter wait
+        self.bus.signal_subscribe(
+            LOGIN1, PROPS_IFACE, 'PropertiesChanged', None, SESSION_IFACE,
+            Gio.DBusSignalFlags.NONE, self.on_props)
+        path = self.active_session()
+        if path and self.session_prop(path, 'LockedHint'):
+            self.begin()
+
+    def call(self, path, iface, method, args, reply):
+        return self.bus.call_sync(LOGIN1, path, iface, method, args,
+                                  GLib.VariantType(reply) if reply else None,
+                                  Gio.DBusCallFlags.NONE, -1, None)
+
+    def active_session(self):
+        try:
+            v = self.call('/org/freedesktop/login1/seat/seat0', PROPS_IFACE, 'Get',
+                          GLib.Variant('(ss)', ('org.freedesktop.login1.Seat',
+                                                'ActiveSession')), '(v)')
+            return v.unpack()[0][1]
+        except GLib.Error:
+            return None
+
+    def session_prop(self, path, prop):
+        try:
+            v = self.call(path, PROPS_IFACE, 'Get',
+                          GLib.Variant('(ss)', (SESSION_IFACE, prop)), '(v)')
+            return v.unpack()[0]
+        except GLib.Error:
+            return None
+
+    def on_props(self, _conn, _sender, path, _iface, _signal, params):
+        _iface_name, changed, _invalid = params.unpack()
+        if 'LockedHint' not in changed or path != self.active_session():
+            return
+        if changed['LockedHint']:
+            self.begin()
+        else:
+            self.end()
+
+    def fresh(self, then):
+        """call then(counter, clocks) once the counter has changed"""
+        if self.waiting:
+            GLib.source_remove(self.waiting)
+        last = read_int(os.path.join(BATTERY, 'charge_counter'))
+        deadline = time.clock_gettime(time.CLOCK_MONOTONIC) + FRESH_WAIT_S
+
+        def poll():
+            c = read_int(os.path.join(BATTERY, 'charge_counter'))
+            if c != last or time.clock_gettime(time.CLOCK_MONOTONIC) > deadline:
+                self.waiting = 0
+                then(c, clocks())
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+        self.waiting = GLib.timeout_add(500, poll)
+
+    def begin(self):
+        self.period = {'pending': True, 'plugged': plugged()}
+        period = self.period
+
+        def start(counter, c):
+            if self.period is period and counter is not None:
+                period.update(c, counter=counter, pending=False)
+        self.fresh(start)
+
+    def end(self):
+        period, self.period = self.period, None
+        if not period:
+            return
+        if period['pending']:	# unlocked within the start wait
+            if self.waiting:
+                GLib.source_remove(self.waiting)
+                self.waiting = 0
+            return
+
+        def stop(counter, c):
+            if counter is None:
+                return
+            seconds = c['time'] - period['time']
+            if seconds < MIN_PERIOD_S:
+                return
+            uah = period['counter'] - counter
+            awake = c['mono'] - period['mono']
+            self.append({
+                'start': round(period['time']),
+                'end': round(c['time']),
+                'seconds': round(seconds),
+                'asleep': round(max(0.0, c['boot'] - period['boot'] - awake)),
+                'uah': uah,
+                'ma': round(uah * 3.6 / seconds, 1),
+                'suspends': c['suspends'] - period['suspends'],
+                'plugged': period['plugged'] or plugged() or uah <= 0,
+            })
+        self.fresh(stop)
+
+    def append(self, entry):
+        try:
+            with open(LOG) as f:
+                log = json.load(f)
+        except (OSError, ValueError):
+            log = []
+        log = (log + [entry])[-KEEP:]
+        tmp = LOG + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(log, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, LOG)
+
+
+if __name__ == '__main__':
+    os.makedirs(STATE_DIR, exist_ok=True)
+    StandbyLog()
+    GLib.MainLoop().run()

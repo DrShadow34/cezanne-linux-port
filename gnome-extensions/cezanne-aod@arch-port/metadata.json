@@ -1,0 +1,7 @@
+{
+  "uuid": "cezanne-aod@arch-port",
+  "name": "Cezanne AOD",
+  "description": "Always-on display for the cezanne panel: a clock in the panel's doze mode while suspended, updated every minute.",
+  "shell-version": ["51"],
+  "session-modes": ["user", "unlock-dialog"]
+}

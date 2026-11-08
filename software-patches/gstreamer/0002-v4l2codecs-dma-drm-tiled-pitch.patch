@@ -1,0 +1,50 @@
+From: cezanne port
+Subject: [PATCH] v4l2codecs: DRM byte pitches in the VideoMeta of tiled DMA_DRM buffers
+
+With DMA_DRM caps the pool's buffers carry the driver's layout in their
+GstVideoMeta, and DMA_DRM consumers use the meta strides as the DRM plane
+pitches (gtkgstsink passes them to EGL / Vulkan as the dmabuf pitch). For
+tiled formats (MediaTek MM21 = NV12_16L32S with
+DRM_FORMAT_MOD_MTK_16L_32S_TILE) GstVideoInfo stores the stride packed as
+tile counts (GST_VIDEO_TILE_MAKE_STRIDE: y_tiles << 16 | x_tiles), so a
+1280x720 frame was imported with a 0x170050 (1507408) byte pitch: Mesa's
+panfrost detiled the first tile row and read zeros below it, and GTK
+showed the video green. Convert the meta strides of tiled DMA_DRM buffers
+to bytes; the GstVideoInfo (used by the element's own copies) keeps the
+tile encoding.
+---
+ sys/v4l2codecs/gstv4l2codecpool.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+--- a/sys/v4l2codecs/gstv4l2codecpool.c
++++ b/sys/v4l2codecs/gstv4l2codecpool.c
+@@ -51,8 +51,10 @@
+     GstBufferPoolAcquireParams * params)
+ {
+   GstV4l2CodecPool *self = GST_V4L2_CODEC_POOL (pool);
++  const GstVideoFormatInfo *finfo;
+   GstBuffer *buf;
+   GstVideoMeta *vmeta;
++  guint i;
+ 
+   /* A GstVideoInfo must be set before buffer can be acquired */
+   g_return_val_if_fail (self->vinfo_drm, GST_FLOW_ERROR);
+@@ -93,6 +95,18 @@
+   memcpy (vmeta->offset, self->vinfo_drm->vinfo.offset, sizeof (vmeta->offset));
+   memcpy (vmeta->stride, self->vinfo_drm->vinfo.stride, sizeof (vmeta->stride));
+ 
++  /* DMA_DRM consumers (gtkgstsink, EGL / Vulkan dmabuf imports) take the
++   * meta strides as the DRM plane pitches, but GstVideoInfo keeps a tiled
++   * format's strides as packed tile counts (GST_VIDEO_TILE_MAKE_STRIDE):
++   * hand them the pitch in bytes, tile columns times a tile row. */
++  finfo = self->vinfo_drm->vinfo.finfo;
++  if (self->vinfo_drm->drm_fourcc /* != DRM_FORMAT_INVALID */  &&
++      GST_VIDEO_FORMAT_INFO_IS_TILED (finfo)) {
++    for (i = 0; i < vmeta->n_planes; i++)
++      vmeta->stride[i] = GST_VIDEO_TILE_X_TILES (vmeta->stride[i]) *
++          GST_VIDEO_FORMAT_INFO_TILE_STRIDE (finfo, i);
++  }
++
+   *buffer = buf;
+   return GST_FLOW_OK;
+ }

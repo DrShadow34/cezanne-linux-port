@@ -1,0 +1,12 @@
+{
+  "uuid": "cezanne-overview-close@arch-port",
+  "name": "Cezanne Overview Close Buttons",
+  "description": "Shows the close button of every window in the overview all the time instead of on mouse hover only, so windows can be closed by touch.",
+  "shell-version": [
+    "51"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=FM radio (cezanne, MediaTek CONNSYS MT6635 FM receiver: /dev/fm)
+After=cezanne-wifi.service
+Requires=cezanne-wifi.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/modprobe fmradio_drv
+
+[Install]
+WantedBy=multi-user.target

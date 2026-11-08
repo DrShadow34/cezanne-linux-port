@@ -1,0 +1,13 @@
+[Unit]
+Description=Bluetooth bring-up (cezanne, MediaTek CONNSYS BT)
+After=cezanne-wifi.service
+Requires=cezanne-wifi.service
+Before=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cezanne-bt-up
+
+[Install]
+WantedBy=bluetooth.target multi-user.target

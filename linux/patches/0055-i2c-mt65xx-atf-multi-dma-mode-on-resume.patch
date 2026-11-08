@@ -1,0 +1,95 @@
+i2c: mt65xx: restore the multi-channel DMA mode through ATF
+
+MT6885's multi-channel controllers (BSP ids 2, 4, 8, 9) need their secure
+DMA mode register (controller + 0xf8c) in shadow-register mode for the AP
+channel. lk sets it; the SPM's deeper suspend modes (dram / syspll /
+bus26m) reset it and every AP-channel transfer then times out (bq25970,
+dw9719: -110). Only ATF can write it (SIP 0xc20002a0, as the BSP's
+resume_noirq does), with the controller clock on: at probe and in
+resume_noirq. DT: mediatek,atf-id = BSP id.
+
+diff --git a/drivers/i2c/busses/i2c-mt65xx.c b/drivers/i2c/busses/i2c-mt65xx.c
+index c1fd4950b..099021760 100644
+--- a/drivers/i2c/busses/i2c-mt65xx.c
++++ b/drivers/i2c/busses/i2c-mt65xx.c
+@@ -4,6 +4,7 @@
+  * Author: Xudong Chen <xudong.chen@mediatek.com>
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/completion.h>
+ #include <linux/delay.h>
+@@ -297,6 +298,7 @@ struct mtk_i2c {
+ 	void __iomem *base;		/* i2c base addr */
+ 	void __iomem *chan0_base;	/* multi-channel: channel 0, if not ours */
+ 	bool arbit_wait;		/* multi-channel: last transfer failed */
++	int atf_id;			/* multi-channel: controller id in ATF, or -1 */
+ 	void __iomem *pdmabase;		/* dma base address*/
+ 	struct clk_bulk_data clocks[I2C_MT65XX_CLK_MAX]; /* clocks for i2c */
+ 	bool have_pmic;			/* can use i2c pins from PMIC */
+@@ -555,6 +557,31 @@ static void mtk_i2c_writew(struct mtk_i2c *i2c, u16 val,
+ 	writew(val, i2c->base + i2c->dev_comp->regs[reg]);
+ }
+ 
++/*
++ * Multi-channel controllers (MT6885): their DMA mode register (0xf8c of the
++ * controller, secure) needs shadow-register mode for the AP channel. lk sets
++ * it, but it resets in the SPM's deeper suspend modes (dram / syspll /
++ * bus26m) and every AP-channel transfer then times out. Only ATF can write
++ * it; the BSP does so on every resume. Needs the controller clock on.
++ */
++#define MTK_SIP_KERNEL_I2C_SEC_WRITE	0xc20002a0
++#define I2C_SEC_OFFSET_MULTI_DMA	0xf8c
++#define I2C_SEC_SHADOW_REG_MODE		0x2
++
++static void mtk_i2c_sec_init(struct mtk_i2c *i2c)
++{
++	struct arm_smccc_res res;
++
++	if (i2c->atf_id < 0)
++		return;
++	arm_smccc_smc(MTK_SIP_KERNEL_I2C_SEC_WRITE, i2c->atf_id,
++		      I2C_SEC_OFFSET_MULTI_DMA, I2C_SEC_SHADOW_REG_MODE,
++		      0, 0, 0, 0, &res);
++	if (res.a0)
++		dev_warn_once(i2c->dev, "ATF multi-DMA mode write failed: %#lx\n",
++			      res.a0);
++}
++
+ static void mtk_i2c_init_hw(struct mtk_i2c *i2c)
+ {
+ 	u16 control_reg;
+@@ -1444,10 +1471,15 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 		return PTR_ERR(i2c->base);
+ 
+ 	/* the AP owns one channel of a multi-channel controller */
++	i2c->atf_id = -1;
+ 	if (!of_property_read_u32(pdev->dev.of_node, "mediatek,channel-offset",
+ 				  &chan_offset) && chan_offset) {
++		u32 id;
++
+ 		i2c->chan0_base = i2c->base;
+ 		i2c->base += chan_offset;
++		if (!of_property_read_u32(pdev->dev.of_node, "mediatek,atf-id", &id))
++			i2c->atf_id = id;
+ 	}
+ 
+ 	i2c->pdmabase = devm_platform_get_and_ioremap_resource(pdev, 1, NULL);
+@@ -1539,6 +1571,8 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev, "clock enable failed!\n");
+ 		return ret;
+ 	}
++
++	mtk_i2c_sec_init(i2c);
+ 	mtk_i2c_init_hw(i2c);
+ 	clk_bulk_disable(I2C_MT65XX_CLK_MAX, i2c->clocks);
+ 
+@@ -1596,6 +1630,7 @@ static int mtk_i2c_resume_noirq(struct device *dev)
+ 		return ret;
+ 	}
+ 
++	mtk_i2c_sec_init(i2c);
+ 	mtk_i2c_init_hw(i2c);
+ 
+ 	clk_bulk_disable(I2C_MT65XX_CLK_MAX, i2c->clocks);

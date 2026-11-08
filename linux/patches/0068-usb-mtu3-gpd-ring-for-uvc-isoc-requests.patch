@@ -1,0 +1,20 @@
+diff --git a/drivers/usb/mtu3/mtu3_qmu.h b/drivers/usb/mtu3/mtu3_qmu.h
+index 66e1c0ab5..9f32f2105 100644
+--- a/drivers/usb/mtu3/mtu3_qmu.h
++++ b/drivers/usb/mtu3/mtu3_qmu.h
+@@ -10,7 +10,14 @@
+ #ifndef __MTK_QMU_H__
+ #define __MTK_QMU_H__
+ 
+-#define MAX_GPD_NUM		64
++/*
++ * A full ring fails usb_ep_queue() with -EAGAIN. f_uvc queues one request
++ * per (micro)frame of its frame interval plus 32 on an isoc endpoint: 299
++ * at 30 fps, 566 at 15 fps on high speed; 64 dropped parts of every frame
++ * and the frames were never completed. The ring is linked by the GPDs'
++ * next pointers only, its size is not known to the hardware.
++ */
++#define MAX_GPD_NUM		1024
+ #define QMU_GPD_SIZE		(sizeof(struct qmu_gpd))
+ #define QMU_GPD_RING_SIZE	(MAX_GPD_NUM * QMU_GPD_SIZE)
+ 

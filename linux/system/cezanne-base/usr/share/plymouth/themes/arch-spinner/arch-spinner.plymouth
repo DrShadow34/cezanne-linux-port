@@ -1,0 +1,38 @@
+[Plymouth Theme]
+Name=Arch Spinner
+Description=Arch logo (icon over text), spinner below
+ModuleName=two-step
+
+[two-step]
+Font=Adwaita Sans 12
+TitleFont=Adwaita Sans Light 30
+MonospaceFont=Adwaita Mono 12
+ImageDir=/usr/share/plymouth/themes/arch-spinner
+DialogHorizontalAlignment=.5
+DialogVerticalAlignment=.382
+TitleHorizontalAlignment=.5
+TitleVerticalAlignment=.382
+# 1080x2400 at DeviceScale 1 (images at their pixel size; plymouth places
+# them at (screen - image) * alignment): spinner 112 px at y 1373-1485,
+# ~200 px below the logo
+HorizontalAlignment=.5
+VerticalAlignment=.60
+# logo: Arch icon stacked over the "archlinux" text, 500x347 (46 % of the
+# width), drawn from /usr/share/pixmaps/archlinux-logo-text-dark.svg; at
+# y 821-1168, a little above the middle
+WatermarkHorizontalAlignment=.5
+WatermarkVerticalAlignment=.40
+Transition=none
+TransitionDuration=0.0
+BackgroundStartColor=0x000000
+BackgroundEndColor=0x000000
+MessageBelowAnimation=true
+
+[boot-up]
+UseEndAnimation=false
+
+[shutdown]
+UseEndAnimation=false
+
+[reboot]
+UseEndAnimation=false

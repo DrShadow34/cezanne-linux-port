@@ -1,0 +1,107 @@
+diff --git a/sound/soc/codecs/cs35l41.c b/sound/soc/codecs/cs35l41.c
+index b2a076706..e7d84e365 100644
+--- a/sound/soc/codecs/cs35l41.c
++++ b/sound/soc/codecs/cs35l41.c
+@@ -15,6 +15,7 @@
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/pm_runtime.h>
++#include <linux/workqueue.h>
+ #include <linux/property.h>
+ #include <sound/initval.h>
+ #include <sound/pcm.h>
+@@ -210,6 +211,34 @@ static int cs35l41_dsp_preload_ev(struct snd_soc_dapm_widget *w,
+ 	}
+ }
+ 
++/*
++ * The DSP1 widget powers up before "Main AMP" (global enable) and before the
++ * host starts the I2S clocks the PLL locks to, so cs_dsp starts the HALO core
++ * on an unclocked amp. With the vendor CSPL v0.13 firmware (Redmi K30 Ultra)
++ * one of the two amps then usually never runs (heartbeat 0, mailbox commands
++ * ignored: that speaker stays silent until reboot). With
++ * "cirrus,dsp-start-on-pll-lock" the first start waits for global enable and
++ * PLL lock, i.e. for the stream to be running.
++ */
++static void cs35l41_dsp_start_work(struct work_struct *work)
++{
++	struct cs35l41_private *cs35l41 =
++		container_of(work, struct cs35l41_private, dsp_start_work);
++	unsigned int pwr, raw3;
++	int ret;
++
++	ret = regmap_read_poll_timeout(cs35l41->regmap, CS35L41_IRQ1_RAW_STATUS3,
++				       raw3, raw3 & CS35L41_PLL_LOCK, 1000, 500000);
++	regmap_read(cs35l41->regmap, CS35L41_PWR_CTRL1, &pwr);
++	if (ret || !(pwr & CS35L41_GLOBAL_EN_MASK))
++		dev_warn(cs35l41->dev, "DSP1 start: pll lock %u, global enable %u\n",
++			 !!(raw3 & CS35L41_PLL_LOCK), pwr & CS35L41_GLOBAL_EN_MASK);
++
++	ret = wm_adsp_run(&cs35l41->dsp);
++	if (ret)
++		dev_err(cs35l41->dev, "DSP1 start failed: %d\n", ret);
++}
++
+ static int cs35l41_dsp_audio_ev(struct snd_soc_dapm_widget *w,
+ 				struct snd_kcontrol *kcontrol, int event)
+ {
+@@ -220,8 +249,13 @@ static int cs35l41_dsp_audio_ev(struct snd_soc_dapm_widget *w,
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_POST_PMU:
+-		if (!cs35l41->dsp.cs_dsp.running)
++		if (!cs35l41->dsp.cs_dsp.running) {
++			if (cs35l41->dsp_start_on_pll_lock) {
++				queue_work(system_unbound_wq, &cs35l41->dsp_start_work);
++				return 0;
++			}
+ 			return wm_adsp_event(w, kcontrol, event);
++		}
+ 
+ 		ret = regmap_read(cs35l41->regmap, CS35L41_DSP_MBOX_2, &fw_status);
+ 		if (ret < 0) {
+@@ -243,6 +277,12 @@ static int cs35l41_dsp_audio_ev(struct snd_soc_dapm_widget *w,
+ 		return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
+ 						 CSPL_MBOX_CMD_RESUME);
+ 	case SND_SOC_DAPM_PRE_PMD:
++		if (cs35l41->dsp_start_on_pll_lock) {
++			/* a stream too short to start the DSP: start with the next */
++			cancel_work_sync(&cs35l41->dsp_start_work);
++			if (!cs35l41->dsp.cs_dsp.running)
++				return 0;
++		}
+ 		return cs35l41_set_cspl_mbox_cmd(cs35l41->dev, cs35l41->regmap,
+ 						 CSPL_MBOX_CMD_PAUSE);
+ 	default:
+@@ -1091,6 +1131,9 @@ static int cs35l41_dsp_init(struct cs35l41_private *cs35l41)
+ 	dsp->toggle_preload = true;
+ 
+ 	cs35l41_configure_cs_dsp(cs35l41->dev, cs35l41->regmap, &dsp->cs_dsp);
++	cs35l41->dsp_start_on_pll_lock =
++		device_property_read_bool(cs35l41->dev, "cirrus,dsp-start-on-pll-lock");
++	INIT_WORK(&cs35l41->dsp_start_work, cs35l41_dsp_start_work);
+ 
+ 	ret = cs35l41_write_fs_errata(cs35l41->dev, cs35l41->regmap);
+ 	if (ret < 0)
+@@ -1375,6 +1418,7 @@ EXPORT_SYMBOL_GPL(cs35l41_probe);
+ 
+ void cs35l41_remove(struct cs35l41_private *cs35l41)
+ {
++	cancel_work_sync(&cs35l41->dsp_start_work);
+ 	pm_runtime_get_sync(cs35l41->dev);
+ 	pm_runtime_dont_use_autosuspend(cs35l41->dev);
+ 	pm_runtime_disable(cs35l41->dev);
+diff --git a/sound/soc/codecs/cs35l41.h b/sound/soc/codecs/cs35l41.h
+index c85cbc1dd..01c6b965a 100644
+--- a/sound/soc/codecs/cs35l41.h
++++ b/sound/soc/codecs/cs35l41.h
+@@ -33,6 +33,9 @@ struct cs35l41_private {
+ 	int irq;
+ 	/* GPIO for /RST */
+ 	struct gpio_desc *reset_gpio;
++	/* first DSP start deferred until the amp is clocked */
++	bool dsp_start_on_pll_lock;
++	struct work_struct dsp_start_work;
+ };
+ 
+ int cs35l41_probe(struct cs35l41_private *cs35l41, const struct cs35l41_hw_cfg *hw_cfg);

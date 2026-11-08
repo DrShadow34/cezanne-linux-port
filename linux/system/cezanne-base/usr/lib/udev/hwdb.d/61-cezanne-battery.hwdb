@@ -1,0 +1,9 @@
+# The charge limit (GNOME "Preserve Battery Health") for the cezanne battery.
+# UPower's 60-upower-battery.rules looks the battery up as
+# battery:<name>:<model_name>:<DMI modalias>; a phone has no DMI and the
+# MT6359 gauge no model name, so the key is "battery:battery::" and UPower's
+# default entry (battery:*:*:dmi:*) never matches: without CHARGE_LIMIT it
+# reports no charge threshold support. The gauge (mt6359-gauge) stops
+# charging at the end threshold and resumes at the start threshold.
+battery:battery:*
+ CHARGE_LIMIT=75,80

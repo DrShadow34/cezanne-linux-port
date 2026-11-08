@@ -1,0 +1,7 @@
+{
+  "uuid": "cezanne-flashlight@arch-port",
+  "name": "Cezanne Flashlight",
+  "description": "Quick Settings toggle for the rear flash LEDs (Redmi K30 Ultra port)",
+  "shell-version": ["51"],
+  "session-modes": ["user", "unlock-dialog"]
+}

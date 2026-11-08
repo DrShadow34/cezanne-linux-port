@@ -1,0 +1,4 @@
+# Redmi K30 Ultra cameras
+obj-m += fan53870.o s5k3t2.o imx682.o cezanne_camsv.o cezanne_sensor.o
+# unmodified mainline copies (not enabled in the kernel config)
+obj-m += v4l2-cci.o dw9719.o

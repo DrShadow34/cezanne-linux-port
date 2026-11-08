@@ -1,0 +1,21 @@
+# NFC app for the Redmi K30 Ultra (cezanne): read tags and cards (NDEF via
+# neard, chip family from the kernel's NFC netlink target data), keep them
+# in a list, write links / text / phone / email / Wi-Fi / contacts and copy
+# saved tags. Needs neard (mainline/rootfs/nfc/neard).
+pkgname=cezanne-nfc
+pkgver=1.0
+pkgrel=2
+pkgdesc="Read, save and write NFC tags (neard)"
+arch=(any)
+license=(MIT)
+depends=(python python-gobject gtk4 libadwaita neard)
+source=(cezanne-nfc
+        org.cezanne.Nfc.desktop
+        org.cezanne.Nfc.svg)
+sha256sums=(SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 cezanne-nfc "$pkgdir/usr/bin/cezanne-nfc"
+  install -Dm644 org.cezanne.Nfc.desktop "$pkgdir/usr/share/applications/org.cezanne.Nfc.desktop"
+  install -Dm644 org.cezanne.Nfc.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.cezanne.Nfc.svg"
+}

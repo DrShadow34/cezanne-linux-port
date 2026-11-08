@@ -1,0 +1,47 @@
+# neard, the Linux NFC daemon (kernel NFC netlink API -> D-Bus org.neard),
+# and nfctool. Not packaged by Arch; used on cezanne with the mainline
+# nxp-nci driver on the NXP SN100U (NCI 2.0).
+# org.neard.service: D-Bus activation (the GNOME extension cezanne-nfc
+# starts neard on first use).
+# D-Bus policy: upstream lets only root and at_console users talk to
+# org.neard; at_console matches nobody on a systemd system, so local users
+# may send to it here, as BlueZ does for org.bluez.
+pkgname=neard
+pkgver=0.20
+pkgrel=2
+pkgdesc="Near Field Communication manager (daemon and nfctool)"
+arch=(aarch64)
+url="https://github.com/linux-nfc/neard"
+license=(GPL-2.0-only)
+depends=(glib2 dbus libnl readline)
+makedepends=(autoconf autoconf-archive automake libtool pkgconf systemd)
+backup=(etc/neard/main.conf)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/linux-nfc/neard/archive/refs/tags/v$pkgver.tar.gz"
+        org.neard.service)
+sha256sums=('2b3c12e7ce77901a649237ea044d9af5b4df54c0cbeed5036b5342dbc89dc3fd'
+            SKIP)
+
+prepare() {
+  cd $pkgname-$pkgver
+  sed -i 's|<deny send_destination="org.neard"/>|<allow send_destination="org.neard"/>|' src/org.neard.conf
+  ./bootstrap
+}
+
+build() {
+  cd $pkgname-$pkgver
+  ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
+    --libexecdir=/usr/lib --enable-tools \
+    --with-systemdsystemunitdir=/usr/lib/systemd/system
+  make
+}
+
+package() {
+  cd $pkgname-$pkgver
+  make DESTDIR="$pkgdir" install
+  install -Dm644 src/main.conf "$pkgdir/etc/neard/main.conf"
+  # Arch keeps package D-Bus policies under /usr/share
+  install -d "$pkgdir/usr/share/dbus-1"
+  mv "$pkgdir/etc/dbus-1/system.d" "$pkgdir/usr/share/dbus-1/system.d"
+  rmdir "$pkgdir/etc/dbus-1"
+  install -Dm644 "$srcdir/org.neard.service" "$pkgdir/usr/share/dbus-1/system-services/org.neard.service"
+}

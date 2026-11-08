@@ -1,0 +1,12 @@
+--- a/src/mm-modem-helpers.c	2026-10-30 03:23:05.418861370 +0100
++++ b/src/mm-modem-helpers.c	2026-10-30 03:23:05.438725469 +0100
+@@ -3190,7 +3190,8 @@
+  * +CPMS: <memr>,<usedr>,<totalr>,<memw>,<usedw>,<totalw>, <mems>,<useds>,<totals>
+  */
+ 
+-#define CPMS_QUERY_REGEX "\\+CPMS:\\s*\"(?P<memr>.*)\",[0-9]+,[0-9]+,\"(?P<memw>.*)\",[0-9]+,[0-9]+,\"(?P<mems>.*)\",[0-9]+,[0-9]"
++/* spaces after the commas are allowed (MediaTek modems put them there) */
++#define CPMS_QUERY_REGEX "\\+CPMS:\\s*\"(?P<memr>.*)\",\\s*[0-9]+,\\s*[0-9]+,\\s*\"(?P<memw>.*)\",\\s*[0-9]+,\\s*[0-9]+,\\s*\"(?P<mems>.*)\",\\s*[0-9]+,\\s*[0-9]"
+ 
+ gboolean
+ mm_3gpp_parse_cpms_query_response (const gchar *reply,

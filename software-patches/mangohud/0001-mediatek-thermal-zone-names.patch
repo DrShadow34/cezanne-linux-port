@@ -1,0 +1,36 @@
+From: arch-port
+Subject: [PATCH] cpu, gpu_fdinfo: MediaTek thermal zone names
+
+MediaTek's LVTS thermal driver names its hwmon devices after the zones:
+cpu_big0_thermal .. cpu_big3_thermal, cpu_little0_thermal .., gpu0_thermal,
+gpu1_thermal. The CPU match (cpu\d*_thermal) and the panfrost GPU lookup
+("gpu_thermal") found neither, so no temperatures were shown.
+---
+--- a/src/cpu.cpp
++++ b/src/cpu.cpp
+@@ -609,7 +609,8 @@
+             // E2K (Elbrus 2000) CPU temperature module
+             find_input(path, "temp", input, "Node 0 Max");
+             break;
+-        } else if (std::regex_match(name, match, std::regex("cpu\\d*_thermal"))) {
++        } else if (std::regex_match(name, match, std::regex("cpu(_big)?\\d*_thermal"))) {
++            // cpu_big<N>_thermal: MediaTek LVTS zones (the big cores run hottest)
+             find_fallback_input(path, "temp1", input);
+             break;
+         } else if (name == "apm_xgene") {
+--- a/src/gpu_fdinfo.cpp
++++ b/src/gpu_fdinfo.cpp
+@@ -177,8 +177,12 @@
+ 
+     if (module == "msm")
+         hwmon = find_hwmon_sensor_dir("gpu");
+-    else if (module == "panfrost" || module == "panthor")
++    else if (module == "panfrost" || module == "panthor") {
+         hwmon = find_hwmon_sensor_dir("gpu_thermal");
++        // MediaTek LVTS names its GPU zones gpu0_thermal, gpu1_thermal
++        if (hwmon.empty())
++            hwmon = find_hwmon_sensor_dir("gpu0_thermal");
++    }
+     else
+         hwmon = find_hwmon_dir();
+ 

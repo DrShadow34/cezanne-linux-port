@@ -1,0 +1,1139 @@
+From b3a89bf9a511fc566af1acff1b919b107d53442d Mon Sep 17 00:00:00 2001
+From: arch-port <26345330+DrShadow34@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:17:42 +0100
+Subject: [PATCH] panvk: v9 index rewrites, geometry shaders with GPU-side
+ counts
+
+What the tiler cannot draw, as an index list written by a precomp job
+(panlib_rewrite_indices_v9) ahead of the draw:
+- VK_POLYGON_MODE_LINE: the three edges of each triangle as a line list
+  (no face culling of the edges: CTS rasterization.culling.*_line fail);
+- adjacency topologies without a geometry shader: the primitives without
+  their adjacent vertices (poly_vertex_id_for_topology()).
+With an indirect draw or primitive restart in strips the count is known
+on the GPU only: LINE mode then draws filled, adjacency is skipped.
+
+Geometry shaders with indirect draws and primitive restart in strips
+(src/poly's GPU-side setup, as Honeykrisp): a device heap (poly_heap,
+grown on fault) reset by the first such draw of a batch; restart is
+unrolled to a list in it (poly_unroll_restart); panlib_gs_setup_indirect_v9
+fills poly's parameters from the draw command and patches the counts of
+the vertex / geometry shader compute jobs (queued NOT_STARTED, compute or
+null job) and of the layers' IDVS jobs, and the vertex shader's base
+vertex / instance / draw ID and per-instance attributes as the indirect
+draw helper does. The patched compute jobs are restored before a batch is
+issued again. Direct draws forced through this path pass all of CTS
+geometry.*; geometry.builtin_variable.in_block.primitive_id_in_restarted
+passes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013fD3if93WntovhmD8fGa8C
+---
+ src/panfrost/libpan/draw_helper.cl            | 207 +++++++
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h     |  11 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c  |   3 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c | 550 +++++++++++++++---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   |   9 +
+ src/panfrost/vulkan/panvk_cmd_draw.h          |   2 +
+ src/panfrost/vulkan/panvk_device.h            |   7 +
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c       |   3 +-
+ src/panfrost/vulkan/panvk_vX_device.c         |  11 +
+ 9 files changed, 712 insertions(+), 91 deletions(-)
+
+diff --git a/src/panfrost/libpan/draw_helper.cl b/src/panfrost/libpan/draw_helper.cl
+index 4966348..fc82559 100644
+--- a/src/panfrost/libpan/draw_helper.cl
++++ b/src/panfrost/libpan/draw_helper.cl
+@@ -144,6 +144,213 @@ panlib_draw_indirect_v9_helper(global uint32_t *cmd, global uint32_t *count_buf,
+       *offset += (int32_t)(first_instance * attrib_patches[2 * i + 1]);
+    }
+ }
++
++/*
++ * v9: what the tiler cannot draw, as a 32-bit index list: triangles with
++ * VK_POLYGON_MODE_LINE (the three edges of each, a line list) and
++ * adjacency topologies without a geometry shader (the primitives without
++ * their adjacent vertices; both for triangles with adjacency in LINE mode).
++ * One invocation per input primitive, 64 per workgroup. The indices come
++ * from the draw's index buffer (index_size != 0, clamped to index_avail)
++ * or are the vertex's number in the draw.
++ */
++KERNEL(64)
++panlib_rewrite_indices_v9(global uint32_t *out, uint64_t index_buffer,
++                          uint32_t index_avail, uint32_t index_size,
++                          uint32_t num_prims, uint32_t flatshade_first,
++                          uint32_t lines_from_tris,
++                          uint32_t compact_prim__11)
++{
++   uint32_t prim = cl_global_id.x;
++   if (prim >= num_prims)
++      return;
++
++   enum mesa_prim mode = poly_uncompact_prim(compact_prim__11);
++   bool adj = mesa_prim_has_adjacency(mode);
++   bool tris = u_reduced_prim(mode) == MESA_PRIM_TRIANGLES;
++   uint32_t nv = tris ? 3 : 2;
++   uint32_t v[3];
++
++   for (uint32_t k = 0; k < nv; k++) {
++      /* adjacency: lines are vertices 1, 2 of 4, triangles 0, 2, 4 of 6 */
++      uint32_t vert = adj ? (tris ? 2 * k : k + 1) : k;
++      uint32_t id = poly_vertex_id_for_topology(mode, flatshade_first, prim,
++                                                vert, num_prims);
++      v[k] = poly_load_index(index_buffer, index_avail, id, index_size);
++   }
++
++   if (lines_from_tris) {
++      global uint32_t *o = out + prim * 6;
++      o[0] = v[0];
++      o[1] = v[1];
++      o[2] = v[1];
++      o[3] = v[2];
++      o[4] = v[2];
++      o[5] = v[0];
++   } else {
++      for (uint32_t k = 0; k < nv; k++)
++         out[prim * nv + k] = v[k];
++   }
++}
++
++/*
++ * v9 geometry shaders (src/poly) whose input counts are known on the GPU
++ * only: indirect draws and primitive restart. poly's heap (a device BO,
++ * the poly_heap header first) is reset by the first such draw of a batch;
++ * the draws of a batch then bump-allocate from it.
++ */
++KERNEL(1)
++panlib_poly_heap_reset_v9(global struct poly_heap *heap, uint64_t base,
++                          uint32_t size)
++{
++   heap->base = (global uchar *)base;
++   heap->bottom = 0;
++   heap->size = size;
++}
++
++/* primitive restart: strips (or lists) to a list without restarts, as an
++ * indexed indirect draw (out_draw) whose indices live in the heap */
++KERNEL(256)
++panlib_unroll_restart_v9(global uint32_t *out_draw,
++                         global struct poly_heap *heap,
++                         constant uint32_t *in_draw, uint64_t index_buffer,
++                         uint32_t index_buffer_range_el,
++                         uint32_t flatshade_first, uint32_t index_size_log2__3,
++                         uint32_t mode__11)
++{
++   uint32_t index_size_B = 1 << index_size_log2__3;
++   uint32_t restart_index =
++      index_size_B == 4 ? ~0u : (1u << (index_size_B * 8)) - 1;
++
++   POLY_DECL_UNROLL_RESTART_SCRATCH(scratch, 256);
++   poly_unroll_restart(out_draw, heap, in_draw, index_buffer,
++                       index_buffer_range_el, index_size_B, restart_index,
++                       flatshade_first, poly_uncompact_prim(mode__11), scratch);
++}
++
++/* Compute job queued as MALI_JOB_TYPE_NOT_STARTED: compute or null job */
++static void
++panlib_patch_compute_job(global uint8_t *job, uint32_t x, uint32_t y)
++{
++   const bool run = x != 0 && y != 0;
++   struct mali_job_header_packed job_header;
++
++   pan_pack(&job_header, JOB_HEADER, cfg) {
++      cfg.type = run ? MALI_JOB_TYPE_COMPUTE : MALI_JOB_TYPE_NULL;
++   }
++   pan_merge((global struct mali_job_header_packed *)job, &job_header,
++             JOB_HEADER);
++
++   if (!run)
++      return;
++
++   global struct mali_compute_payload_packed *payload =
++      (global struct mali_compute_payload_packed *)(job +
++                                                    pan_section_offset(
++                                                       COMPUTE_JOB, PAYLOAD));
++
++   pan_unpack(payload, COMPUTE_PAYLOAD, unpacked);
++   pan_pack(payload, COMPUTE_PAYLOAD, cfg) {
++      memcpy(&cfg, &unpacked, sizeof(cfg));
++      cfg.workgroup_count_x = x;
++      cfg.workgroup_count_y = y;
++   }
++}
++
++/*
++ * poly's indirect geometry shader setup (poly_gs_setup_indirect) for one
++ * draw of an indirect command, then what the CPU does for direct draws:
++ * the workgroup counts of the vertex shader / main geometry shader compute
++ * jobs (64 invocations per workgroup), the counts and index buffer of the
++ * rasterization draw's MALLOC_VERTEX_JOBs (one per layer), and, as
++ * panlib_draw_indirect_v9_helper(), the vertex shader's base vertex /
++ * instance / draw ID sysvals and per-instance attribute offsets. Draws past
++ * the count buffer value get zero vertices.
++ */
++KERNEL(1)
++panlib_gs_setup_indirect_v9(
++   constant uint32_t *cmd, global uint32_t *count_buf, uint32_t draw_id,
++   uint32_t max_draw_count, uint64_t index_buffer, uint32_t index_size,
++   uint32_t index_avail, global struct poly_vertex_params *vp,
++   global struct poly_geometry_params *p, global struct poly_heap *heap,
++   uint64_t vs_outputs, uint32_t prim, uint32_t max_indices, uint32_t shape,
++   global uint8_t *vs_job, global uint8_t *gs_job,
++   global uint64_t *idvs_jobs, uint32_t idvs_job_count,
++   uint64_t rast_index_buffer, global uint8_t *vs_fau,
++   uint32_t first_vertex_off, uint32_t base_instance_off,
++   uint32_t draw_id_off, global uint8_t *vs_attribs,
++   global uint32_t *attrib_patches, uint32_t patch_attrib_count)
++{
++   uint32_t draw_count =
++      count_buf ? min(*count_buf, max_draw_count) : max_draw_count;
++   bool indexed = index_size != 0;
++   uint32_t vertex_count = cmd[0];
++   uint32_t instance_count = cmd[1];
++   uint32_t first_index = indexed ? cmd[2] : 0;
++   int32_t vertex_offset = (int32_t)(indexed ? cmd[3] : cmd[2]);
++   uint32_t first_instance = indexed ? cmd[4] : cmd[3];
++
++   if (draw_id >= draw_count) {
++      vertex_count = 0;
++      instance_count = 0;
++   }
++
++   poly_vertex_params_set_draw(vp, vertex_count, instance_count);
++   poly_geometry_params_set_draw(p, prim, shape, max_indices, vertex_count,
++                                 instance_count);
++
++   if (indexed) {
++      vp->index_buffer =
++         poly_index_buffer(index_buffer, index_avail, first_index, index_size);
++      vp->index_buffer_range_el =
++         poly_index_buffer_range_el(index_avail, first_index);
++   }
++
++   vp->output_buffer = (uintptr_t)poly_heap_alloc(
++      heap, poly_tcs_in_size(vertex_count * instance_count, vs_outputs));
++   vp->outputs = vs_outputs;
++
++   if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
++      p->output_index_buffer =
++         (global uint *)poly_heap_alloc(heap, p->draw.index_count * 4);
++      rast_index_buffer = (uintptr_t)p->output_index_buffer;
++   }
++
++   /* no vertex shader job if it stores nothing */
++   if (vs_job)
++      panlib_patch_compute_job(vs_job, DIV_ROUND_UP(vertex_count, 64),
++                               instance_count);
++   if (gs_job)
++      panlib_patch_compute_job(gs_job, DIV_ROUND_UP(p->grid[0], 64),
++                               instance_count);
++
++   /* MALLOC_VERTEX_JOB: PRIMITIVE @32 (base vertex offset, instance
++    * offset, index count), INSTANCE_COUNT @48, INDICES @120 */
++   for (uint32_t i = 0; i < idvs_job_count; i++) {
++      global uint8_t *job = (global uint8_t *)idvs_jobs[i];
++
++      *(global uint32_t *)(job + 44) = p->draw.index_count;
++      *(global uint32_t *)(job + 48) = p->draw.instance_count;
++      if (rast_index_buffer)
++         *(global uint64_t *)(job + 120) = rast_index_buffer;
++   }
++
++   if (!vs_job)
++      return;
++
++   if (first_vertex_off != ~0u)
++      *(global int32_t *)(vs_fau + first_vertex_off) = vertex_offset;
++   if (base_instance_off != ~0u)
++      *(global uint32_t *)(vs_fau + base_instance_off) = first_instance;
++   if (draw_id_off != ~0u)
++      *(global uint32_t *)(vs_fau + draw_id_off) = draw_id;
++
++   for (uint32_t i = 0; i < patch_attrib_count; i++) {
++      global int32_t *offset = (global int32_t *)
++         (vs_attribs + attrib_patches[2 * i] * 32 + 8);
++      *offset += (int32_t)(first_instance * attrib_patches[2 * i + 1]);
++   }
++}
+ #endif
+ 
+ #if (PAN_ARCH == 6 || PAN_ARCH == 7)
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index 6f67d95..fcad5d2 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -37,6 +37,12 @@ struct panvk_job_copy {
+    struct mali_malloc_vertex_job_packed data;
+ };
+ 
++/* compute jobs patched by the GPU (type and workgroup counts) */
++struct panvk_compute_job_copy {
++   void *job;
++   struct mali_compute_job_packed data;
++};
++
+ /* Tiler Context "Layer offset", 9-bit signed at word 4 bit 8 */
+ static inline void
+ panvk_tiler_ctx_set_layer_offset(struct mali_tiler_context_packed *ctx,
+@@ -87,6 +93,11 @@ struct panvk_batch {
+    /* pipeline barrier since the last compute job: the next one is preceded
+     * by a shader core cache flush job (instead of a batch boundary) */
+    bool needs_cache_flush;
++   /* pristine compute jobs whose type and counts the GPU patches */
++   struct util_dynarray compute_job_copies;
++   /* geometry shaders: job resetting the device's poly heap, 0 if none
++    * yet (panlib_poly_heap_reset_v9) */
++   unsigned poly_heap_reset_job;
+ #endif
+    /* has timestamp writes: run with the GPU cycle/timestamp counters on */
+    bool needs_cycle_count;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index ad6af64..bc5fe87 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -348,6 +348,7 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
+ #if PAN_ARCH == 9
+    cmdbuf->cur_batch->job_copies = UTIL_DYNARRAY_INIT;
++   cmdbuf->cur_batch->compute_job_copies = UTIL_DYNARRAY_INIT;
+ #endif
+    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
+    assert(cmdbuf->cur_batch);
+@@ -404,6 +405,7 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
+       util_dynarray_fini(&batch->jobs);
+ #if PAN_ARCH == 9
+       util_dynarray_fini(&batch->job_copies);
++      util_dynarray_fini(&batch->compute_job_copies);
+ #endif
+       util_dynarray_fini(&batch->event_ops);
+ 
+@@ -430,6 +432,7 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
+       util_dynarray_fini(&batch->jobs);
+ #if PAN_ARCH == 9
+       util_dynarray_fini(&batch->job_copies);
++      util_dynarray_fini(&batch->compute_job_copies);
+ #endif
+       util_dynarray_fini(&batch->event_ops);
+ 
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+index e456b1a..5d5884c 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+@@ -36,6 +36,7 @@
+ #include "pan_props.h"
+ #include "pan_shader.h"
+ 
++#include "util/stack_array.h"
+ #include "vk_format.h"
+ #include "vk_meta.h"
+ 
+@@ -1043,14 +1044,15 @@ emit_indirect_patch(struct panvk_cmd_buffer *cmdbuf,
+ 
+ /* ---- geometry shaders (src/poly) ---- */
+ 
+-/* A compute job of a vertex or geometry shader variant in the draw's
+- * vertex/tiler chain: count_x invocations (rounded up to workgroups, the
+- * shader skips the rest) by count_y, after job dep if not 0. */
++/* A compute job of a vertex or geometry shader variant for the draw's
++ * vertex/tiler chain, not added yet: count_x invocations (rounded up to
++ * workgroups, the shader skips the rest) by count_y. *fau is its push
++ * uniform buffer. */
+ static VkResult
+-emit_poly_compute_job(struct panvk_cmd_buffer *cmdbuf,
+-                      const struct panvk_shader_variant *shader,
+-                      uint64_t res_table, uint32_t count_x, uint32_t count_y,
+-                      unsigned dep, unsigned *job_index)
++build_poly_compute_job(struct panvk_cmd_buffer *cmdbuf,
++                       const struct panvk_shader_variant *shader,
++                       uint64_t res_table, uint32_t count_x, uint32_t count_y,
++                       struct pan_ptr *job, uint64_t *fau)
+ {
+    struct panvk_batch *batch = cmdbuf->cur_batch;
+    struct pan_ptr push_uniforms;
+@@ -1064,11 +1066,11 @@ emit_poly_compute_job(struct panvk_cmd_buffer *cmdbuf,
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
+-   if (!job.gpu)
++   *job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
++   if (!job->gpu)
+       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
+-   pan_section_pack(job.cpu, COMPUTE_JOB, PAYLOAD, cfg) {
++   pan_section_pack(job->cpu, COMPUTE_JOB, PAYLOAD, cfg) {
+       cfg.workgroup_size_x = shader->cs.local_size.x;
+       cfg.workgroup_size_y = shader->cs.local_size.y;
+       cfg.workgroup_size_z = shader->cs.local_size.z;
+@@ -1086,22 +1088,46 @@ emit_poly_compute_job(struct panvk_cmd_buffer *cmdbuf,
+       cfg.task_axis = MALI_TASK_AXIS_X;
+    }
+ 
+-   util_dynarray_append(&batch->jobs, job.cpu);
+-   *job_index = pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, false,
+-                               false, dep, 0, &job, false);
++   util_dynarray_append(&batch->jobs, job->cpu);
++   *fau = push_uniforms.gpu;
+    return VK_SUCCESS;
+ }
+ 
++/* Adds a compute job after job dep (if not 0). GPU-patched ones are queued
++ * as NOT_STARTED, panlib_patch_compute_job() makes them compute or null
++ * jobs, and are restored before the batch is issued again. */
++static unsigned
++add_poly_compute_job(struct panvk_cmd_buffer *cmdbuf, struct pan_ptr *job,
++                     bool gpu_patched, unsigned dep)
++{
++   struct panvk_batch *batch = cmdbuf->cur_batch;
++   unsigned index = pan_jc_add_job(
++      &batch->vtc_jc,
++      gpu_patched ? MALI_JOB_TYPE_NOT_STARTED : MALI_JOB_TYPE_COMPUTE, false,
++      false, dep, 0, job, false);
++
++   if (gpu_patched) {
++      struct panvk_compute_job_copy copy = {.job = job->cpu};
++      memcpy(&copy.data, job->cpu, sizeof(copy.data));
++      util_dynarray_append(&batch->compute_job_copies, copy);
++   }
++
++   return index;
++}
++
+ /*
+  * Parameters of a draw with a geometry shader, and the draw the hardware
+  * does instead (rast): poly's vertex parameters (index buffer, the buffer
+  * the vertex shader stores its outputs to) and geometry parameters (counts,
+  * output index buffer), as Honeykrisp's hk_upload_vertex_params() /
+- * hk_upload_geometry_params() for direct draws without transform feedback.
++ * hk_upload_geometry_params() for draws without transform feedback. With
++ * gpu_counts (indirect draws, primitive restart) only their invariant part:
++ * panlib_gs_setup_indirect_v9() fills in the rest and the counts of rast.
+  */
+ static VkResult
+ prepare_poly_draw(struct panvk_cmd_buffer *cmdbuf,
+-                  struct panvk_draw_info *draw, struct panvk_draw_info *rast)
++                  struct panvk_draw_info *draw, bool gpu_counts,
++                  enum mesa_prim prim, struct panvk_draw_info *rast)
+ {
+    const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
+    const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
+@@ -1118,64 +1144,74 @@ prepare_poly_draw(struct panvk_cmd_buffer *cmdbuf,
+ 
+    struct poly_vertex_params vp;
+    poly_vertex_params_init(&vp, vs->poly.vs_sw_outputs, wg_size);
+-   poly_vertex_params_set_draw(&vp, verts, instances);
+-
+-   if (draw->index.index_size) {
+-      uint32_t avail = draw->index.buffer_size / draw->index.index_size;
+-
+-      vp.index_size_B = draw->index.index_size;
+-      vp.index_buffer_range_el =
+-         poly_index_buffer_range_el(avail, draw->index.offset);
+-      vp.index_buffer = vp.index_buffer_range_el
+-                           ? draw->index.buffer_dev_addr +
+-                                (uint64_t)draw->index.offset *
+-                                   draw->index.index_size
+-                           : PAN_SHADER_OOB_ADDRESS;
+-   }
+-
+-   uint32_t out_size = poly_tcs_in_size(verts * instances, vp.outputs);
+-   if (out_size) {
+-      struct pan_ptr out = panvk_cmd_alloc_dev_mem(cmdbuf, desc, out_size, 16);
+-      if (!out.gpu)
+-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+-      vp.output_buffer = out.gpu;
+-   } else {
+-      vp.output_buffer = PAN_SHADER_OOB_ADDRESS;
+-   }
+ 
+    struct poly_geometry_params gp;
+-   poly_geometry_params_init(&gp, draw->prim, wg_size);
+-   poly_geometry_params_set_draw(&gp, draw->prim, gsi->shape,
+-                                 gsi->max_indices, verts, instances);
++   poly_geometry_params_init(&gp, prim, wg_size);
+    gp.count_buffer_stride = gsi->count_words * 4;
+ 
+    *rast = (struct panvk_draw_info){
+-      .vertex.count = gp.draw.index_count,
+-      .instance.count = gp.draw.instance_count,
+       .prim = gsi->mode,
+       .draw_id = draw->draw_id,
+    };
+ 
+-   if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED ||
+-       gsi->shape == POLY_GS_SHAPE_STATIC_INDEXED) {
+-      const uint32_t index_size = poly_gs_index_size(gsi->shape);
+-      const uint32_t size = rast->vertex.count * index_size;
+-      struct pan_ptr ib;
++   if (!gpu_counts) {
++      poly_vertex_params_set_draw(&vp, verts, instances);
++      poly_geometry_params_set_draw(&gp, prim, gsi->shape, gsi->max_indices,
++                                    verts, instances);
+ 
+-      if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+-         ib = panvk_cmd_alloc_dev_mem(cmdbuf, desc, MAX2(size, 4), 4);
+-         gp.output_index_buffer = ib.gpu;
++      if (draw->index.index_size) {
++         uint32_t avail = draw->index.buffer_size / draw->index.index_size;
++
++         vp.index_size_B = draw->index.index_size;
++         vp.index_buffer_range_el =
++            poly_index_buffer_range_el(avail, draw->index.offset);
++         vp.index_buffer = vp.index_buffer_range_el
++                              ? draw->index.buffer_dev_addr +
++                                   (uint64_t)draw->index.offset *
++                                      draw->index.index_size
++                              : PAN_SHADER_OOB_ADDRESS;
++      }
++
++      uint32_t out_size = poly_tcs_in_size(verts * instances, vp.outputs);
++      if (out_size) {
++         struct pan_ptr out =
++            panvk_cmd_alloc_dev_mem(cmdbuf, desc, out_size, 16);
++         if (!out.gpu)
++            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         vp.output_buffer = out.gpu;
+       } else {
++         vp.output_buffer = PAN_SHADER_OOB_ADDRESS;
++      }
++
++      rast->vertex.count = gp.draw.index_count;
++      rast->instance.count = gp.draw.instance_count;
++   } else {
++      /* the index size the vertex shader pulls with (poly_index_size()) */
++      vp.index_size_B = draw->index.index_size;
++   }
++
++   if (poly_gs_indexed(gsi->shape)) {
++      const uint32_t index_size = poly_gs_index_size(gsi->shape);
++      /* GPU counts: the setup job sets the index buffer of dynamic ones */
++      const uint32_t size = gpu_counts ? 4 : rast->vertex.count * index_size;
++      struct pan_ptr ib = {0};
++
++      if (gsi->shape == POLY_GS_SHAPE_STATIC_INDEXED) {
++         ib = panvk_cmd_alloc_dev_mem(cmdbuf, desc, MAX2(gsi->max_indices, 4),
++                                      4);
++         if (!ib.gpu)
++            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         memcpy(ib.cpu, gsi->topology, gsi->max_indices);
++      } else if (!gpu_counts) {
+          ib = panvk_cmd_alloc_dev_mem(cmdbuf, desc, MAX2(size, 4), 4);
+-         if (ib.cpu)
+-            memcpy(ib.cpu, gsi->topology, size);
++         if (!ib.gpu)
++            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         gp.output_index_buffer = ib.gpu;
+       }
+-      if (!ib.gpu)
+-         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
+       /* strips separated by restart indices (all ones) */
+       rast->index.buffer_dev_addr = ib.gpu;
+-      rast->index.buffer_size = size;
++      rast->index.buffer_size = gpu_counts ? UINT32_MAX : size;
+       rast->index.index_size = index_size;
+       rast->index.restart_enable = gsi->mode != MESA_PRIM_POINTS;
+    }
+@@ -1187,20 +1223,29 @@ prepare_poly_draw(struct panvk_cmd_buffer *cmdbuf,
+ 
+    memcpy(params.cpu, &vp, sizeof(vp));
+    memcpy((uint8_t *)params.cpu + sizeof(vp), &gp, sizeof(gp));
++   draw->poly.input_topology = prim;
+    draw->poly.vertex_params = params.gpu;
+    draw->poly.geometry_params = params.gpu + sizeof(vp);
+    draw->poly.rast_last_vertex =
+-      rast->index.index_size || !rast->vertex.count ? UINT32_MAX
+-                                                    : rast->vertex.count - 1;
++      gpu_counts || rast->index.index_size || !rast->vertex.count
++         ? UINT32_MAX
++         : rast->vertex.count - 1;
+    return VK_SUCCESS;
+ }
+ 
+ /* The vertex shader, then the geometry shader's main variant (dynamic
+  * topologies: writes the index buffer), as compute jobs ahead of the draw.
+- * Returns the index of the last one, the draw's dependency. */
++ * Direct draws: added right away, *last_job is the draw's dependency.
++ * GPU counts: built only (jobs[]), see emit_poly_gpu_setup(). */
++struct poly_gpu_jobs {
++   struct pan_ptr vs, gs;
++   uint64_t vs_fau;
++};
++
+ static VkResult
+ emit_poly_jobs(struct panvk_cmd_buffer *cmdbuf,
+-               const struct panvk_draw_info *draw, unsigned *last_job)
++               const struct panvk_draw_info *draw, enum mesa_prim prim,
++               struct poly_gpu_jobs *gpu, unsigned *last_job)
+ {
+    const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
+    const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
+@@ -1208,27 +1253,294 @@ emit_poly_jobs(struct panvk_cmd_buffer *cmdbuf,
+       panvk_shader_variant(vs, PANVK_VS_VARIANT_SW);
+    const struct panvk_shader_variant *gs_main =
+       panvk_shader_variant(gs, PANVK_GS_VARIANT_MAIN);
++   struct pan_ptr job;
++   uint64_t fau;
+    VkResult result;
+ 
+    *last_job = 0;
+    if (panvk_priv_mem_check_alloc(vs_sw->spd)) {
+-      result = emit_poly_compute_job(
++      result = build_poly_compute_job(
+          cmdbuf, vs_sw, cmdbuf->state.gfx.vs.desc.res_table,
+-         draw->vertex.count, draw->instance.count, 0, last_job);
++         draw->vertex.count, draw->instance.count, &job, &fau);
+       if (result != VK_SUCCESS)
+          return result;
++      if (gpu) {
++         gpu->vs = job;
++         gpu->vs_fau = fau;
++      } else {
++         *last_job = add_poly_compute_job(cmdbuf, &job, false, 0);
++      }
+    }
+ 
+    if (panvk_priv_mem_check_alloc(gs_main->spd)) {
+-      uint32_t prims =
+-         u_decomposed_prims_for_vertices(draw->prim, draw->vertex.count);
++      uint32_t prims = u_decomposed_prims_for_vertices(prim, draw->vertex.count);
+ 
+-      result = emit_poly_compute_job(cmdbuf, gs_main,
+-                                     cmdbuf->state.gfx.gs.desc.res_table,
+-                                     prims, draw->instance.count, *last_job,
+-                                     last_job);
++      result = build_poly_compute_job(cmdbuf, gs_main,
++                                      cmdbuf->state.gfx.gs.desc.res_table,
++                                      prims, draw->instance.count, &job, &fau);
+       if (result != VK_SUCCESS)
+          return result;
++      if (gpu)
++         gpu->gs = job;
++      else
++         *last_job = add_poly_compute_job(cmdbuf, &job, false, *last_job);
++   }
++
++   return VK_SUCCESS;
++}
++
++/*
++ * Geometry shader draws whose counts only the GPU knows: an indirect draw
++ * (one of its draws: draw->draw_id) or a direct one with primitive restart
++ * in strips (unrolled to a list in poly's heap first, then drawn as an
++ * indirect draw of it). After the heap reset of the batch, the unroll and
++ * setup jobs patch the vertex / geometry shader compute jobs and the
++ * layers' IDVS jobs (built, not added yet), then those are added after
++ * them. Returns the job the IDVS jobs depend on.
++ */
++static VkResult
++emit_poly_gpu_setup(struct panvk_cmd_buffer *cmdbuf,
++                    const struct panvk_draw_info *draw, bool restart,
++                    struct poly_gpu_jobs *gpu, const struct pan_ptr *idvs_jobs,
++                    uint32_t idvs_job_count)
++{
++   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
++   struct panvk_batch *batch = cmdbuf->cur_batch;
++   const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
++   const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
++   const struct poly_gs_info *gsi = &gs->poly.gs_info;
++   const struct panvk_shader_variant *vs_sw =
++      panvk_shader_variant(vs, PANVK_VS_VARIANT_SW);
++   const struct vk_dynamic_graphics_state *dyns =
++      &cmdbuf->vk.dynamic_graphics_state;
++   const struct vk_vertex_input_state *vi = dyns->vi;
++   const uint64_t heap = dev->poly_heap->addr.dev;
++   const uint64_t heap_data = heap + 64;
++   const uint32_t heap_size = pan_kmod_bo_size(dev->poly_heap->bo) - 64;
++   const bool flatshade_first =
++      dyns->rs.provoking_vertex != VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
++   enum mesa_prim prim = draw->prim;
++   unsigned dep;
++
++   if (!batch->poly_heap_reset_job) {
++      struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
++      panlib_poly_heap_reset_v9(&precomp_ctx, panlib_1d(1),
++                                PANLIB_BARRIER_NONE, heap, heap_data,
++                                heap_size);
++      batch->poly_heap_reset_job = batch->vtc_jc.job_index;
++   }
++   dep = batch->poly_heap_reset_job;
++
++   /* the draw command, for a direct draw written here */
++   uint64_t cmd = 0, count_buf = draw->indirect.count_buffer_dev_addr;
++   uint32_t max_draw_count = 1;
++   if (draw->indirect.buffer_dev_addr) {
++      cmd = draw->indirect.buffer_dev_addr +
++            (uint64_t)draw->draw_id * draw->indirect.stride;
++      max_draw_count = draw->indirect.draw_count;
++   } else {
++      struct pan_ptr c = panvk_cmd_alloc_dev_mem(cmdbuf, desc, 5 * 4, 4);
++      if (!c.gpu)
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      uint32_t *words = c.cpu;
++      words[0] = draw->vertex.count;
++      words[1] = draw->instance.count;
++      if (draw->index.index_size) {
++         words[2] = draw->index.offset;
++         words[3] = draw->vertex.base;
++         words[4] = draw->instance.base;
++      } else {
++         words[2] = draw->vertex.base;
++         words[3] = draw->instance.base;
++      }
++      cmd = c.gpu;
++   }
++
++   uint64_t index_buffer = draw->index.buffer_dev_addr;
++   uint32_t index_avail =
++      draw->index.index_size ? draw->index.buffer_size / draw->index.index_size
++                             : 0;
++
++   if (restart) {
++      struct pan_ptr out_draw = panvk_cmd_alloc_dev_mem(cmdbuf, desc, 5 * 4, 4);
++      if (!out_draw.gpu)
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++      struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
++      struct panlib_unroll_restart_v9_args args = {
++         .out_draw = out_draw.gpu,
++         .heap = heap,
++         .in_draw = cmd,
++         .index_buffer = index_buffer,
++         .index_buffer_range_el = index_avail,
++         .flatshade_first = flatshade_first,
++      };
++      panlib_unroll_restart_v9_struct(
++         &precomp_ctx, panlib_1d_with_jm_deps(1, dep, 0), PANLIB_BARRIER_NONE,
++         args, util_logbase2(draw->index.index_size), poly_compact_prim(prim));
++      dep = batch->vtc_jc.job_index;
++
++      /* now a list in the heap, offset by the command's first index */
++      cmd = out_draw.gpu;
++      index_buffer = heap_data;
++      index_avail = heap_size / draw->index.index_size;
++      prim = u_decomposed_prim(prim);
++   }
++
++   struct pan_ptr jobs_list = panvk_cmd_alloc_dev_mem(
++      cmdbuf, desc, MAX2(idvs_job_count, 1) * sizeof(uint64_t), 8);
++   if (!jobs_list.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   for (uint32_t i = 0; i < idvs_job_count; i++)
++      ((uint64_t *)jobs_list.cpu)[i] = idvs_jobs[i].gpu;
++
++   /* indirect draws: firstInstance offsets this draw's own copy of the
++    * per-instance attributes (direct draws have it already) */
++   uint32_t patch_mask = draw->indirect.buffer_dev_addr
++                            ? cmdbuf->state.gfx.vi.attribs_changing_on_base_instance
++                            : 0;
++   uint32_t patch_count = util_bitcount(patch_mask);
++   uint64_t patches = 0;
++   if (patch_count) {
++      struct pan_ptr p = panvk_cmd_alloc_dev_mem(
++         cmdbuf, desc, patch_count * 2 * sizeof(uint32_t), sizeof(uint32_t));
++      uint32_t *pairs = p.cpu, n = 0;
++
++      if (!p.gpu)
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      u_foreach_bit(i, patch_mask) {
++         pairs[n++] = i;
++         pairs[n++] = dyns->vi_binding_strides[vi->attributes[i].binding];
++      }
++      patches = p.gpu;
++   }
++
++#define FAU_OFF(name)                                                          \
++   (shader_uses_sysval(vs_sw, graphics, name)                                  \
++       ? shader_remapped_sysval_offset(vs_sw, sysval_offset(graphics, name))   \
++       : ~0u)
++
++   const struct panlib_gs_setup_indirect_v9_args args = {
++      .cmd = cmd,
++      .count_buf = count_buf,
++      .draw_id = draw->draw_id,
++      .max_draw_count = max_draw_count,
++      .index_buffer = draw->index.index_size ? index_buffer : 0,
++      .index_size = draw->index.index_size,
++      .index_avail = index_avail,
++      .vp = draw->poly.vertex_params,
++      .p = draw->poly.geometry_params,
++      .heap = heap,
++      .vs_outputs = vs->poly.vs_sw_outputs,
++      .prim = prim,
++      .max_indices = gsi->max_indices,
++      .shape = gsi->shape,
++      .vs_job = gpu->vs.gpu,
++      .gs_job = gpu->gs.gpu,
++      .idvs_jobs = jobs_list.gpu,
++      .idvs_job_count = idvs_job_count,
++      /* dynamic: set by the setup job; static: left as emitted */
++      .rast_index_buffer = 0,
++      .vs_fau = gpu->vs_fau,
++      .first_vertex_off = FAU_OFF(vs.first_vertex),
++      .base_instance_off = FAU_OFF(vs.base_instance),
++      .draw_id_off = FAU_OFF(vs.draw_id),
++      .vs_attribs = cmdbuf->state.gfx.vs.desc.driver_set.dev_addr,
++      .attrib_patches = patches,
++      .patch_attrib_count = patch_count,
++   };
++#undef FAU_OFF
++
++   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
++   panlib_gs_setup_indirect_v9_struct(&precomp_ctx,
++                                      panlib_1d_with_jm_deps(1, dep, 0),
++                                      PANLIB_BARRIER_JM_SUPPRESS_PREFETCH,
++                                      args);
++   dep = batch->vtc_jc.job_index;
++
++   if (gpu->vs.gpu)
++      dep = add_poly_compute_job(cmdbuf, &gpu->vs, true, dep);
++   if (gpu->gs.gpu)
++      dep = add_poly_compute_job(cmdbuf, &gpu->gs, true, dep);
++
++   for (uint32_t i = 0; i < idvs_job_count; i++) {
++      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_MALLOC_VERTEX, false, false,
++                     dep, 0, &idvs_jobs[i], false);
++   }
++
++   return VK_SUCCESS;
++}
++
++/* ---- index rewrites ---- */
++
++/* The tiler draws neither polygon edges nor primitives with adjacency:
++ * VK_POLYGON_MODE_LINE triangles and adjacency topologies without a geometry
++ * shader become indexed line / triangle lists written by a precomp job,
++ * see panlib_rewrite_indices_v9(). */
++static bool
++lines_from_tris(const struct panvk_cmd_buffer *cmdbuf, enum mesa_prim prim)
++{
++   return u_reduced_prim(prim) == MESA_PRIM_TRIANGLES &&
++          cmdbuf->vk.dynamic_graphics_state.rs.polygon_mode ==
++             VK_POLYGON_MODE_LINE;
++}
++
++static bool
++needs_index_rewrite(const struct panvk_cmd_buffer *cmdbuf,
++                    const struct panvk_draw_info *draw)
++{
++   return mesa_prim_has_adjacency(draw->prim) ||
++          lines_from_tris(cmdbuf, draw->prim);
++}
++
++/* The draw the hardware does (rast) and the rewrite job's arguments. */
++static VkResult
++prepare_index_rewrite(struct panvk_cmd_buffer *cmdbuf,
++                      const struct panvk_draw_info *draw,
++                      struct panvk_draw_info *rast,
++                      struct panlib_rewrite_indices_v9_args *args)
++{
++   const bool edges = lines_from_tris(cmdbuf, draw->prim);
++   const bool tris = u_reduced_prim(draw->prim) == MESA_PRIM_TRIANGLES;
++   const uint32_t prims =
++      u_decomposed_prims_for_vertices(draw->prim, draw->vertex.count);
++   const uint32_t per_prim = edges ? 6 : tris ? 3 : 2;
++   const uint32_t count = prims * per_prim;
++
++   struct pan_ptr out =
++      panvk_cmd_alloc_dev_mem(cmdbuf, desc, MAX2(count, 1) * 4, 4);
++   if (!out.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   *rast = *draw;
++   rast->prim = edges ? MESA_PRIM_LINES
++                      : tris ? MESA_PRIM_TRIANGLES : MESA_PRIM_LINES;
++   rast->vertex.count = count;
++   rast->index.buffer_dev_addr = out.gpu;
++   rast->index.buffer_size = count * 4;
++   rast->index.index_size = 4;
++   rast->index.offset = 0;
++   rast->index.restart_enable = false;
++
++   *args = (struct panlib_rewrite_indices_v9_args){
++      .out = out.gpu,
++      .num_prims = prims,
++      .flatshade_first =
++         cmdbuf->vk.dynamic_graphics_state.rs.provoking_vertex !=
++         VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT,
++      .lines_from_tris = edges,
++   };
++
++   if (draw->index.index_size) {
++      uint32_t avail = draw->index.buffer_size / draw->index.index_size;
++
++      args->index_size = draw->index.index_size;
++      args->index_avail = poly_index_buffer_range_el(avail, draw->index.offset);
++      args->index_buffer =
++         args->index_avail ? draw->index.buffer_dev_addr +
++                                (uint64_t)draw->index.offset *
++                                   draw->index.index_size
++                           : PAN_SHADER_OOB_ADDRESS;
+    }
+ 
+    return VK_SUCCESS;
+@@ -1252,29 +1564,57 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
+     * jobs and the sysvals. */
+    struct panvk_draw_info rast_draw;
+    const struct panvk_draw_info *hw_draw = draw;
++   /* indirect draws and primitive restart in strips: counts known on the
++    * GPU only, see emit_poly_gpu_setup() */
++   const bool gs_restart = draw->index.index_size &&
++                           draw->index.restart_enable &&
++                           u_decomposed_prim(draw->prim) != draw->prim;
++   const bool gpu_counts =
++      gs && (draw->indirect.buffer_dev_addr || gs_restart);
+    if (gs) {
+-      /* TODO: indirect draws (poly's indirect setup kernel) and primitive
+-       * restart in strips (poly's restart unrolling) */
+-      if (draw->indirect.buffer_dev_addr ||
+-          (draw->index.index_size && draw->index.restart_enable &&
+-           u_decomposed_prim(draw->prim) != draw->prim)) {
+-         mesa_logw_once("panvk: geometry shader with an indirect draw or "
+-                        "primitive restart: draw skipped");
++      if (gpu_counts &&
++          !to_panvk_device(cmdbuf->vk.base.device)->poly_heap) {
++         mesa_logw_once("panvk: geometry shader without the geometryShader "
++                        "feature enabled: draw skipped");
+          return;
+       }
+ 
+-      result = prepare_poly_draw(cmdbuf, draw, &rast_draw);
++      result = prepare_poly_draw(
++         cmdbuf, draw, gpu_counts,
++         gs_restart ? u_decomposed_prim(draw->prim) : draw->prim, &rast_draw);
+       if (result != VK_SUCCESS)
+          return;
+-      if (!rast_draw.vertex.count || !rast_draw.instance.count)
++      if (!gpu_counts &&
++          (!rast_draw.vertex.count || !rast_draw.instance.count))
+          return;
+       hw_draw = &rast_draw;
+-   } else if (mesa_prim_has_adjacency(draw->prim)) {
+-      /* TODO: without a geometry shader the adjacent vertices are ignored:
+-       * an index rewrite job (as for VK_POLYGON_MODE_LINE) */
+-      mesa_logw_once("panvk: adjacency topology without a geometry shader: "
+-                     "draw skipped");
+-      return;
++   }
++
++   struct panlib_rewrite_indices_v9_args rewrite;
++   bool rewrite_indices = !gs && needs_index_rewrite(cmdbuf, draw);
++   if (rewrite_indices) {
++      /* TODO: indirect draws and primitive restart in strips (the count is
++       * known on the GPU only). Polygon edges then fall back to filled
++       * polygons, adjacency draws are skipped. */
++      if (draw->indirect.buffer_dev_addr ||
++          (draw->index.index_size && draw->index.restart_enable &&
++           u_decomposed_prim(draw->prim) != draw->prim)) {
++         if (mesa_prim_has_adjacency(draw->prim)) {
++            mesa_logw_once("panvk: adjacency topology with an indirect draw "
++                           "or primitive restart: draw skipped");
++            return;
++         }
++         mesa_logw_once("panvk: VK_POLYGON_MODE_LINE with an indirect draw "
++                        "or primitive restart: drawn filled");
++         rewrite_indices = false;
++      } else {
++         result = prepare_index_rewrite(cmdbuf, draw, &rast_draw, &rewrite);
++         if (result != VK_SUCCESS)
++            return;
++         if (!rast_draw.vertex.count)
++            return;
++         hw_draw = &rast_draw;
++      }
+    }
+ 
+    cmdbuf->state.gfx.fs.required =
+@@ -1365,6 +1705,8 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
+    uint32_t layer_count = view_mask ? util_bitcount(view_mask)
+                                     : cmdbuf->state.gfx.render.layer_count;
+    unsigned poly_job = 0;
++   struct poly_gpu_jobs gpu_jobs = {0};
++   STACK_ARRAY(struct pan_ptr, gpu_idvs_jobs, gpu_counts ? layer_count : 1);
+    for (uint32_t i = 0; i < layer_count; i++) {
+       uint32_t layer = view_mask ? u_bit_scan(&view_mask) : i;
+ 
+@@ -1375,27 +1717,45 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
+       result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+          cmdbuf, vs, &push_uniforms, 1);
+       if (result != VK_SUCCESS)
+-         return;
++         goto out;
+       cmdbuf->state.gfx.vs.push_uniforms = push_uniforms.gpu;
+ 
+       if (fs) {
+          result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+             cmdbuf, fs, &push_uniforms, 1);
+          if (result != VK_SUCCESS)
+-            return;
++            goto out;
+          cmdbuf->state.gfx.fs.push_uniforms = push_uniforms.gpu;
+       }
+ 
+       /* once per draw, with the first layer's sysvals */
+       unsigned dep = 0;
+       if (gs && i == 0) {
+-         result = emit_poly_jobs(cmdbuf, draw, &poly_job);
++         result = emit_poly_jobs(cmdbuf, draw, draw->poly.input_topology,
++                                 gpu_counts ? &gpu_jobs : NULL, &poly_job);
+          if (result != VK_SUCCESS)
+-            return;
++            goto out;
+       }
+-      if (gs)
++      if (rewrite_indices && i == 0) {
++         struct panvk_precomp_ctx precomp_ctx =
++            panvk_per_arch(precomp_cs)(cmdbuf);
++         panlib_rewrite_indices_v9_struct(
++            &precomp_ctx, panlib_1d(DIV_ROUND_UP(rewrite.num_prims, 64)),
++            PANLIB_BARRIER_NONE, rewrite, poly_compact_prim(draw->prim));
++         poly_job = batch->vtc_jc.job_index;
++      }
++      if (gs || rewrite_indices)
+          dep = poly_job;
+ 
++      /* added after the setup job patching them */
++      if (gpu_counts) {
++         result = emit_idvs_job(cmdbuf, hw_draw, layer, zsd, bds, bd_count, 0,
++                                &gpu_idvs_jobs[i]);
++         if (result != VK_SUCCESS)
++            goto out;
++         continue;
++      }
++
+       bool indirect = draw->indirect.buffer_dev_addr != 0;
+       struct pan_ptr job;
+ 
+@@ -1404,10 +1764,20 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
+       if (result == VK_SUCCESS && indirect)
+          result = emit_indirect_patch(cmdbuf, draw, &job, i == 0);
+       if (result != VK_SUCCESS)
+-         return;
++         goto out;
++   }
++
++   if (gpu_counts) {
++      result = emit_poly_gpu_setup(cmdbuf, draw, gs_restart, &gpu_jobs,
++                                   gpu_idvs_jobs, layer_count);
++      if (result != VK_SUCCESS)
++         goto out;
+    }
+ 
+    clear_dirty_after_draw(cmdbuf);
++
++out:
++   STACK_ARRAY_FINISH(gpu_idvs_jobs);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index ddbcc51..6fd184a 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -81,6 +81,15 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+                 (uint8_t *)&c->data + pan_size(JOB_HEADER),
+                 sizeof(c->data) - pan_size(JOB_HEADER));
+       }
++      /* patched compute jobs: also their type (header word 4, OR-ed in by
++       * the GPU); words 6-7 (next job) are linked after the copy */
++      util_dynarray_foreach(&batch->compute_job_copies,
++                            struct panvk_compute_job_copy, c) {
++         memcpy((uint8_t *)c->job + 16, (uint8_t *)&c->data + 16, 8);
++         memcpy((uint8_t *)c->job + pan_size(JOB_HEADER),
++                (uint8_t *)&c->data + pan_size(JOB_HEADER),
++                sizeof(c->data) - pan_size(JOB_HEADER));
++      }
+ #endif
+ 
+       /* We don't keep track of BO <-> job relationship, so let's just flush the
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index 02dc844..80ae9f1 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -467,6 +467,8 @@ struct panvk_draw_info {
+       uint64_t vertex_params;
+       uint64_t geometry_params;
+       uint32_t rast_last_vertex;
++      /* the geometry shader's input primitives (restart: unrolled) */
++      enum mesa_prim input_topology;
+    } poly;
+ #endif
+ };
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index d82dd2e..63f24bc 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -49,6 +49,10 @@ enum panvk_queue_family {
+ };
+ 
+ #define PANVK_NULL_INDEX_BUFFER_SIZE (256 * 1024)
++/* poly's heap: what a batch's geometry shader draws with GPU-side counts
++ * allocate (vertex shader outputs, index buffers); only used pages are
++ * backed */
++#define PANVK_POLY_HEAP_SIZE (256 * 1024 * 1024)
+ 
+ struct panvk_device {
+    struct vk_device vk;
+@@ -74,6 +78,9 @@ struct panvk_device {
+    /* v9: zeroed index buffer bound for a null index buffer (maintenance6),
+     * v9 has no index buffer size to make the fetches out of bounds */
+    struct panvk_priv_bo *null_index_buffer;
++   /* v9 geometry shaders with indirect draws / primitive restart: poly's
++    * heap (struct poly_heap header, then the data), grown on fault */
++   struct panvk_priv_bo *poly_heap;
+ 
+    struct {
+       struct panvk_priv_bo *handlers_bo;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index c077273..74ae3a2 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -886,7 +886,8 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
+                      info->poly.vertex_params);
+       set_gfx_sysval(cmdbuf, dirty_sysvals, poly.geometry_params,
+                      info->poly.geometry_params);
+-      set_gfx_sysval(cmdbuf, dirty_sysvals, poly.input_topology, info->prim);
++      set_gfx_sysval(cmdbuf, dirty_sysvals, poly.input_topology,
++                     info->poly.input_topology);
+       set_gfx_sysval(cmdbuf, dirty_sysvals, poly.provoking_last,
+                      rs->provoking_vertex ==
+                         VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT);
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 04d64ac..1060677 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -534,6 +534,15 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+                                  &device->null_index_buffer);
+    if (result != VK_SUCCESS)
+       goto err_free_priv_bos;
++
++   if (device->vk.enabled_features.geometryShader) {
++      result = panvk_priv_bo_create(
++         device, PANVK_POLY_HEAP_SIZE,
++         PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
++         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->poly_heap);
++      if (result != VK_SUCCESS)
++         goto err_free_priv_bos;
++   }
+ #endif
+ 
+ #if PAN_ARCH >= 10
+@@ -629,6 +638,7 @@ err_free_priv_bos:
+    panvk_priv_bo_unref(device->sample_positions);
+ #if PAN_ARCH == 9
+    panvk_priv_bo_unref(device->null_index_buffer);
++   panvk_priv_bo_unref(device->poly_heap);
+ #endif
+    panvk_priv_bo_unref(device->indirect_varying_buffer);
+    panvk_priv_bo_unref(device->tiler_heap);
+@@ -687,6 +697,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
+    panvk_priv_bo_unref(device->sample_positions);
+ #if PAN_ARCH == 9
+    panvk_priv_bo_unref(device->null_index_buffer);
++   panvk_priv_bo_unref(device->poly_heap);
+ #endif
+    panvk_device_cleanup_mempools(device);
+    vk_free(&device->vk.alloc, device->dump_region_size);
+-- 
+2.56.0
+

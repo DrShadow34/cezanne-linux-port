@@ -1,0 +1,34 @@
+#!/bin/sh
+# Wi-Fi bring-up for the MediaTek connectivity modules on mainline
+# (conninfra + wmt_chrdev_wifi + gen4m, see NOTES.md):
+#  1. load the modules
+#  2. hand the Wi-Fi NVRAM (calibration, MAC) from MIUI's nvdata partition to
+#     the driver, as the Android HAL does ("WR-BUF:NVRAM" + data)
+#  3. report screen on: starts the RF pre-calibration (no MTK display notifier)
+#  4. power Wi-Fi on; the driver waits for the pre-calibration (up to 10 s)
+#  5. drop the driver's log level to errors (default floods dmesg)
+set -e
+modprobe conninfra
+modprobe wmt_chrdev_wifi_connac2
+modprobe wlan_drv_gen4m_6885
+for i in $(seq 50); do [ -c /dev/wmtWifi ] && break; sleep 0.1; done
+
+P=$(mktemp -d)
+mount -o ro /dev/disk/by-partlabel/nvdata "$P"
+{ printf 'WR-BUF:NVRAM'; cat "$P/APCFG/APRDEB/WIFI"; } > /run/wifi-nvram.bin
+umount "$P"; rmdir "$P"
+dd if=/run/wifi-nvram.bin of=/dev/wmtWifi bs=8192 count=1 2>/dev/null
+rm -f /run/wifi-nvram.bin
+
+echo 1 > /sys/module/conninfra/parameters/screen_on
+for i in 1 2 3 4 5; do
+	if echo 1 > /dev/wmtWifi 2>/dev/null; then
+		echo 0xFF:0x01 > /proc/net/wlan/dbgLevel 2>/dev/null || true
+		# link quality monitor: "rate error for CCK" every few seconds
+		echo 0x0b:0x00 > /proc/net/wlan/dbgLevel 2>/dev/null || true
+		exit 0
+	fi
+	sleep 2
+done
+echo "Wi-Fi power on failed" >&2
+exit 1

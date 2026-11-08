@@ -1,0 +1,206 @@
+ASoC: mt8192: hostless speech DAI for voice calls (MD1 on PCM 2)
+
+diff --git a/sound/soc/mediatek/common/mtk-afe-platform-driver.c b/sound/soc/mediatek/common/mtk-afe-platform-driver.c
+index 477284e12..9f00a3919 100644
+--- a/sound/soc/mediatek/common/mtk-afe-platform-driver.c
++++ b/sound/soc/mediatek/common/mtk-afe-platform-driver.c
+@@ -83,8 +83,9 @@ snd_pcm_uframes_t mtk_afe_pcm_pointer(struct snd_soc_component *component,
+ {
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+ 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
+-	struct mtk_base_afe_memif *memif = &afe->memif[snd_soc_rtd_to_cpu(rtd, 0)->id];
+-	const struct mtk_base_memif_data *memif_data = memif->data;
++	int id = snd_soc_rtd_to_cpu(rtd, 0)->id;
++	struct mtk_base_afe_memif *memif;
++	const struct mtk_base_memif_data *memif_data;
+ 	struct regmap *regmap = afe->regmap;
+ 	struct device *dev = afe->dev;
+ 	unsigned int hw_ptr_lower32 = 0, hw_ptr_upper32 = 0;
+@@ -93,6 +94,12 @@ snd_pcm_uframes_t mtk_afe_pcm_pointer(struct snd_soc_component *component,
+ 	int ret;
+ 	unsigned long long pcm_ptr_bytes = 0;
+ 
++	/* hostless front ends move no data through memory */
++	if (id >= afe->memif_size)
++		return 0;
++	memif = &afe->memif[id];
++	memif_data = memif->data;
++
+ 	ret = regmap_read(regmap, memif_data->reg_ofs_cur, &hw_ptr_lower32);
+ 	if (ret) {
+ 		dev_err(dev, "%s hw_ptr_lower32 err\n", __func__);
+diff --git a/sound/soc/mediatek/mt8192/Makefile b/sound/soc/mediatek/mt8192/Makefile
+index d60c36bcd..38e9391ec 100644
+--- a/sound/soc/mediatek/mt8192/Makefile
++++ b/sound/soc/mediatek/mt8192/Makefile
+@@ -9,7 +9,8 @@ snd-soc-mt8192-afe-y := \
+ 	mt8192-afe-control.o \
+ 	mt8192-dai-i2s.o \
+ 	mt8192-dai-pcm.o \
+-	mt8192-dai-tdm.o
++	mt8192-dai-tdm.o \
++	mt8192-dai-hostless.o
+ 
+ obj-$(CONFIG_SND_SOC_MT8192) += snd-soc-mt8192-afe.o
+ obj-$(CONFIG_SND_SOC_MT8192_MT6359_RT1015_RT5682) += \
+diff --git a/sound/soc/mediatek/mt8192/mt8192-afe-common.h b/sound/soc/mediatek/mt8192/mt8192-afe-common.h
+index ad461dcb6..416273822 100644
+--- a/sound/soc/mediatek/mt8192/mt8192-afe-common.h
++++ b/sound/soc/mediatek/mt8192/mt8192-afe-common.h
+@@ -62,6 +62,7 @@ enum {
+ 	MT8192_DAI_PCM_1,
+ 	MT8192_DAI_PCM_2,
+ 	MT8192_DAI_TDM,
++	MT8192_DAI_HOSTLESS_SPEECH,
+ 	MT8192_DAI_NUM,
+ };
+ 
+@@ -158,6 +159,7 @@ int mt8192_dai_hw_gain_register(struct mtk_base_afe *afe);
+ int mt8192_dai_src_register(struct mtk_base_afe *afe);
+ int mt8192_dai_pcm_register(struct mtk_base_afe *afe);
+ int mt8192_dai_tdm_register(struct mtk_base_afe *afe);
++int mt8192_dai_hostless_register(struct mtk_base_afe *afe);
+ 
+ int mt8192_dai_i2s_set_share(struct mtk_base_afe *afe, const char *main_i2s_name,
+ 			     const char *secondary_i2s_name);
+diff --git a/sound/soc/mediatek/mt8192/mt8192-afe-pcm.c b/sound/soc/mediatek/mt8192/mt8192-afe-pcm.c
+index d03f3aef9..347c158d3 100644
+--- a/sound/soc/mediatek/mt8192/mt8192-afe-pcm.c
++++ b/sound/soc/mediatek/mt8192/mt8192-afe-pcm.c
+@@ -2152,6 +2152,12 @@ static const dai_register_cb dai_register_cbs[] = {
+ 	mt8192_dai_i2s_register,
+ 	mt8192_dai_pcm_register,
+ 	mt8192_dai_tdm_register,
++	mt8192_dai_hostless_register,
++	/*
++	 * memif last: sub DAIs are combined head first, and DL1 (id 0) only
++	 * keeps its id as the component's first DAI (ASoC replaces id 0 by
++	 * the index); behind another DAI it would drive DL12's registers
++	 */
+ 	mt8192_dai_memif_register,
+ };
+ 
+diff --git a/sound/soc/mediatek/mt8192/mt8192-dai-hostless.c b/sound/soc/mediatek/mt8192/mt8192-dai-hostless.c
+new file mode 100644
+index 000000000..5f0809217
+--- /dev/null
++++ b/sound/soc/mediatek/mt8192/mt8192-dai-hostless.c
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: GPL-2.0
++//
++// MediaTek ALSA SoC Audio DAI Hostless Control
++//
++// Voice calls: the modem's PCM (MD1 on PCM 2) is connected straight to the
++// microphones (ADDA UL) and to the speaker amplifiers (I2S3) or the headset
++// (ADDA DL) inside the AFE; opening this front end only powers the path,
++// no data goes through memory (as mt8183-dai-hostless.c).
++
++#include "mt8192-afe-common.h"
++
++static const struct snd_soc_dapm_route mtk_dai_hostless_routes[] = {
++	/* modem downlink */
++	{"I2S3_CH1", "PCM_2_CAP_CH1", "Hostless Speech DL"},
++	{"I2S3_CH2", "PCM_2_CAP_CH1", "Hostless Speech DL"},
++	{"ADDA_DL_CH1", "PCM_2_CAP_CH1", "Hostless Speech DL"},
++	{"ADDA_DL_CH2", "PCM_2_CAP_CH1", "Hostless Speech DL"},
++	/* modem uplink */
++	{"PCM_2_PB_CH1", "ADDA_UL_CH1", "Hostless Speech DL"},
++	{"PCM_2_PB_CH2", "ADDA_UL_CH2", "Hostless Speech DL"},
++	{"PCM_2_PB_CH3", "ADDA_UL_CH3", "Hostless Speech DL"},
++
++	{"Hostless Speech UL", NULL, "PCM 2 Capture"},
++	{"Hostless Speech UL", NULL, "ADDA Capture"},
++};
++
++static int mtk_dai_hostless_startup(struct snd_pcm_substream *substream,
++				    struct snd_soc_dai *dai)
++{
++	struct mtk_base_afe *afe = snd_soc_dai_get_drvdata(dai);
++
++	return snd_soc_set_runtime_hwparams(substream, afe->mtk_afe_hardware);
++}
++
++static const struct snd_soc_dai_ops mtk_dai_hostless_ops = {
++	.startup = mtk_dai_hostless_startup,
++};
++
++#define MTK_HOSTLESS_RATES (SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 |\
++			    SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_48000)
++
++#define MTK_HOSTLESS_FORMATS (SNDRV_PCM_FMTBIT_S16_LE |\
++			      SNDRV_PCM_FMTBIT_S24_LE |\
++			      SNDRV_PCM_FMTBIT_S32_LE)
++
++static struct snd_soc_dai_driver mtk_dai_hostless_driver[] = {
++	{
++		.name = "Hostless Speech DAI",
++		.id = MT8192_DAI_HOSTLESS_SPEECH,
++		.playback = {
++			.stream_name = "Hostless Speech DL",
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = MTK_HOSTLESS_RATES,
++			.formats = MTK_HOSTLESS_FORMATS,
++		},
++		.capture = {
++			.stream_name = "Hostless Speech UL",
++			.channels_min = 1,
++			.channels_max = 2,
++			.rates = MTK_HOSTLESS_RATES,
++			.formats = MTK_HOSTLESS_FORMATS,
++		},
++		.ops = &mtk_dai_hostless_ops,
++	},
++};
++
++int mt8192_dai_hostless_register(struct mtk_base_afe *afe)
++{
++	struct mtk_base_afe_dai *dai;
++
++	dai = devm_kzalloc(afe->dev, sizeof(*dai), GFP_KERNEL);
++	if (!dai)
++		return -ENOMEM;
++
++	list_add(&dai->list, &afe->sub_dais);
++
++	dai->dai_drivers = mtk_dai_hostless_driver;
++	dai->num_dai_drivers = ARRAY_SIZE(mtk_dai_hostless_driver);
++
++	dai->dapm_routes = mtk_dai_hostless_routes;
++	dai->num_dapm_routes = ARRAY_SIZE(mtk_dai_hostless_routes);
++
++	return 0;
++}
+diff --git a/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c b/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
+index e1785bbcd..8b0e66557 100644
+--- a/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
++++ b/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
+@@ -538,6 +538,11 @@ SND_SOC_DAILINK_DEFS(capture_mono3,
+ 		     DAILINK_COMP_ARRAY(COMP_DUMMY()),
+ 		     DAILINK_COMP_ARRAY(COMP_EMPTY()));
+ 
++SND_SOC_DAILINK_DEFS(hostless_speech,
++		     DAILINK_COMP_ARRAY(COMP_CPU("Hostless Speech DAI")),
++		     DAILINK_COMP_ARRAY(COMP_DUMMY()),
++		     DAILINK_COMP_ARRAY(COMP_EMPTY()));
++
+ SND_SOC_DAILINK_DEFS(playback_hdmi,
+ 		     DAILINK_COMP_ARRAY(COMP_CPU("HDMI")),
+ 		     DAILINK_COMP_ARRAY(COMP_DUMMY()),
+@@ -836,6 +841,16 @@ static struct snd_soc_dai_link mt8192_mt6359_dai_links[] = {
+ 		.playback_only = 1,
+ 		SND_SOC_DAILINK_REG(playback_hdmi),
+ 	},
++	{
++		/* voice calls: modem PCM <-> mics / amps, no host buffer */
++		.name = "Hostless_Speech",
++		.stream_name = "Hostless_Speech",
++		.trigger = {SND_SOC_DPCM_TRIGGER_PRE,
++			    SND_SOC_DPCM_TRIGGER_PRE},
++		.dynamic = 1,
++		.ignore_suspend = 1,
++		SND_SOC_DAILINK_REG(hostless_speech),
++	},
+ 	/* Back End DAI links */
+ 	{
+ 		.name = "Primary Codec",

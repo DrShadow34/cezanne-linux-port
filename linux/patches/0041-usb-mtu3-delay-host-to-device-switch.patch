@@ -1,0 +1,29 @@
+usb: mtu3: let xHCI finish the disconnect before handing the port to the device MAC
+
+diff --git a/drivers/usb/mtu3/mtu3_dr.c b/drivers/usb/mtu3/mtu3_dr.c
+index ffa5b9401..89ab3ffd2 100644
+--- a/drivers/usb/mtu3/mtu3_dr.c
++++ b/drivers/usb/mtu3/mtu3_dr.c
+@@ -7,6 +7,7 @@
+  * Author: Chunfeng Yun <chunfeng.yun@mediatek.com>
+  */
+ 
++#include <linux/delay.h>
+ #include <linux/string_choices.h>
+ #include "mtu3.h"
+ #include "mtu3_dr.h"
+@@ -159,6 +160,14 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 		ssusb->is_host = true;
+ 		break;
+ 	case USB_ROLE_DEVICE:
++		/*
++		 * A single shared port: once it moves to the device MAC, xHCI
++		 * can't finish the disconnect of the device that just left
++		 * (stop endpoint times out, "HC died"). Let the hub thread
++		 * tear it down first.
++		 */
++		if (ssusb->is_host)
++			msleep(300);
+ 		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_DEVICE);
+ 		ssusb->is_host = false;
+ 		ssusb_set_vbus(otg_sx, 0);

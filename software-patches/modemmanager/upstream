@@ -1,0 +1,4 @@
+# Arch's modemmanager (+ libmm-glib, modemmanager-docs) with the MT6885
+# patches; SUFFIX 6: the hand-built 1.24.2-2.5 is installed
+UPSTREAM=modemmanager
+SUFFIX=6

@@ -1,0 +1,270 @@
+diff --git a/drivers/clk/mediatek/Makefile b/drivers/clk/mediatek/Makefile
+index 0b79834b1..fe22102cb 100644
+--- a/drivers/clk/mediatek/Makefile
++++ b/drivers/clk/mediatek/Makefile
+@@ -173,4 +173,4 @@ obj-$(CONFIG_COMMON_CLK_MT8365_VDEC) += clk-mt8365-vdec.o
+ obj-$(CONFIG_COMMON_CLK_MT8365_VENC) += clk-mt8365-venc.o
+ obj-$(CONFIG_COMMON_CLK_MT8516) += clk-mt8516-apmixedsys.o clk-mt8516.o
+ obj-$(CONFIG_COMMON_CLK_MT8516_AUDSYS) += clk-mt8516-aud.o
+-obj-$(CONFIG_COMMON_CLK_MT6885) += clk-mt6885.o
++obj-$(CONFIG_COMMON_CLK_MT6885) += clk-mt6885.o clk-mt6885-cam.o
+diff --git a/drivers/clk/mediatek/clk-mt6885-cam.c b/drivers/clk/mediatek/clk-mt6885-cam.c
+new file mode 100644
+index 000000000..ff4a75c79
+--- /dev/null
++++ b/drivers/clk/mediatek/clk-mt6885-cam.c
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MT6885 camera subsystem clock gates (camsys + the three raw pipes).
++ * Same layout as MT8192 (clk-mt8192-cam.c) plus LARB15 and MRAW1; bits from
++ * the BSP clk-mt6885.c camsys_main_clks / camsys_raw*_clks.
++ */
++#include <linux/clk-provider.h>
++#include <linux/platform_device.h>
++
++#include "clk-mtk.h"
++#include "clk-gate.h"
++
++#include <dt-bindings/clock/mt6885-clk.h>
++
++static const struct mtk_gate_regs cam_cg_regs = {
++	.set_ofs = 0x4,
++	.clr_ofs = 0x8,
++	.sta_ofs = 0x0,
++};
++
++#define GATE_CAM(_id, _name, _parent, _shift)	\
++	GATE_MTK(_id, _name, _parent, &cam_cg_regs, _shift, &mtk_clk_gate_ops_setclr)
++
++static const struct mtk_gate cam_clks[] = {
++	GATE_CAM(CAMSYS_LARB13, "cam_larb13", "cam_sel", 0),
++	GATE_CAM(CAMSYS_DFP_VAD, "cam_dfp_vad", "cam_sel", 1),
++	GATE_CAM(CAMSYS_LARB14, "cam_larb14", "cam_sel", 2),
++	GATE_CAM(CAMSYS_LARB15, "cam_larb15", "cam_sel", 3),
++	GATE_CAM(CAMSYS_CAM, "cam_cam", "cam_sel", 6),
++	GATE_CAM(CAMSYS_CAMTG, "cam_camtg", "cam_sel", 7),
++	GATE_CAM(CAMSYS_SENINF, "cam_seninf", "cam_sel", 8),
++	GATE_CAM(CAMSYS_CAMSV0, "cam_camsv0", "cam_sel", 9),
++	GATE_CAM(CAMSYS_CAMSV1, "cam_camsv1", "cam_sel", 10),
++	GATE_CAM(CAMSYS_CAMSV2, "cam_camsv2", "cam_sel", 11),
++	GATE_CAM(CAMSYS_CAMSV3, "cam_camsv3", "cam_sel", 12),
++	GATE_CAM(CAMSYS_CCU0, "cam_ccu0", "cam_sel", 13),
++	GATE_CAM(CAMSYS_CCU1, "cam_ccu1", "cam_sel", 14),
++	GATE_CAM(CAMSYS_MRAW0, "cam_mraw0", "cam_sel", 15),
++	GATE_CAM(CAMSYS_MRAW1, "cam_mraw1", "cam_sel", 16),
++	GATE_CAM(CAMSYS_FAKE_ENG, "cam_fake_eng", "cam_sel", 17),
++};
++
++#define CAM_RAW_CLKS(_x)							\
++static const struct mtk_gate cam_raw##_x##_clks[] = {				\
++	GATE_CAM(CAMSYS_RAW_LARBX, "cam_raw" #_x "_larbx", "cam_sel", 0),	\
++	GATE_CAM(CAMSYS_RAW_CAM, "cam_raw" #_x "_cam", "cam_sel", 1),		\
++	GATE_CAM(CAMSYS_RAW_CAMTG, "cam_raw" #_x "_camtg", "cam_sel", 2),	\
++};										\
++static const struct mtk_clk_desc cam_raw##_x##_desc = {			\
++	.clks = cam_raw##_x##_clks,						\
++	.num_clks = ARRAY_SIZE(cam_raw##_x##_clks),				\
++}
++
++CAM_RAW_CLKS(a);
++CAM_RAW_CLKS(b);
++CAM_RAW_CLKS(c);
++
++static const struct mtk_clk_desc cam_desc = {
++	.clks = cam_clks,
++	.num_clks = ARRAY_SIZE(cam_clks),
++};
++
++static const struct of_device_id of_match_clk_mt6885_cam[] = {
++	{ .compatible = "mediatek,mt6885-camsys", .data = &cam_desc },
++	{ .compatible = "mediatek,mt6885-camsys-rawa", .data = &cam_rawa_desc },
++	{ .compatible = "mediatek,mt6885-camsys-rawb", .data = &cam_rawb_desc },
++	{ .compatible = "mediatek,mt6885-camsys-rawc", .data = &cam_rawc_desc },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, of_match_clk_mt6885_cam);
++
++static struct platform_driver clk_mt6885_cam_drv = {
++	.probe = mtk_clk_simple_probe,
++	.remove = mtk_clk_simple_remove,
++	.driver = {
++		.name = "clk-mt6885-cam",
++		.of_match_table = of_match_clk_mt6885_cam,
++	},
++};
++module_platform_driver(clk_mt6885_cam_drv);
++
++MODULE_DESCRIPTION("MediaTek MT6885 camera clocks driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/pmdomain/mediatek/mt6885-pm-domains.h b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+index b7d492039..598390759 100644
+--- a/drivers/pmdomain/mediatek/mt6885-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+@@ -28,6 +28,9 @@
+ #define MT6885_TOP_AXI_PROT_EN_VDNR_SET		0xbb8
+ #define MT6885_TOP_AXI_PROT_EN_VDNR_CLR		0xbbc
+ #define MT6885_TOP_AXI_PROT_EN_VDNR_STA1	0xbc4
++#define MT6885_TOP_AXI_PROT_EN_MM_SET		0x2d4
++#define MT6885_TOP_AXI_PROT_EN_MM_CLR		0x2d8
++#define MT6885_TOP_AXI_PROT_EN_MM_STA1		0x2ec
+ 
+ #define MT6885_TOP_AXI_PROT_EN_1_MFG1		GENMASK(21, 19)
+ #define MT6885_TOP_AXI_PROT_EN_2_MFG1		GENMASK(6, 5)
+@@ -38,6 +41,17 @@
+ #define MT6885_TOP_AXI_PROT_EN_CONN		BIT(13)
+ #define MT6885_TOP_AXI_PROT_EN_CONN_2ND		BIT(14)
+ #define MT6885_TOP_AXI_PROT_EN_2_CONN		BIT(2)
++/* BSP spm_mtcmos_ctrl_cam*(): MT8192-like but wider MM masks, no VDNR step */
++#define MT6885_TOP_AXI_PROT_EN_2_CAM		BIT(1)
++#define MT6885_TOP_AXI_PROT_EN_MM_CAM		(BIT(0) | BIT(2) | BIT(4))
++#define MT6885_TOP_AXI_PROT_EN_1_CAM		BIT(22)
++#define MT6885_TOP_AXI_PROT_EN_MM_CAM_2ND	(BIT(1) | BIT(3) | BIT(5))
++#define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWA	BIT(18)
++#define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWA_2ND	BIT(19)
++#define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWB	BIT(20)
++#define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWB_2ND	BIT(21)
++#define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC	BIT(22)
++#define MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC_2ND	BIT(23)
+ 
+ static enum scpsys_bus_prot_block scpsys_bus_prot_blocks_mt6885[] = {
+ 	BUS_PROT_BLOCK_INFRA
+@@ -178,6 +192,90 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 		/* stays on across system sleep while conninfra (a wakeup device) uses it */
+ 		.caps = MTK_SCPD_KEEP_DEFAULT_OFF | MTK_SCPD_ACTIVE_WAKEUP,
+ 	},
++	/*
++	 * Camera: BSP spm_mtcmos_ctrl_cam(). Its parent DIS (MM bus, SMI) is
++	 * kept on by lk for the display and not modelled here. Like CONN, the
++	 * BSP does not wait for the protection acks after release (they stay
++	 * up), so neither may we.
++	 */
++	[MT6885_POWER_DOMAIN_CAM] = {
++		.name = "cam",
++		.sta_mask = BIT(23),
++		.ctl_offs = 0x035c,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_2_CAM,
++				    MT6885_TOP_AXI_PROT_EN_2_SET, MT6885_TOP_AXI_PROT_EN_2_CLR,
++				    MT6885_TOP_AXI_PROT_EN_2_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_CAM,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_1_CAM,
++				    MT6885_TOP_AXI_PROT_EN_1_SET, MT6885_TOP_AXI_PROT_EN_1_CLR,
++				    MT6885_TOP_AXI_PROT_EN_1_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_CAM_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++		},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_CAM_RAWA] = {
++		.name = "cam_rawa",
++		.sta_mask = BIT(24),
++		.ctl_offs = 0x0360,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWA,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWA_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++		},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_CAM_RAWB] = {
++		.name = "cam_rawb",
++		.sta_mask = BIT(25),
++		.ctl_offs = 0x0364,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWB,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWB_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++		},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
++	[MT6885_POWER_DOMAIN_CAM_RAWC] = {
++		.name = "cam_rawc",
++		.sta_mask = BIT(26),
++		.ctl_offs = 0x0368,
++		.pwr_sta_offs = 0x016c,
++		.pwr_sta2nd_offs = 0x0170,
++		.sram_pdn_bits = GENMASK(8, 8),
++		.sram_pdn_ack_bits = GENMASK(12, 12),
++		.bp_cfg = {
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++			BUS_PROT_WR_IGN(INFRA, MT6885_TOP_AXI_PROT_EN_MM_CAM_RAWC_2ND,
++				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
++				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
++		},
++		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
++	},
+ };
+ 
+ static const struct scpsys_soc_data mt6885_scpsys_data = {
+diff --git a/include/dt-bindings/clock/mt6885-clk.h b/include/dt-bindings/clock/mt6885-clk.h
+index 3a32fcfa5..d7beb1d9e 100644
+--- a/include/dt-bindings/clock/mt6885-clk.h
++++ b/include/dt-bindings/clock/mt6885-clk.h
+@@ -344,4 +344,29 @@
+ #define MFGCFG_BG3D 1
+ #define MFGCFG_NR_CLK 2
+ 
++/* camsys (0x1a000000), BSP clk-mt6885.c CAMSYS_CG */
++#define CAMSYS_LARB13		0
++#define CAMSYS_DFP_VAD		1
++#define CAMSYS_LARB14		2
++#define CAMSYS_LARB15		3
++#define CAMSYS_CAM		4
++#define CAMSYS_CAMTG		5
++#define CAMSYS_SENINF		6
++#define CAMSYS_CAMSV0		7
++#define CAMSYS_CAMSV1		8
++#define CAMSYS_CAMSV2		9
++#define CAMSYS_CAMSV3		10
++#define CAMSYS_CCU0		11
++#define CAMSYS_CCU1		12
++#define CAMSYS_MRAW0		13
++#define CAMSYS_MRAW1		14
++#define CAMSYS_FAKE_ENG		15
++#define CAMSYS_NR_CLK		16
++
++/* camsys_rawa/b/c (0x1a04f000, 0x1a06f000, 0x1a08f000) */
++#define CAMSYS_RAW_LARBX	0
++#define CAMSYS_RAW_CAM		1
++#define CAMSYS_RAW_CAMTG	2
++#define CAMSYS_RAW_NR_CLK	3
++
+ #endif
+diff --git a/include/dt-bindings/power/mt6885-power.h b/include/dt-bindings/power/mt6885-power.h
+index 5bcb887bc..3c9afadc7 100644
+--- a/include/dt-bindings/power/mt6885-power.h
++++ b/include/dt-bindings/power/mt6885-power.h
+@@ -14,5 +14,9 @@
+ #define MT6885_POWER_DOMAIN_MFG6	6	/* shader cores 7-8 */
+ #define MT6885_POWER_DOMAIN_AUDIO	7
+ #define MT6885_POWER_DOMAIN_CONN	8
++#define MT6885_POWER_DOMAIN_CAM		9
++#define MT6885_POWER_DOMAIN_CAM_RAWA	10
++#define MT6885_POWER_DOMAIN_CAM_RAWB	11
++#define MT6885_POWER_DOMAIN_CAM_RAWC	12
+ 
+ #endif /* _DT_BINDINGS_POWER_MT6885_POWER_H */

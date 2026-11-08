@@ -1,0 +1,7 @@
+{
+  "uuid": "cezanne-fod@arch-port",
+  "name": "Cezanne FOD Spot",
+  "description": "Under-display fingerprint spot: idle fingerprint icon, and on press panel HBM with the rest of the screen dimmed back to the current brightness.",
+  "shell-version": ["51"],
+  "session-modes": ["user", "unlock-dialog"]
+}

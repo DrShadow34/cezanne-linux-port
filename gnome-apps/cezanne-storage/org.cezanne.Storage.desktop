@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Storage
+Comment=What fills the phone’s storage: apps, games, pictures, videos, cache
+Exec=cezanne-storage
+Icon=org.cezanne.Storage
+Terminal=false
+Type=Application
+Categories=System;
+Keywords=disk;space;usage;storage;cache;trash;free;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

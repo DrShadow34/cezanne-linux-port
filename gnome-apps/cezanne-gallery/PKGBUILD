@@ -1,0 +1,30 @@
+# Gallery for the Redmi K30 Ultra (cezanne): the photos and videos of the
+# home directory as the Android gallery shows them (timeline, albums per
+# folder, full-screen viewer). Files come from GNOME's indexer (LocalSearch,
+# $HOME without hidden folders or folders with a .nomedia file; pinned by
+# cezanne-base), thumbnails from the freedesktop cache (glycin,
+# ffmpegthumbnailer), full images through glycin, RAW previews via gexiv2,
+# videos through playbin3 + gtk4paintablesink (system memory: the decoders'
+# dmabufs show green / black through GTK's own video widget). "Upscale 2x (AI)"
+# writes an upscaled copy of a photo (cezanne-photo; APU: cezanne-upscale) or
+# a video up to 1080p (cezanne-video-upscale, package cezanne-upscale).
+pkgname=cezanne-gallery
+pkgver=1.0
+pkgrel=3
+pkgdesc="Photo and video gallery (LocalSearch index, timeline and albums)"
+arch=(any)
+license=(MIT)
+depends=(python python-gobject gtk4 libadwaita localsearch tinysparql gnome-desktop-4 glycin glycin-gtk4
+         gexiv2 ffmpegthumbnailer gstreamer gst-plugins-base gst-plugins-good gst-plugin-gtk4)
+optdepends=('cezanne-photo: Upscale 2x (AI)'
+            'cezanne-upscale: the upscaling on the APU (else on the GPU); videos')
+source=(cezanne-gallery
+        org.cezanne.Gallery.desktop
+        org.cezanne.Gallery.svg)
+sha256sums=(SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 cezanne-gallery "$pkgdir/usr/bin/cezanne-gallery"
+  install -Dm644 org.cezanne.Gallery.desktop "$pkgdir/usr/share/applications/org.cezanne.Gallery.desktop"
+  install -Dm644 org.cezanne.Gallery.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.cezanne.Gallery.svg"
+}

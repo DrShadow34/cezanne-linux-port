@@ -1,0 +1,83 @@
+# cezanne-upscale: AI upscaling on the Redmi K30 Ultra's APU for the camera
+# app (cezanne-photo --upscale): Real-ESRGAN x4plus (= Upscayl's
+# upscayl-standard-4x) quantised to int16 for the MDLA cores, run by the
+# socket-activated root daemon cezanne-upscaled through /dev/cezanne-apu
+# (driver mainline/apu/cezanne-apu.c in linux-cezanne >= 7.3.1-5; not a
+# dependency: the clean chroot would install the kernel). The int16 model
+# is built here from realesrgan-ncnn-vulkan's realesrgan-x4plus with the
+# checked-in activation ranges (cal-x4plus.json, calibrate.py). The same
+# daemon segments: the subject mask of a picture for the camera's two
+# portrait modes, objects (the salient object: U^2-Net, u2net) and people
+# (U^2-Net human segmentation, u2net_human_seg); convs over 128 input
+# channels split; u2netp, the small salient one, as the fallback; all from
+# rembg's release, int16 from cal-u2net.json / cal-u2net-human.json /
+# cal-u2netp.json, seg16.py; relative depth for the portrait blur (MiDaS
+# v2.1 small from its release, MIT; depthwise convs; int16 from
+# cal-midas.json, midas.py); and upscales videos frame by frame
+# (cezanne-video-upscale: the compact Real-ESRGAN = Upscayl's
+# upscayl-lite-4x, int16 from cal-compact.json, compact.py). README.md.
+pkgname=cezanne-upscale
+pkgver=1.0
+pkgrel=16
+pkgdesc="Real-ESRGAN x4plus on the MT6885 APU (MDLA) for the camera app"
+arch=(any)
+license=(MIT BSD-3-Clause Apache-2.0)
+depends=(python python-numpy systemd)
+optdepends=('ffmpeg: cezanne-video-upscale')
+makedepends=(realesrgan-ncnn-vulkan python-onnx)
+install=cezanne-upscale.install
+source=(cezanne-upscaled
+        x4plus_mdla.py
+        mdlacmd.py
+        esrgan.py
+        quant16.py
+        export16.py
+        cal-x4plus.json
+        cezanne-upscaled.socket
+        cezanne-upscaled.service
+        cezanne-apu.conf
+        u2net_mdla.py
+        seg16.py
+        onnx2ops.py
+        cal-u2netp.json
+        cal-u2net.json
+        cal-u2net-human.json
+        midas.py
+        depth_mdla.py
+        cal-midas.json
+        compact.py
+        compact_mdla.py
+        cal-compact.json
+        cezanne-video-upscale
+        https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx
+        https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx
+        https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net_human_seg.onnx
+        https://github.com/isl-org/MiDaS/releases/download/v2_1/model-small.onnx)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP
+            309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8
+            8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491
+            01eb6a29a5c4d8edb30b56adad9bb3a2a0535338e480724a213e0acfd2d1c73c
+            2d8c6cb8f415229daf1eb041024208e2608c9f98e17c81cc7c6ecb449c56fd58)
+
+build() {
+  python export16.py /usr/share/realesrgan/models/realesrgan-x4plus cal-x4plus.json x4plus-int16.npz
+  python onnx2ops.py convert u2netp.onnx u2netp-f32.npz
+  python seg16.py export u2netp-f32.npz cal-u2netp.json u2netp-int16.npz
+  python onnx2ops.py convert u2net.onnx u2net-f32.npz
+  python seg16.py export u2net-f32.npz cal-u2net.json u2net-int16.npz
+  python onnx2ops.py convert u2net_human_seg.onnx u2net-human-f32.npz
+  python seg16.py export u2net-human-f32.npz cal-u2net-human.json u2net-human-int16.npz
+  python midas.py export model-small.onnx cal-midas.json midas-int16.npz
+  python compact.py export /usr/share/realesrgan/models/upscayl-lite-4x cal-compact.json compact.npz
+}
+
+package() {
+  install -Dm755 cezanne-upscaled "$pkgdir/usr/lib/cezanne-upscale/cezanne-upscaled"
+  install -Dm644 -t "$pkgdir/usr/lib/cezanne-upscale" x4plus_mdla.py mdlacmd.py \
+    u2net_mdla.py seg16.py onnx2ops.py midas.py depth_mdla.py compact.py compact_mdla.py
+  install -Dm644 -t "$pkgdir/usr/share/cezanne-upscale" x4plus-int16.npz u2netp-int16.npz \
+    u2net-int16.npz u2net-human-int16.npz midas-int16.npz compact-x2.npz compact-x4.npz
+  install -Dm755 cezanne-video-upscale "$pkgdir/usr/bin/cezanne-video-upscale"
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/system" cezanne-upscaled.socket cezanne-upscaled.service
+  install -Dm644 cezanne-apu.conf "$pkgdir/usr/lib/modules-load.d/cezanne-apu.conf"
+}

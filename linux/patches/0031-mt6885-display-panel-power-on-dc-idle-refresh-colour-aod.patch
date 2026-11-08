@@ -1,0 +1,1026 @@
+mt6885 display / Xiaomi J10 panel: screen features (2026-10-23)
+
+- panel power-on: 120 ms after the OFC block instead of the BSP's 80 ms
+  (lit-but-black ~1 in 10 at 120 Hz), no second 0x60 after the init, DSI
+  clock lane HS and EXT_TE_EN only after the panel init, BSP reset order
+- panel sysfs: hbm (sunlight / FOD), dc_dimming (CCORR output gain,
+  mtk_drm_set_output_gain), idle_ms (idle refresh 120 -> 60 Hz via
+  mtk_dsi_set_idle_cb), color_mode (p3, p3-d65, srgb, native), doze (AOD),
+  debug status / dcs
+- see mainline/display/PLAN.md
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 005d7cb98..06c8b1ff9 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -85,6 +85,15 @@ struct mtk_crtc {
+ 	enum { MTK_HDR_OFF, MTK_HDR_PQ, MTK_HDR_PQ_ROLLOFF } hdr;
+ 	struct drm_property_blob	*hdr_lut, *hdr_rolloff_lut, *hdr_ctm;
+ 	struct drm_property_blob	*id_lut, *id_ctm;
++	/*
++	 * Output gain (DC dimming, mtk_drm_set_output_gain()): the CCORR gets
++	 * the matrix of the last colour update scaled by out_gain / 4096.
++	 * color_ready: programmed since the crtc was enabled.
++	 */
++	u32				out_gain;
++	struct drm_color_ctm		cur_ctm;
++	bool				cur_ctm_valid;
++	bool				color_ready;
+ 	struct mtk_mutex		*mutex;
+ 	unsigned int			ddp_comp_nr;
+ 	unsigned int			num_conn_routes;
+@@ -108,6 +117,9 @@ struct mtk_crtc_state {
+ 	unsigned int			pending_vrefresh;
+ };
+ 
++/* crtc of the command-mode panel (mtk_drm_set_output_gain()) */
++static struct mtk_crtc *mtk_gain_crtc;
++
+ static inline struct mtk_crtc *to_mtk_crtc(struct drm_crtc *c)
+ {
+ 	return container_of(c, struct mtk_crtc, base);
+@@ -532,6 +544,7 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 
+ 	/* command mode: the first frame goes out at the first plane update */
+ 	if (mtk_crtc->cmd_dsi) {
++		WRITE_ONCE(mtk_gain_crtc, mtk_crtc);
+ 		mtk_mutex_write_sof(mtk_crtc->mutex, MUTEX_SOF_IDX_SINGLE_MODE);
+ 		mtk_dsi_cmd_set_te_cb(mtk_crtc->cmd_dsi, mtk_crtc_te_irq, crtc);
+ 	} else
+@@ -1043,7 +1056,10 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 		mtk_ddp_comp_power_off(mtk_crtc->dual_comp[0]);
+ 	mtk_ddp_comp_power_off(comp);
+ 
++	mutex_lock(&mtk_crtc->hw_lock);
+ 	mtk_crtc->enabled = false;
++	mtk_crtc->color_ready = false;
++	mutex_unlock(&mtk_crtc->hw_lock);
+ }
+ 
+ static void mtk_crtc_atomic_begin(struct drm_crtc *crtc,
+@@ -1106,6 +1122,57 @@ static int mtk_crtc_hdr_mode(struct drm_crtc *crtc, struct drm_atomic_commit *st
+ 	return MTK_HDR_OFF;
+ }
+ 
++#define MTK_GAIN_ONE	4096
++
++/* the current matrix times the output gain (SDR only), to every CCORR */
++static void mtk_crtc_ctm_program(struct mtk_crtc *mtk_crtc)
++{
++	struct drm_color_ctm ctm = mtk_crtc->cur_ctm;
++	struct drm_property_blob blob = { .data = &ctm, .length = sizeof(ctm) };
++	struct drm_crtc_state st = { .ctm = &blob };
++	u32 gain = mtk_crtc->hdr == MTK_HDR_OFF ? mtk_crtc->out_gain : MTK_GAIN_ONE;
++	int i;
++
++	if (!mtk_crtc->cur_ctm_valid)
++		return;
++	/* S31.32 sign-magnitude */
++	for (i = 0; gain != MTK_GAIN_ONE && i < ARRAY_SIZE(ctm.matrix); i++) {
++		u64 v = ctm.matrix[i];
++
++		ctm.matrix[i] = (v & BIT_ULL(63)) |
++				mul_u64_u32_shr(v & ~BIT_ULL(63), gain, 12);
++	}
++	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
++		mtk_ddp_ctm_set(mtk_crtc->ddp_comp[i], &st);
++	for (i = 0; i < mtk_crtc->dual_comp_nr; i++)
++		mtk_ddp_ctm_set(mtk_crtc->dual_comp[i], &st);
++}
++
++/*
++ * Scale the output of the command-mode panel's crtc by gain / 4096 (DC
++ * dimming: the panel driver holds the panel above its PWM range and dims
++ * the pixels instead). Takes effect with one frame sent right away.
++ */
++void mtk_drm_set_output_gain(unsigned int gain)
++{
++	struct mtk_crtc *mtk_crtc = READ_ONCE(mtk_gain_crtc);
++
++	if (!mtk_crtc)
++		return;
++	mutex_lock(&mtk_crtc->hw_lock);
++	if (gain != mtk_crtc->out_gain) {
++		mtk_crtc->out_gain = gain;
++		/* before the first colour update the flush programs it */
++		if (mtk_crtc->enabled && mtk_crtc->color_ready) {
++			mtk_dsi_cmd_frame_begin(mtk_crtc->cmd_dsi);
++			mtk_crtc_ctm_program(mtk_crtc);
++			mtk_dsi_cmd_frame_end(mtk_crtc->cmd_dsi, mtk_crtc->mutex);
++		}
++	}
++	mutex_unlock(&mtk_crtc->hw_lock);
++}
++EXPORT_SYMBOL_GPL(mtk_drm_set_output_gain);
++
+ static void mtk_crtc_color_set(struct mtk_crtc *mtk_crtc,
+ 			       const struct drm_crtc_state *crtc_state)
+ {
+@@ -1125,14 +1192,17 @@ static void mtk_crtc_color_set(struct mtk_crtc *mtk_crtc,
+ 		}
+ 	}
+ 
+-	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
++	mutex_lock(&mtk_crtc->hw_lock);
++	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
+ 		mtk_ddp_gamma_set(mtk_crtc->ddp_comp[i], &st);
+-		mtk_ddp_ctm_set(mtk_crtc->ddp_comp[i], &st);
+-	}
+-	for (i = 0; i < mtk_crtc->dual_comp_nr; i++) {
++	for (i = 0; i < mtk_crtc->dual_comp_nr; i++)
+ 		mtk_ddp_gamma_set(mtk_crtc->dual_comp[i], &st);
+-		mtk_ddp_ctm_set(mtk_crtc->dual_comp[i], &st);
+-	}
++	mtk_crtc->cur_ctm_valid = st.ctm;
++	if (st.ctm)
++		memcpy(&mtk_crtc->cur_ctm, st.ctm->data, sizeof(mtk_crtc->cur_ctm));
++	mtk_crtc_ctm_program(mtk_crtc);
++	mtk_crtc->color_ready = true;
++	mutex_unlock(&mtk_crtc->hw_lock);
+ }
+ 
+ static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
+@@ -1490,6 +1560,7 @@ int mtk_crtc_create(struct drm_device *drm_dev, const unsigned int *path,
+ 			return ret;
+ 	}
+ 	mutex_init(&mtk_crtc->hw_lock);
++	mtk_crtc->out_gain = MTK_GAIN_ONE;
+ 	spin_lock_init(&mtk_crtc->config_lock);
+ 
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.h b/drivers/gpu/drm/mediatek/mtk_crtc.h
+index a6b8697cc..8d64f1b0e 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.h
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.h
+@@ -15,6 +15,7 @@
+ #define MTK_MIN_BPC	3
+ 
+ void mtk_crtc_commit(struct drm_crtc *crtc);
++void mtk_drm_set_output_gain(unsigned int gain);
+ int mtk_crtc_create(struct drm_device *drm_dev, const unsigned int *path,
+ 		    unsigned int path_len, int priv_data_index,
+ 		    const struct mtk_drm_route *conn_routes,
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_drv.h b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+index 4be684e4c..6d2248590 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+@@ -184,6 +184,10 @@ struct mtk_mutex;
+ bool mtk_dsi_is_cmd_mode(struct device *dev);
+ void mtk_dsi_cmd_set_te_cb(struct device *dev, void (*cb)(void *data),
+ 			   void *data);
++struct mipi_dsi_host;
++void mtk_dsi_set_idle_cb(struct mipi_dsi_host *host,
++			 void (*cb)(void *data, bool idle), void *data,
++			 unsigned int idle_ms);
+ void mtk_dsi_cmd_frame_begin(struct device *dev);
+ void mtk_dsi_cmd_frame_end(struct device *dev, struct mtk_mutex *mutex);
+ 
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 9f4a13eca..c982e7130 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -266,6 +266,17 @@ struct mtk_dsi {
+ 	spinlock_t te_lock;
+ 	void (*te_cb)(void *data);
+ 	void *te_cb_data;
++	/*
++	 * Idle refresh (command mode): idle_cb(data, true) once no frame went
++	 * out for idle_ms, idle_cb(data, false) before the next one; the panel
++	 * driver drops its scan rate meanwhile (userspace keeps its mode).
++	 */
++	void (*idle_cb)(void *data, bool idle);
++	void *idle_cb_data;
++	unsigned int idle_ms;
++	bool idle;
++	struct mutex idle_lock;
++	struct delayed_work idle_work;
+ };
+ 
+ /* one DSI host per SoC here; the DSC component has no handle to us */
+@@ -442,10 +453,12 @@ static void mtk_dsi_rxtx_control(struct mtk_dsi *dsi)
+ 	if (dsi->mode_flags & MIPI_DSI_MODE_NO_EOT_PACKET)
+ 		regval |= DIS_EOT;
+ 
+-	/* the panel's TE line, reported as TE_RDY in DSI_INTSTA */
+-	if (dsi->cmd_mode)
+-		regval |= EXT_TE_EN;
+-
++	/*
++	 * Command mode: the panel's TE line (TE_RDY in DSI_INTSTA) is only
++	 * enabled once the panel is initialised (mtk_dsi_bridge_atomic_enable),
++	 * like the BSP ("set the EXT_TE_EN bit before sending DSI cmd, system
++	 * would hang"; TXRX_CTRL 0x0001023c after the lcm init).
++	 */
+ 	writel(regval, dsi->regs + DSI_TXRX_CTRL);
+ }
+ 
+@@ -805,6 +818,7 @@ static void mtk_dsi_lane_ready(struct mtk_dsi *dsi)
+ 	}
+ }
+ 
++
+ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ {
+ 	struct device *dev = dsi->host.dev;
+@@ -939,7 +953,12 @@ static void mtk_output_dsi_disable(struct mtk_dsi *dsi)
+ 	if (!dsi->enabled)
+ 		return;
+ 
++	/* the panel restarts at its mode's rate (init / refresh change) */
++	cancel_delayed_work_sync(&dsi->idle_work);
++	mutex_lock(&dsi->idle_lock);
++	dsi->idle = false;
+ 	dsi->enabled = false;
++	mutex_unlock(&dsi->idle_lock);
+ }
+ 
+ static int mtk_dsi_bridge_attach(struct drm_bridge *bridge,
+@@ -978,6 +997,9 @@ static void mtk_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
+ 	if (dsi->refcount == 0)
+ 		return;
+ 
++	if (dsi->cmd_mode)
++		mtk_dsi_mask(dsi, DSI_TXRX_CTRL, EXT_TE_EN, EXT_TE_EN);
++	mtk_dsi_clk_hs_mode(dsi, 1);
+ 	mtk_output_dsi_enable(dsi);
+ }
+ 
+@@ -993,7 +1015,13 @@ static void mtk_dsi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
+ 		drm_err(drm, "failed to power on dsi\n");
+ 
+ 	mtk_dsi_lane_ready(dsi);
+-	mtk_dsi_clk_hs_mode(dsi, 1);
++	/*
++	 * Command mode: the clock lane goes HS in the enable, after the panel
++	 * was reset and initialised in LP (its pre_enable runs after this),
++	 * as the BSP does (mtk_output_dsi_enable).
++	 */
++	if (!dsi->cmd_mode)
++		mtk_dsi_clk_hs_mode(dsi, 1);
+ }
+ 
+ static void mtk_dsi_bridge_atomic_post_disable(struct drm_bridge *bridge,
+@@ -1228,10 +1256,54 @@ bool mtk_dsi_is_cmd_mode(struct device *dev)
+  * vblank: the transfer then stays ahead of the panel scan, no tearing),
+  * enables the single-shot mutex and sends DCS write_memory_start.
+  */
++static void mtk_dsi_idle_work(struct work_struct *work)
++{
++	struct mtk_dsi *dsi = container_of(work, struct mtk_dsi, idle_work.work);
++
++	mutex_lock(&dsi->idle_lock);
++	if (dsi->idle_cb && dsi->enabled && !dsi->idle) {
++		dsi->idle = true;
++		dsi->idle_cb(dsi->idle_cb_data, true);
++	}
++	mutex_unlock(&dsi->idle_lock);
++}
++
++/*
++ * For the panel driver: cb(data, idle) is called without any of its locks
++ * possibly held by the caller (it may run inside a backlight update), so
++ * it must only send DCS. idle_ms 0: off.
++ */
++void mtk_dsi_set_idle_cb(struct mipi_dsi_host *host,
++			 void (*cb)(void *data, bool idle), void *data,
++			 unsigned int idle_ms)
++{
++	struct mtk_dsi *dsi = host_to_dsi(host);
++
++	cancel_delayed_work_sync(&dsi->idle_work);
++	mutex_lock(&dsi->idle_lock);
++	if (dsi->idle && dsi->idle_cb)
++		dsi->idle_cb(dsi->idle_cb_data, false);
++	dsi->idle = false;
++	dsi->idle_cb = idle_ms ? cb : NULL;
++	dsi->idle_cb_data = data;
++	dsi->idle_ms = idle_ms;
++	mutex_unlock(&dsi->idle_lock);
++}
++EXPORT_SYMBOL_GPL(mtk_dsi_set_idle_cb);
++
+ void mtk_dsi_cmd_frame_begin(struct device *dev)
+ {
+ 	struct mtk_dsi *dsi = dev_get_drvdata(dev);
+ 
++	/* back to the full scan rate before the frame */
++	mutex_lock(&dsi->idle_lock);
++	if (dsi->idle) {
++		dsi->idle = false;
++		if (dsi->idle_cb && dsi->enabled)
++			dsi->idle_cb(dsi->idle_cb_data, false);
++	}
++	mutex_unlock(&dsi->idle_lock);
++
+ 	mutex_lock(&dsi->cmd_lock);
+ 	mtk_dsi_wait_for_idle(dsi);
+ }
+@@ -1291,6 +1363,9 @@ void mtk_dsi_cmd_frame_end(struct device *dev, struct mtk_mutex *mutex)
+ 		mtk_dsi_cmd_trigger(dsi, armed);
+ 	}
+ out:
++	if (dsi->idle_cb && dsi->enabled)
++		mod_delayed_work(system_wq, &dsi->idle_work,
++				 msecs_to_jiffies(dsi->idle_ms));
+ 	mutex_unlock(&dsi->cmd_lock);
+ }
+ 
+@@ -1500,6 +1575,8 @@ static int mtk_dsi_probe(struct platform_device *pdev)
+ 
+ 	init_waitqueue_head(&dsi->irq_wait_queue);
+ 	init_waitqueue_head(&dsi->te_wq);
++	mutex_init(&dsi->idle_lock);
++	INIT_DELAYED_WORK(&dsi->idle_work, mtk_dsi_idle_work);
+ 	spin_lock_init(&dsi->te_lock);
+ 	ret = devm_mutex_init(dev, &dsi->cmd_lock);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+index a18a8e8bf..6f4356e4d 100644
+--- a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+@@ -14,6 +14,7 @@
+ #include <linux/delay.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/regulator/consumer.h>
+ 
+@@ -42,9 +43,54 @@ struct j10_panel {
+ 	struct drm_dsc_config dsc;
+ 	bool powered;
+ 	bool high_refresh;
++	bool just_on;	/* powered on in this commit: init sent 0x60 */
+ 	/* HDR (PQ) output: high brightness mode at full level, the pipeline
+ 	 * maps the content luminance onto it */
+ 	bool hdr;
++	/* sysfs hbm: J10_HBM_* (sunlight boost, fingerprint spot) */
++	int hbm;
++	int hbm_applied;
++	/* sysfs color_mode (J10_COLOR_*), P3 while HDR output is on */
++	int color_mode;
++	int color_applied;
++	/*
++	 * sysfs doze (J10_DOZE_*): AOD, the panel shows its frame memory at a
++	 * fixed low brightness by itself; it stays powered (and in doze)
++	 * through crtc disable / suspend until doze is set back to 0.
++	 */
++	int doze;
++	/* sysfs dc_dimming: low levels dimmed in the pipeline (j10_set_brightness) */
++	bool dc_dimming;
++	unsigned int idle_ms;	/* sysfs idle_ms: idle refresh (j10_idle_cb) */
++	/* panel state vs. DCS from sysfs / backlight */
++	struct mutex lock;
++};
++
++enum {
++	J10_HBM_OFF,
++	J10_HBM_SUN,	/* BSP panel_normal_hbm_control(): ELVSS dimming, smooth */
++	J10_HBM_FOD,	/* BSP panel_hbm_fod_control(): instant, for the FOD spot */
++};
++
++enum {
++	J10_DOZE_OFF,
++	J10_DOZE_LOW,	/* BSP DOZE_BRIGHTNESS_LBM: 53 2B */
++	J10_DOZE_HIGH,	/* BSP DOZE_BRIGHTNESS_HBM: 53 2A */
++};
++
++/* BSP panel_set_crc_*(): MIUI's colour schemes, DISPPARAM_P3 etc. */
++enum {
++	J10_COLOR_P3,		/* init default (vendor CRC_P3) */
++	J10_COLOR_P3_D65,	/* P3 gamut, D65 white, flat gamma */
++	J10_COLOR_SRGB,		/* sRGB gamut, flat gamma */
++	J10_COLOR_NATIVE,	/* CRC off: the panel's full gamut */
++};
++
++static const char * const j10_color_names[] = {
++	[J10_COLOR_P3] = "p3",
++	[J10_COLOR_P3_D65] = "p3-d65",
++	[J10_COLOR_SRGB] = "srgb",
++	[J10_COLOR_NATIVE] = "native",
+ };
+ 
+ static inline struct j10_panel *to_j10_panel(struct drm_bridge *bridge)
+@@ -52,8 +98,10 @@ static inline struct j10_panel *to_j10_panel(struct drm_bridge *bridge)
+ 	return container_of(bridge, struct j10_panel, bridge);
+ }
+ 
++/* BSP lcm_panel_init(): reset released as the rails come up, 10 ms, then a 1 ms pulse */
+ static void j10_reset(struct j10_panel *ctx)
+ {
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+ 	usleep_range(10000, 11000);
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);	/* active low: in reset */
+ 	usleep_range(1000, 2000);
+@@ -156,7 +204,13 @@ static int j10_on(struct j10_panel *ctx)
+ 				     0xa6, 0x37, 0xbe, 0x00, 0x32, 0x32);
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0xa5, 0xa5);
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+-	mipi_dsi_msleep(&dsi_ctx, 80);
++	/*
++	 * BSP: 80 ms. At 120 Hz that is not always enough for the oscillator
++	 * (OFC) to settle before the frequency select and display on: ~1 in
++	 * 10 power-ons the panel came up lit but black (registers fine, only a
++	 * new reset + init recovered it). 120 ms: 30 of 30 fine.
++	 */
++	mipi_dsi_msleep(&dsi_ctx, 120);
+ 
+ 	j10_set_refresh(&dsi_ctx, ctx->high_refresh);
+ 
+@@ -204,6 +258,63 @@ static int j10_on(struct j10_panel *ctx)
+ 	return dsi_ctx.accum_err;
+ }
+ 
++/* called with ctx->lock held, panel powered */
++static void j10_color_apply(struct j10_panel *ctx)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++	int mode = ctx->hdr ? J10_COLOR_P3 : ctx->color_mode;
++	bool flat = mode == J10_COLOR_P3_D65 || mode == J10_COLOR_SRGB;
++	const u8 crc[] = { 0x81, mode == J10_COLOR_SRGB ? 0x90 : 0x92 };
++	/* flat gamma on/off: 0x27 / 0x07 in the third byte */
++	const u8 gamma[] = {
++		0xc2, 0x2d, flat ? 0x27 : 0x07, 0xfe, 0x82, 0xc6, 0x70, 0x82,
++		0x70, 0xca, 0x0a, 0x0a, 0x0a, 0x28, 0x28, 0x28, 0x35, 0x35,
++		0x35, 0x3f, 0x3f, 0x3f, 0x42, 0x42, 0x42, 0x1b, 0xda, 0x2f, 0x48,
++	};
++
++	if (!ctx->powered || mode == ctx->color_applied)
++		return;
++
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, crc, sizeof(crc));
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1, 0x00);
++	switch (mode) {
++	case J10_COLOR_SRGB:
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01, 0xb1);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1,
++			0xc0, 0x09, 0x04, 0x3c, 0xe9, 0x10, 0x09, 0x02, 0xc6,
++			0x45, 0xea, 0xd8, 0xc7, 0x0c, 0xca, 0xfb, 0xf0, 0x14,
++			0xff, 0xf3, 0xdb);
++		break;
++	case J10_COLOR_NATIVE:
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x2b, 0xb1);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1,
++			0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff,
++			0x00, 0xff, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0x00,
++			0xff, 0xff, 0xff);
++		break;
++	default:	/* P3, P3 D65: white point in the last three */
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x2b, 0xb1);
++		if (mode == J10_COLOR_P3_D65)
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1,
++				0xb7, 0x00, 0x00, 0x15, 0xc2, 0x00, 0x08, 0x08,
++				0xb9, 0x26, 0xee, 0xdb, 0xdc, 0x05, 0xcc, 0xe4,
++				0xd7, 0x00, 0xff, 0xf5, 0xe0);
++		else
++			mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1,
++				0xb7, 0x00, 0x00, 0x15, 0xc2, 0x00, 0x08, 0x08,
++				0xb9, 0x26, 0xee, 0xdb, 0xdc, 0x05, 0xcc, 0xe4,
++				0xd7, 0x00, 0xff, 0xff, 0xff);
++		break;
++	}
++	mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, gamma, sizeof(gamma));
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x03);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	if (!dsi_ctx.accum_err)
++		ctx->color_applied = mode;
++}
++
+ static int j10_power_on(struct j10_panel *ctx)
+ {
+ 	int ret;
+@@ -223,6 +334,9 @@ static int j10_power_on(struct j10_panel *ctx)
+ 		return ret;
+ 	}
+ 	ctx->powered = true;
++	ctx->just_on = true;
++	ctx->hbm_applied = J10_HBM_OFF;	/* init sequence: normal range */
++	ctx->color_applied = J10_COLOR_P3;	/* and the P3 tables */
+ 	return 0;
+ }
+ 
+@@ -360,6 +474,201 @@ static bool j10_high_refresh(struct drm_bridge *bridge,
+ 	return drm_mode_vrefresh(&crtc_state->adjusted_mode) > 90;
+ }
+ 
++/*
++ * DC dimming: below J10_DC_LEVEL (BSP dc_backlight_threhold) the panel stays
++ * at that level and the pipeline scales the pixels instead (the gain after
++ * the DCS, both land on the next frame). Measured with the panel's own ALS
++ * (white screen over a mirror): the output is linear in the panel level and
++ * linear in the CCORR gain, so gain = level / J10_DC_LEVEL. Under a gain of
++ * ~0.1 (J10_DC_FLOOR) the pixel steps get coarse: the panel level goes down
++ * instead. The panel PWMs at every level (camera bands up to 2047); held at
++ * 486 the flicker is shallower than at the low levels.
++ */
++#define J10_DC_LEVEL	486
++#define J10_DC_FLOOR	49
++
++#if IS_BUILTIN(CONFIG_DRM_MEDIATEK)
++void mtk_drm_set_output_gain(unsigned int gain);
++void mtk_dsi_set_idle_cb(struct mipi_dsi_host *host,
++			 void (*cb)(void *data, bool idle), void *data,
++			 unsigned int idle_ms);
++#else
++static inline void mtk_drm_set_output_gain(unsigned int gain) { }
++static inline void mtk_dsi_set_idle_cb(struct mipi_dsi_host *host,
++				       void (*cb)(void *data, bool idle),
++				       void *data, unsigned int idle_ms) { }
++#endif
++
++/*
++ * Idle refresh, like MIUI's SurfaceFlinger idle timer (3 s, 120 -> 60 Hz):
++ * the DSI host calls this once no frame went out for idle_ms and again
++ * before the next frame; in the 120 Hz mode the panel scans (and its TE
++ * runs) at 60 Hz meanwhile. Called with no panel lock possible to take.
++ */
++#define J10_IDLE_MS	1000
++
++static void j10_idle_cb(void *data, bool idle)
++{
++	struct j10_panel *ctx = data;
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	if (!READ_ONCE(ctx->powered) || !READ_ONCE(ctx->high_refresh) ||
++	    READ_ONCE(ctx->doze))
++		return;
++	/*
++	 * Not under DC dimming (panel held at J10_DC_LEVEL, pixels scaled):
++	 * there the 60 and 120 Hz gamma differ visibly on the switch.
++	 */
++	if (idle && READ_ONCE(ctx->dc_dimming) &&
++	    backlight_get_brightness(ctx->backlight) < J10_DC_LEVEL)
++		return;
++	j10_set_refresh(&dsi_ctx, !idle);
++}
++
++/* DCS 0x51, 11 bit, high byte first */
++static void j10_write_dbv(struct mipi_dsi_multi_context *dsi_ctx, u16 dbv)
++{
++	const u8 cmd[] = { MIPI_DCS_SET_DISPLAY_BRIGHTNESS, dbv >> 8, dbv & 0xff };
++
++	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, cmd, sizeof(cmd));
++}
++
++
++static void j10_set_brightness(struct j10_panel *ctx,
++			       struct mipi_dsi_multi_context *dsi_ctx, u16 level)
++{
++	u16 dbv = level;
++	u32 gain = 4096;
++
++	if (ctx->dc_dimming && level && level < J10_DC_LEVEL) {
++		if (level >= J10_DC_FLOOR) {
++			dbv = J10_DC_LEVEL;
++			gain = DIV_ROUND_CLOSEST(level * 4096, J10_DC_LEVEL);
++		} else {
++			dbv = DIV_ROUND_CLOSEST(level * J10_DC_LEVEL, J10_DC_FLOOR);
++			gain = DIV_ROUND_CLOSEST(J10_DC_FLOOR * 4096, J10_DC_LEVEL);
++		}
++	}
++	j10_write_dbv(dsi_ctx, dbv);
++	mtk_drm_set_output_gain(gain);
++}
++
++/* sysfs hbm, else the sunlight HBM while HDR output is on */
++static int j10_hbm_wanted(struct j10_panel *ctx)
++{
++	if (ctx->hbm)
++		return ctx->hbm;
++	return ctx->hdr ? J10_HBM_SUN : J10_HBM_OFF;
++}
++
++/* DCS sequences from the BSP panel driver; called with ctx->lock held */
++static void j10_hbm_apply(struct j10_panel *ctx)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++	int mode = j10_hbm_wanted(ctx);
++	u16 level = backlight_get_brightness(ctx->backlight);
++
++	if (!ctx->powered || ctx->doze || mode == ctx->hbm_applied)
++		return;
++
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	/* HBM shows the pixels as they are (the FOD dim layer relies on it) */
++	if (mode != J10_HBM_OFF)
++		mtk_drm_set_output_gain(4096);
++	switch (mode) {
++	case J10_HBM_SUN:
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x13);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x4c);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
++					     0xe8, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
++					     0x07, 0xff);
++		break;
++	case J10_HBM_FOD:
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x13);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
++					     0xe0, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
++					     0x07, 0xff);
++		break;
++	default:
++		/* back to the normal range at the backlight level */
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
++					     0x20, 0x00);
++		j10_set_brightness(ctx, &dsi_ctx, level);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x93);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x44);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++		break;
++	}
++	if (!dsi_ctx.accum_err)
++		ctx->hbm_applied = mode;
++}
++
++/* BSP panel_doze_enable / panel_set_nolp; called with ctx->lock held */
++static int j10_doze_set(struct j10_panel *ctx, int doze)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++	const u8 aod[] = { 0x53, doze == J10_DOZE_HIGH ? 0x2a : 0x2b, 0x00 };
++
++	if (!ctx->powered)
++		return -ENODEV;
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++
++	if (doze && ctx->doze) {
++		/* brightness change only (BSP panel_set_aod_light_mode) */
++		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, aod, sizeof(aod));
++	} else if (doze) {
++		mtk_drm_set_output_gain(4096);
++		mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);	/* checksum off */
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xec, 0x20);
++		j10_set_refresh(&dsi_ctx, false);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0b);	/* vfp diff off */
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd8, 0x50, 0x00);
++		mipi_dsi_dcs_write_buffer_multi(&dsi_ctx, aod, sizeof(aod));
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++		mipi_dsi_msleep(&dsi_ctx, 40);
++		mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
++	} else if (ctx->doze) {
++		mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0a);	/* black insertion */
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xee, 0x02);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0b);	/* vfp diff */
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd8, 0x59, 0x70);
++		mipi_dsi_msleep(&dsi_ctx, 40);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
++					     0x28, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);	/* checksum on */
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xec, 0x42);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++		j10_set_refresh(&dsi_ctx, ctx->high_refresh);
++		mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
++	}
++	if (dsi_ctx.accum_err)
++		return dsi_ctx.accum_err;
++
++	ctx->doze = doze;
++	if (!doze) {
++		/* the normal range at the level (53 20, ELVSS) and its gain */
++		ctx->hbm_applied = -1;
++		j10_hbm_apply(ctx);
++	}
++	return 0;
++}
++
+ static int j10_bridge_attach(struct drm_bridge *bridge,
+ 			     struct drm_encoder *encoder,
+ 			     enum drm_bridge_attach_flags flags)
+@@ -389,20 +698,16 @@ static void j10_bridge_enable(struct drm_bridge *bridge,
+ 
+ 	if (!ctx->powered)
+ 		return;
+-	/* also after a refresh change, where the panel stayed on */
+-	j10_set_refresh(&dsi_ctx, ctx->high_refresh);
+-	if (ctx->hdr) {
+-		/* BSP panel_hbm_set_cmdq(): HBM on, level 0x7ff */
+-		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+-					     0xe0, 0x00);
+-		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
+-					     J10_MAX_BRIGHTNESS >> 8,
+-					     J10_MAX_BRIGHTNESS & 0xff);
+-	} else {
+-		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+-					     0x20, 0x00);
+-		backlight_enable(ctx->backlight);
+-	}
++	/* after a refresh change, where the panel stayed on; the init sent it */
++	if (!ctx->just_on && !ctx->doze)
++		j10_set_refresh(&dsi_ctx, ctx->high_refresh);
++	ctx->just_on = false;
++	/* the level (skipped while HBM is wanted), then HBM on or off */
++	backlight_enable(ctx->backlight);
++	mutex_lock(&ctx->lock);
++	j10_color_apply(ctx);
++	j10_hbm_apply(ctx);
++	mutex_unlock(&ctx->lock);
+ }
+ 
+ static void j10_bridge_disable(struct drm_bridge *bridge,
+@@ -410,7 +715,7 @@ static void j10_bridge_disable(struct drm_bridge *bridge,
+ {
+ 	struct j10_panel *ctx = to_j10_panel(bridge);
+ 
+-	if (!j10_crtc_stays_on(bridge, state))
++	if (!j10_crtc_stays_on(bridge, state) && !ctx->doze)
+ 		backlight_disable(ctx->backlight);
+ }
+ 
+@@ -419,7 +724,8 @@ static void j10_bridge_post_disable(struct drm_bridge *bridge,
+ {
+ 	struct j10_panel *ctx = to_j10_panel(bridge);
+ 
+-	if (ctx->powered && !j10_crtc_stays_on(bridge, state))
++	/* in doze the panel keeps showing its frame memory */
++	if (ctx->powered && !ctx->doze && !j10_crtc_stays_on(bridge, state))
+ 		j10_power_off(ctx);
+ }
+ 
+@@ -458,17 +764,237 @@ static int j10_bl_update_status(struct backlight_device *bl)
+ {
+ 	struct mipi_dsi_device *dsi = bl_get_data(bl);
+ 	struct j10_panel *ctx = mipi_dsi_get_drvdata(dsi);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
+ 	u16 brightness = backlight_get_brightness(bl);
++
++	mutex_lock(&ctx->lock);
++	/*
++	 * HBM (sunlight boost, FOD spot, HDR) holds the panel at its peak; the
++	 * level is applied when it ends (j10_hbm_apply).
++	 */
++	if (j10_hbm_wanted(ctx) == J10_HBM_OFF && !ctx->doze) {
++		dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++		j10_set_brightness(ctx, &dsi_ctx, brightness);
++	}
++	mutex_unlock(&ctx->lock);
++	return dsi_ctx.accum_err;
++}
++
++/* 0: off, 1: sunlight HBM (smooth), 2: FOD HBM (instant) */
++static ssize_t hbm_show(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++
++	return sysfs_emit(buf, "%d\n", ctx->hbm);
++}
++
++static ssize_t hbm_store(struct device *dev, struct device_attribute *attr,
++			 const char *buf, size_t len)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &val);
++	if (ret)
++		return ret;
++	if (val > J10_HBM_FOD)
++		return -EINVAL;
++
++	mutex_lock(&ctx->lock);
++	ctx->hbm = val;
++	j10_hbm_apply(ctx);
++	mutex_unlock(&ctx->lock);
++	return len;
++}
++static DEVICE_ATTR_RW(hbm);
++
++/* DC dimming: 1 holds the panel at J10_DC_LEVEL and dims the pixels */
++static ssize_t dc_dimming_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++
++	return sysfs_emit(buf, "%d\n", ctx->dc_dimming);
++}
++
++static ssize_t dc_dimming_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t len)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++	bool val;
++	int ret;
++
++	ret = kstrtobool(buf, &val);
++	if (ret)
++		return ret;
++
++	mutex_lock(&ctx->lock);
++	ctx->dc_dimming = val;
++	mutex_unlock(&ctx->lock);
++	/* re-apply the level */
++	backlight_update_status(ctx->backlight);
++	return len;
++}
++static DEVICE_ATTR_RW(dc_dimming);
++
++/* AOD: 0 off, 1 doze (dim), 2 doze (bright) */
++static ssize_t doze_show(struct device *dev, struct device_attribute *attr,
++			 char *buf)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++
++	return sysfs_emit(buf, "%d\n", ctx->doze);
++}
++
++static ssize_t doze_store(struct device *dev, struct device_attribute *attr,
++			  const char *buf, size_t len)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &val);
++	if (ret)
++		return ret;
++	if (val > J10_DOZE_HIGH)
++		return -EINVAL;
++
++	mutex_lock(&ctx->lock);
++	ret = j10_doze_set(ctx, val);
++	mutex_unlock(&ctx->lock);
++	return ret ? ret : len;
++}
++static DEVICE_ATTR_RW(doze);
++
++/* colour scheme: p3 (default), p3-d65, srgb, native */
++static ssize_t color_mode_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++
++	return sysfs_emit(buf, "%s\n", j10_color_names[ctx->color_mode]);
++}
++
++static ssize_t color_mode_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t len)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++	int mode = sysfs_match_string(j10_color_names, buf);
++
++	if (mode < 0)
++		return mode;
++
++	mutex_lock(&ctx->lock);
++	ctx->color_mode = mode;
++	j10_color_apply(ctx);
++	mutex_unlock(&ctx->lock);
++	return len;
++}
++static DEVICE_ATTR_RW(color_mode);
++
++/* idle refresh: ms without frames before 60 Hz scan in the 120 Hz mode, 0 off */
++static ssize_t idle_ms_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++
++	return sysfs_emit(buf, "%u\n", ctx->idle_ms);
++}
++
++static ssize_t idle_ms_store(struct device *dev, struct device_attribute *attr,
++			     const char *buf, size_t len)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++	unsigned int val;
+ 	int ret;
+ 
+-	/* HDR: the panel stays at peak, the compositor scales the content */
+-	if (ctx && ctx->hdr)
+-		return 0;
++	ret = kstrtouint(buf, 0, &val);
++	if (ret)
++		return ret;
++	ctx->idle_ms = val;
++	mtk_dsi_set_idle_cb(ctx->dsi->host, j10_idle_cb, ctx, val);
++	return len;
++}
++static DEVICE_ATTR_RW(idle_ms);
+ 
+-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+-	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+-	return ret < 0 ? ret : 0;
++/* debug: DCS status registers (power/address/pixel/display/signal mode, diag, errors) */
++static ssize_t status_show(struct device *dev, struct device_attribute *attr,
++			   char *buf)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++	static const u8 regs[] = { 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x05 };
++	int i, n = 0;
++	u8 v;
++
++	mutex_lock(&ctx->lock);
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		int ret = -ENODEV;
++
++		if (ctx->powered) {
++			ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++			ret = mipi_dsi_dcs_read(ctx->dsi, regs[i], &v, 1);
++		}
++		if (ret == 1)
++			n += sysfs_emit_at(buf, n, "%02x=%02x ", regs[i], v);
++		else
++			n += sysfs_emit_at(buf, n, "%02x=err%d ", regs[i], ret);
++	}
++	mutex_unlock(&ctx->lock);
++	n += sysfs_emit_at(buf, n, "\n");
++	return n;
+ }
++static DEVICE_ATTR_RO(status);
++
++/* debug: "28" / "9d 01": one DCS write (HS), hex bytes */
++static ssize_t dcs_store(struct device *dev, struct device_attribute *attr,
++			 const char *buf, size_t len)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(to_mipi_dsi_device(dev));
++	u8 data[64];
++	int n = 0, ret;
++	char *dup, *p, *tok;
++
++	dup = p = kstrndup(buf, len, GFP_KERNEL);
++	if (!dup)
++		return -ENOMEM;
++	while ((tok = strsep(&p, " \n")) && n < ARRAY_SIZE(data)) {
++		if (!*tok)
++			continue;
++		if (kstrtou8(tok, 16, &data[n++])) {
++			kfree(dup);
++			return -EINVAL;
++		}
++	}
++	kfree(dup);
++	if (!n)
++		return -EINVAL;
++
++	mutex_lock(&ctx->lock);
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	ret = ctx->powered ? mipi_dsi_dcs_write_buffer(ctx->dsi, data, n) : -ENODEV;
++	mutex_unlock(&ctx->lock);
++	return ret < 0 ? ret : len;
++}
++static DEVICE_ATTR_WO(dcs);
++
++
++static struct attribute *j10_attrs[] = {
++	&dev_attr_hbm.attr,
++	&dev_attr_dc_dimming.attr,
++	&dev_attr_doze.attr,
++	&dev_attr_color_mode.attr,
++	&dev_attr_idle_ms.attr,
++	&dev_attr_status.attr,
++	&dev_attr_dcs.attr,
++	NULL
++};
++static const struct attribute_group j10_group = {
++	.attrs = j10_attrs,
++};
+ 
+ static const struct backlight_ops j10_bl_ops = {
+ 	.update_status = j10_bl_update_status,
+@@ -504,6 +1030,9 @@ static int j10_probe(struct mipi_dsi_device *dsi)
+ 
+ 	ctx->dsi = dsi;
+ 	mipi_dsi_set_drvdata(dsi, ctx);
++	ret = devm_mutex_init(dev, &ctx->lock);
++	if (ret)
++		return ret;
+ 
+ 	/* vendor dsc_params (DSC 1.1); the encoder is set up from this */
+ 	dsc = &ctx->dsc;
+@@ -559,11 +1088,17 @@ static int j10_probe(struct mipi_dsi_device *dsi)
+ 	ctx->bridge.ops = DRM_BRIDGE_OP_MODES | DRM_BRIDGE_OP_EDID;
+ 	drm_bridge_add(&ctx->bridge);
+ 
++	ret = devm_device_add_group(dev, &j10_group);
++	if (ret)
++		dev_warn(dev, "no sysfs attributes: %d\n", ret);
++
+ 	ret = mipi_dsi_attach(dsi);
+ 	if (ret < 0) {
+ 		drm_bridge_remove(&ctx->bridge);
+ 		return dev_err_probe(dev, ret, "mipi_dsi_attach\n");
+ 	}
++	ctx->idle_ms = J10_IDLE_MS;
++	mtk_dsi_set_idle_cb(dsi->host, j10_idle_cb, ctx, ctx->idle_ms);
+ 	return 0;
+ }
+ 

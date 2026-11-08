@@ -1,0 +1,31 @@
+#!/usr/bin/python3
+# Client for cezanne-popupd.
+#   cezanne-popup status | up | down
+#   cezanne-popup hold [cmd...]   keep the camera up while cmd runs (or until
+#                                 Ctrl+C); it retracts when this process exits
+import socket, subprocess, sys
+
+SOCK = '/run/cezanne-popup.sock'
+
+
+def connect():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(SOCK)
+    return s
+
+
+def main():
+    args = sys.argv[1:] or ['status']
+    s = connect()
+    s.sendall(args[0].encode() + b'\n')
+    print(s.recv(256).decode().strip())
+    if args[0] == 'hold':
+        try:
+            if len(args) > 1:
+                sys.exit(subprocess.call(args[1:]))
+            s.recv(1)		# block until the daemon goes away or Ctrl+C
+        except KeyboardInterrupt:
+            pass
+
+
+main()

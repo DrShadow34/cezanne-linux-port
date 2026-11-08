@@ -1,0 +1,313 @@
+#!/usr/bin/python3
+"""cezanne-upscaled: AI on the APU for the camera app and the gallery,
+through /dev/cezanne-apu (mainline/apu/upscaler/README.md):
+  upscale   Real-ESRGAN x4plus (Upscayl's standard model), int16, both MDLA
+            cores
+  segment   the subject mask: the salient object (U^2-Net) or people
+            (U^2-Net human segmentation); u2netp, the small salient one,
+            when the 150 MB DMA buffer is not there; int16, one core
+  depth     relative depth (MiDaS v2.1 small, depthwise convs), int16,
+            one core
+  frames    a video frame by frame, 2x / 4x (the compact Real-ESRGAN =
+            Upscayl's upscayl-lite-4x), int16, both cores
+
+Socket-activated (cezanne-upscaled.socket: /run/cezanne-upscale.sock,
+SOCK_SEQPACKET, group video), one job at a time, exits when idle; the APU
+is powered only while a job runs. The device stays root's (the MDLA reaches
+all memory): clients only hand over pixels.
+
+Protocol: the client sends {"job": "upscale" (default) | "segment" | "depth",
+"width": W, "height": H, "order": "bgr"|"rgb"} with two memfds (SCM_RIGHTS):
+the picture (H x W x 3 bytes) and the result, written here:
+  upscale   4H x 4W x 3 bytes; replies {"tiles": n}, {"done": k} per tile
+  segment   320 x 320 float32 (0..1); the picture 320 x 320 (else taken
+            nearest), as the client scales better; "model": "objects"
+            (default) | "people"
+  depth     256 x 256 float32, relative inverse depth (larger = nearer,
+            arbitrary scale and offset); the picture 256 x 256 (else taken
+            nearest)
+  frames    "scale": 2 | 4, frames up to 1080p, sW x sH x 3 bytes; replies
+            {"ready": true}, then the client writes a frame into the first
+            memfd and sends {"frame": i}, the reply {"done": i} means the
+            result is in the second; {"end": true} ends it. Other clients
+            are served between two frames.
+then {"ok": true, "seconds": s, ...} or {"error": "..."}.
+"""
+import errno
+import json
+import mmap
+import os
+import select
+import socket
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))	# /usr/lib/cezanne-upscale
+import numpy as np
+from x4plus_mdla import X4Plus, load_model, pick_tile
+
+MODEL = os.environ.get('CEZANNE_UPSCALE_MODEL', '/usr/share/cezanne-upscale/x4plus-int16.npz')
+SEG_MODELS = {'objects': '/usr/share/cezanne-upscale/u2net-int16.npz',
+	      'people': '/usr/share/cezanne-upscale/u2net-human-int16.npz',
+	      'small': '/usr/share/cezanne-upscale/u2netp-int16.npz'}
+SEG_SIZE = 320
+DEPTH_MODEL = '/usr/share/cezanne-upscale/midas-int16.npz'
+DEPTH_SIZE = 256
+COMPACT_MODEL = os.environ.get('CEZANNE_COMPACT_MODEL', '/usr/share/cezanne-upscale/compact-x%s.npz')
+FRAME_PIXELS = 2_100_000			# frames up to 1080p (2x: 4K)
+IDLE = 30				# s without a client: exit
+MAX_PIXELS = 64 << 20			# input
+# DMA buffer for both cores (x4plus_mdla.pick_tile): ~800 MB (the APU's
+# pool above 4 GiB), ~400 MB (fits the default CMA area), ~160 / ~110 / ~70
+TILE_MAX = (600, 400, 200, 136, 72)
+
+
+def log(*a):
+	print('cezanne-upscaled:', *a, file=sys.stderr, flush=True)
+
+
+def reply(conn, **kw):
+	conn.send(json.dumps(kw).encode())
+
+
+class Models:
+	"""loaded on first use"""
+	def __init__(self):
+		self.cache = {}
+
+	def get(self, kind):
+		if kind not in self.cache:
+			if kind == 'upscale':
+				self.cache[kind] = load_model(MODEL)
+			elif kind == 'depth':
+				import depth_mdla
+				self.cache[kind] = depth_mdla.load(DEPTH_MODEL)
+			elif kind.startswith('segment-'):
+				import u2net_mdla
+				self.cache[kind] = u2net_mdla.load(SEG_MODELS[kind[8:]])
+			else:			# compact-x2 / compact-x4
+				import compact_mdla
+				self.cache[kind] = compact_mdla.load(COMPACT_MODEL % kind[-1])
+		return self.cache[kind]
+
+
+class Inhibit:
+	"""no system sleep during a job (systemd-inhibit closes all but stdio,
+	so it cannot wrap the socket-activated daemon itself)"""
+	def __enter__(self):
+		self.p = subprocess.Popen(['systemd-inhibit', '--what=sleep', '--who=cezanne-upscaled',
+					   '--why=AI on the APU', '--mode=block', 'sleep', 'infinity'])
+
+	def __exit__(self, *a):
+		self.p.terminate()
+		self.p.wait()
+
+
+def serve(conn, models, lsock=None):
+	"""one client, errors replied; lsock: a frame session may serve clients
+	that come in meanwhile"""
+	conn.settimeout(None)
+	try:
+		job(conn, models, lsock)
+	except BrokenPipeError:
+		log('client went away')
+	except Exception as e:
+		log(f'failed: {e!r}')
+		try:
+			reply(conn, error=str(e))
+		except OSError:
+			pass
+	finally:
+		conn.close()
+
+
+def job(conn, models, lsock=None):
+	msg, fds, _, _ = socket.recv_fds(conn, 4096, 2)
+	try:
+		if len(fds) != 2:
+			raise ValueError('needs two memfds')
+		req = json.loads(msg)
+		kind = req.get('job', 'upscale')
+		w, h = int(req['width']), int(req['height'])
+		bgr = req.get('order', 'bgr') == 'bgr'
+		scale = int(req.get('scale', 2))
+		if kind == 'upscale':
+			out_size = 16 * w * h * 3
+		elif kind == 'depth':
+			out_size = DEPTH_SIZE * DEPTH_SIZE * 4
+		elif kind == 'segment':
+			out_size = SEG_SIZE * SEG_SIZE * 4
+			if req.get('model', 'objects') not in ('objects', 'people'):
+				raise ValueError(f'segment: unknown model {req["model"]}')
+		elif kind == 'frames':
+			if scale not in (2, 4) or w * h > FRAME_PIXELS:
+				raise ValueError(f'frames: scale {scale}, {w}x{h}: up to {FRAME_PIXELS} px, 2x or 4x')
+			if lsock is None:
+				raise ValueError('busy with a video')
+			out_size = scale * scale * w * h * 3
+		else:
+			raise ValueError(f'unknown job {kind}')
+		if not 0 < w * h <= MAX_PIXELS or min(w, h) < 1:
+			raise ValueError(f'bad size {w}x{h}')
+		if os.fstat(fds[0]).st_size < w * h * 3 or os.fstat(fds[1]).st_size < out_size:
+			raise ValueError('memfds too small')
+		mi = mmap.mmap(fds[0], w * h * 3, prot=mmap.PROT_READ)
+		mo = mmap.mmap(fds[1], out_size)
+	finally:
+		for fd in fds:
+			os.close(fd)
+	img = np.frombuffer(mi, np.uint8).reshape(h, w, 3)
+	out = mask = None
+	try:
+		if kind == 'segment':
+			mask = np.frombuffer(mo, np.float32).reshape(SEG_SIZE, SEG_SIZE)
+			segment(conn, models, img[..., ::-1] if bgr else img, mask, req.get('model', 'objects'))
+		elif kind == 'depth':
+			mask = np.frombuffer(mo, np.float32).reshape(DEPTH_SIZE, DEPTH_SIZE)
+			depth(conn, models.get('depth'), img[..., ::-1] if bgr else img, mask)
+		else:
+			r = 4 if kind == 'upscale' else scale
+			out = np.frombuffer(mo, np.uint8).reshape(r * h, r * w, 3)
+			if bgr:			# the models are RGB
+				img, out = img[..., ::-1], out[..., ::-1]
+			with Inhibit():
+				if kind == 'upscale':
+					job_run(conn, models.get('upscale'), img, out, w, h)
+				else:
+					frames(conn, models, img, out, scale, lsock)
+	finally:
+		img = out = mask = None		# no views of the maps left before they close
+		mo.flush()
+		mi.close()
+		mo.close()
+
+
+def frames(conn, models, img, out, scale, lsock):
+	"""a video, frame by frame (compact Real-ESRGAN, compact_mdla): the
+	client writes a frame into its memfd and sends {"frame": i}, gets
+	{"done": i} with the result in the other; {"end": true} or closing the
+	connection ends it. A client that comes in meanwhile is served between
+	two frames (the network is built again after it)."""
+	import compact_mdla
+	h, w = img.shape[:2]
+	model = models.get(f'compact-x{scale}')
+	tile = compact_mdla.pick_tile(h, w)
+	net = compact_mdla.Compact(model, tile=tile)
+	n, t0 = 0, time.monotonic()
+	reply(conn, ready=True, tile=list(tile))
+	try:
+		while True:
+			msg = conn.recv(4096)
+			if not msg:
+				break
+			r = json.loads(msg)
+			if r.get('end'):
+				break
+			while select.select([lsock], [], [], 0)[0]:
+				if net:
+					net.close()
+					net = None
+				other, _ = lsock.accept()
+				log('a client between frames')
+				serve(other, models)
+			if net is None:
+				net = compact_mdla.Compact(model, tile=tile)
+			net.frame(img, out)
+			n += 1
+			reply(conn, done=r['frame'])
+	finally:
+		if net:
+			net.close()
+	s = time.monotonic() - t0
+	log(f'{n} frames {w}x{h} -> {scale}x in {s:.1f} s ({tile[0]}x{tile[1]} px tiles)')
+	try:
+		reply(conn, ok=True, frames=n, seconds=round(s, 1))
+	except OSError:
+		pass
+
+
+def depth(conn, model, img, out):
+	"""MiDaS small on one MDLA core: ~1 s (the APU's power-up included)"""
+	import depth_mdla
+	import midas
+	t = time.monotonic()
+	h, w = img.shape[:2]
+	if (h, w) != (DEPTH_SIZE, DEPTH_SIZE):	# the client should scale
+		img = img[np.arange(DEPTH_SIZE) * h // DEPTH_SIZE][:, np.arange(DEPTH_SIZE) * w // DEPTH_SIZE]
+	net = depth_mdla.Depth(model)
+	try:
+		out[:] = net.run(midas.normalise(np.ascontiguousarray(img).astype(np.float32) / 255))
+	finally:
+		net.close()
+	s = time.monotonic() - t
+	log(f'depth {w}x{h} in {s:.2f} s')
+	reply(conn, ok=True, seconds=round(s, 2))
+
+
+def segment(conn, models, img, out, model):
+	"""U^2-Net (`model`: objects / people) on one MDLA core: ~3 s (the
+	APU's power-up and the network's setup included); the small salient one
+	if the DMA buffer is not there"""
+	import seg16
+	import u2net_mdla
+	t = time.monotonic()
+	h, w = img.shape[:2]
+	if (h, w) != (SEG_SIZE, SEG_SIZE):	# the client should scale (Lanczos)
+		img = img[np.arange(SEG_SIZE) * h // SEG_SIZE][:, np.arange(SEG_SIZE) * w // SEG_SIZE]
+	try:
+		kind = 'segment-' + model
+		net = u2net_mdla.U2Net(models.get(kind))
+	except OSError as e:
+		if e.errno not in (errno.ENOMEM, errno.EINVAL):
+			raise
+		log('no DMA buffer for U^2-Net, the small one')
+		kind = 'segment-small'
+		net = u2net_mdla.U2Net(models.get(kind))
+	try:
+		out[:] = net.run(seg16.normalise(np.ascontiguousarray(img)))
+	finally:
+		net.close()
+	s = time.monotonic() - t
+	log(f'{kind} {w}x{h} in {s:.2f} s')
+	reply(conn, ok=True, seconds=round(s, 2), model=kind)
+
+
+def job_run(conn, model, img, out, w, h):
+	net = None
+	for tmax in TILE_MAX:
+		tile = pick_tile(h, w, tmax=tmax)
+		try:
+			net = X4Plus(model, tile=tile)
+			break
+		except OSError as e:
+			# EINVAL: more than the driver allows
+			if e.errno not in (errno.ENOMEM, errno.EINVAL) or tmax == TILE_MAX[-1]:
+				raise
+			log(f'no DMA buffer for {tile} px tiles, trying smaller ones')
+	t = time.monotonic()
+	try:
+		n = -(-h // net.tile) * -(-w // net.tile)
+		reply(conn, tiles=n)
+		net.upscale(img, out, progress=lambda d, n: reply(conn, done=d))
+	finally:
+		net.close()
+	s = time.monotonic() - t
+	log(f'{w}x{h} -> {4 * w}x{4 * h} in {s:.1f} s ({net.tile} px tiles)')
+	reply(conn, ok=True, seconds=round(s, 1))
+
+
+def main():
+	lsock = socket.socket(fileno=3)		# from cezanne-upscaled.socket
+	lsock.settimeout(IDLE)
+	models = Models()
+	while True:
+		try:
+			conn, _ = lsock.accept()
+		except TimeoutError:
+			return
+		serve(conn, models, lsock)
+
+
+if __name__ == '__main__':
+	main()

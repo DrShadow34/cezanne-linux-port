@@ -1,0 +1,12 @@
+[Unit]
+Description=Wi-Fi bring-up (MediaTek CONNSYS, cezanne)
+Before=NetworkManager.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cezanne-wifi-up
+
+[Install]
+WantedBy=multi-user.target

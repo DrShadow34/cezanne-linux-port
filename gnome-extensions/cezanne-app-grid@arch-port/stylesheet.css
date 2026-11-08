@@ -1,0 +1,12 @@
+/* page margins: the stock 18 px sides plus 10 % of the width per side for
+ * the neighbour page previews made the grid narrow */
+.icon-grid {
+  page-padding-left: 12px;
+  page-padding-right: 12px;
+}
+
+/* the workspace box is 0 high in the app grid: no shadow line left */
+.cezanne-app-grid-no-workspaces .workspace-background {
+  background-color: transparent;
+  box-shadow: none;
+}

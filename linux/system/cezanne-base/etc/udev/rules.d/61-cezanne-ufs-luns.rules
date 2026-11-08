@@ -1,0 +1,6 @@
+# The UFS boot LUNs 0 / 1 (4 MiB each, lk / preloader areas) report the same
+# serial as the user LUN 2, so UDisks made one drive of all three with the
+# size of LUN 0 (GNOME About: "Disk Capacity 4.2 MB"). Give them their own
+# serial and hide them from Disks / Files.
+SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_PATH}=="platform-11270000.ufshci-scsi-0:0:0:0", ENV{ID_SERIAL}="$env{ID_SERIAL}_boot0", ENV{ID_SERIAL_SHORT}="$env{ID_SERIAL_SHORT}_boot0", ENV{UDISKS_IGNORE}="1"
+SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_PATH}=="platform-11270000.ufshci-scsi-0:0:0:1", ENV{ID_SERIAL}="$env{ID_SERIAL}_boot1", ENV{ID_SERIAL_SHORT}="$env{ID_SERIAL_SHORT}_boot1", ENV{UDISKS_IGNORE}="1"

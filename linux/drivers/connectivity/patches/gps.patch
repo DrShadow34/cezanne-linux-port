@@ -1,0 +1,50 @@
+diff --git a/data_link/linux/gps_dl_linux_plat_drv.c b/data_link/linux/gps_dl_linux_plat_drv.c
+index 32eb10e..7806820 100644
+--- a/data_link/linux/gps_dl_linux_plat_drv.c
++++ b/data_link/linux/gps_dl_linux_plat_drv.c
+@@ -619,7 +619,11 @@ static int gps_dl_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++static void gps_dl_remove(struct platform_device *pdev)
++#else
+ static int gps_dl_remove(struct platform_device *pdev)
++#endif
+ {
+ 	struct gps_each_device *p_each_dev = gps_dl_device_get(GPS_DATA_LINK_ID0);
+ 
+@@ -630,7 +634,9 @@ static int gps_dl_remove(struct platform_device *pdev)
+ #endif
+ 	platform_set_drvdata(pdev, NULL);
+ 	p_each_dev->private_data = NULL;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+ 	return 0;
++#endif
+ }
+ 
+ static int gps_dl_drv_suspend(struct device *dev)
+diff --git a/data_link/plat/v010/Kbuild b/data_link/plat/v010/Kbuild
+index d510689..de59065 100644
+--- a/data_link/plat/v010/Kbuild
++++ b/data_link/plat/v010/Kbuild
+@@ -71,7 +71,8 @@ KBUILD_MODPOST_FAIL_ON_WARNINGS := y
+ GPS_PLATFORM := v010
+ MODULE_NAME := gps_drv_dl_$(GPS_PLATFORM)
+ obj-m += $(MODULE_NAME).o
+-KO_PATH := $(if $(filter /%,$(src)),,$(srctree)/)$(src)
++# 7.x: $(src) is relative for M= builds
++KO_PATH := $(if $(M),$(M),$(if $(filter /%,$(src)),,$(srctree)/)$(src))
+ 
+ GPS_DRV_CONTROL_LNA := n
+ GPS_DL_HAS_MOCK := n
+@@ -86,6 +87,9 @@ CONNINFRA_SRC_FOLDER := $(KO_PATH)/../../../../conninfra
+ ccflags-y += -I$(CONNINFRA_SRC_FOLDER)/include
+ ccflags-y += -I$(CONNINFRA_SRC_FOLDER)/conn_drv/connv2/debug_utility/metlog
+ ccflags-y += -DGPS_DL_HAS_CONNINFRA_DRV=1
++# cezanne mainline port: vendor header stubs + 7.x API shims (as conninfra)
++ccflags-y += -I$(CONNINFRA_SRC_FOLDER)/../compat/include
++ccflags-y += -include $(CONNINFRA_SRC_FOLDER)/../compat/include/compat_mainline.h
+ 
+ ccflags-y += -I$(CONNINFRA_SRC_FOLDER)/conn_drv/connv2/debug_utility/include
+ ccflags-y += -I$(CONNINFRA_SRC_FOLDER)/conn_drv/connv2/debug_utility/connsyslog

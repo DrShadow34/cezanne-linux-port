@@ -1,0 +1,136 @@
+input: goodix_yellowstone: sleep in system suspend
+
+The GT9896 kept scanning through every suspend (no PM ops). Suspend now
+sends the vendor driver's sleep command (0x05 to 0x4160, be16 arg 0, be16
+sum); resume resets it from a work item so the AOD's short wakes aren't
+held up by the 100 ms reset. A suspend before that work ran leaves the
+chip asleep.
+
+diff --git a/drivers/input/touchscreen/goodix_yellowstone.c b/drivers/input/touchscreen/goodix_yellowstone.c
+index ff118f920..d706f7431 100644
+--- a/drivers/input/touchscreen/goodix_yellowstone.c
++++ b/drivers/input/touchscreen/goodix_yellowstone.c
+@@ -15,8 +15,14 @@
+  *   [8..]  8 bytes per point: id << 4 | type, -, x be16, y be16, w be16
+  *          followed by be16 checksum over the point data
+  * Writing 0 to the status byte acknowledges the event.
++ *
++ * System suspend: command 0x05 (sleep) to the command register, as the
++ * vendor driver does; it scanned on through every suspend before. A reset
++ * wakes it again, from a work item so it doesn't hold up resume (the AOD's
++ * minute wakes are ~0.1 s).
+  */
+ #include <linux/delay.h>
++#include <linux/devm-helpers.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
+ #include <linux/input.h>
+@@ -28,6 +34,7 @@
+ #include <linux/unaligned.h>
+ 
+ #define GOODIX_YS_REG_PID	0x4022
++#define GOODIX_YS_REG_CMD	0x4160
+ #define GOODIX_YS_REG_ESD	0x4166
+ #define GOODIX_YS_REG_COOR	0x4180
+ 
+@@ -35,12 +42,14 @@
+ #define GOODIX_YS_POINT_LEN	8
+ #define GOODIX_YS_MAX_TOUCH	10
+ #define GOODIX_YS_TOUCH_EVENT	0x80
++#define GOODIX_YS_CMD_SLEEP	0x05
+ 
+ struct goodix_ys {
+ 	struct i2c_client *client;
+ 	struct input_dev *input;
+ 	struct gpio_desc *reset_gpio;
+ 	struct touchscreen_properties prop;
++	struct work_struct resume_work;
+ 	u8 buf[GOODIX_YS_HEAD_LEN + GOODIX_YS_POINT_LEN * GOODIX_YS_MAX_TOUCH + 4];
+ };
+ 
+@@ -71,6 +80,20 @@ static int goodix_ys_write_u8(struct goodix_ys *ts, u16 reg, u8 val)
+ 	return ret == sizeof(buf) ? 0 : (ret < 0 ? ret : -EIO);
+ }
+ 
++/* command byte, be16 argument (0), be16 sum of the three */
++static int goodix_ys_command(struct goodix_ys *ts, u8 cmd)
++{
++	u8 buf[7];
++	int ret;
++
++	put_unaligned_be16(GOODIX_YS_REG_CMD, buf);
++	buf[2] = cmd;
++	put_unaligned_be16(0, buf + 3);
++	put_unaligned_be16(cmd, buf + 5);
++	ret = i2c_master_send(ts->client, buf, sizeof(buf));
++	return ret == sizeof(buf) ? 0 : (ret < 0 ? ret : -EIO);
++}
++
+ /* u8 sum over data[0..len-3] must equal the be16 at data[len-2] */
+ static bool goodix_ys_csum_ok(const u8 *data, int len)
+ {
+@@ -148,6 +171,40 @@ static void goodix_ys_reset(struct goodix_ys *ts)
+ 	msleep(100);
+ }
+ 
++static void goodix_ys_resume_work(struct work_struct *work)
++{
++	struct goodix_ys *ts = container_of(work, struct goodix_ys, resume_work);
++
++	goodix_ys_reset(ts);
++	goodix_ys_write_u8(ts, GOODIX_YS_REG_ESD, 0);
++	enable_irq(ts->client->irq);
++}
++
++static int goodix_ys_suspend(struct device *dev)
++{
++	struct goodix_ys *ts = dev_get_drvdata(dev);
++	int ret;
++
++	/* the last resume's reset not run yet: still asleep, IRQ off */
++	if (cancel_work_sync(&ts->resume_work))
++		return 0;
++	disable_irq(ts->client->irq);
++	ret = goodix_ys_command(ts, GOODIX_YS_CMD_SLEEP);
++	if (ret)
++		dev_warn(dev, "sleep command failed: %d\n", ret);
++	return 0;
++}
++
++static int goodix_ys_resume(struct device *dev)
++{
++	struct goodix_ys *ts = dev_get_drvdata(dev);
++
++	schedule_work(&ts->resume_work);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(goodix_ys_pm_ops, goodix_ys_suspend, goodix_ys_resume);
++
+ static int goodix_ys_probe(struct i2c_client *client)
+ {
+ 	struct device *dev = &client->dev;
+@@ -206,8 +263,13 @@ static int goodix_ys_probe(struct i2c_client *client)
+ 		return ret;
+ 
+ 	/* trigger type comes from the device tree */
+-	return devm_request_threaded_irq(dev, client->irq, NULL, goodix_ys_irq,
+-					 IRQF_ONESHOT, client->name, ts);
++	ret = devm_request_threaded_irq(dev, client->irq, NULL, goodix_ys_irq,
++					IRQF_ONESHOT, client->name, ts);
++	if (ret)
++		return ret;
++
++	/* after the IRQ: cancelled before it is freed */
++	return devm_work_autocancel(dev, &ts->resume_work, goodix_ys_resume_work);
+ }
+ 
+ static const struct of_device_id goodix_ys_of_match[] = {
+@@ -226,6 +288,7 @@ static struct i2c_driver goodix_ys_driver = {
+ 	.driver = {
+ 		.name = "goodix-yellowstone",
+ 		.of_match_table = goodix_ys_of_match,
++		.pm = pm_sleep_ptr(&goodix_ys_pm_ops),
+ 	},
+ 	.probe = goodix_ys_probe,
+ 	.id_table = goodix_ys_id,

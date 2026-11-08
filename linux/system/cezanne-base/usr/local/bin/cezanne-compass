@@ -1,0 +1,539 @@
+#!/usr/bin/python3
+# Compass / magnetometer test app for the SCP sensor hub (scp-iio devices
+# "compass", "magn", "accel"). Values are in Android axes (x right, y up,
+# z out of the screen), which is what the hub reports.
+#
+# Like MIUI's sensor HAL (sensors.mt6885.so does magCalibration and
+# getOrientation on the AP), the heading is computed here: hard-iron offset
+# from a sphere fit over a figure-8, then tilt-compensated azimuth from
+# accel + corrected field. The hub's own fusion is shown for comparison only.
+import json
+import math
+import os
+import time
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, GLib, Gtk  # noqa: E402
+
+IIO = '/sys/bus/iio/devices'
+POLL_MS = 33
+SMOOTH = 0.25		# low-pass weight per sample for accel / field vectors
+NEEDLE_TAU = 0.12	# s, needle damping
+HISTORY_S = 20
+ACCURACY = ['Unreliable', 'Low', 'Medium', 'High']
+CARDINAL = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+CAL_FILE = os.path.join(os.environ.get('XDG_CONFIG_HOME') or
+                        os.path.expanduser('~/.config'),
+                        'cezanne-compass', 'calibration.json')
+CAL_SECONDS = 15
+
+
+def find_iio(name):
+    try:
+        for d in os.listdir(IIO):
+            try:
+                with open(os.path.join(IIO, d, 'name')) as f:
+                    if f.read().strip() == name:
+                        return os.path.join(IIO, d)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return None
+
+
+def read_num(dev, attr):
+    try:
+        with open(os.path.join(dev, attr)) as f:
+            return float(f.read())
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+class Sensors:
+    def __init__(self):
+        self.compass = find_iio('compass')
+        self.magn = find_iio('magn')
+        self.accel = find_iio('accel')
+        self.magn_scale = (read_num(self.magn, 'in_magn_scale') or 1e-4) * 100  # G -> uT
+        self.rot_scale = read_num(self.compass, 'in_rot_scale') or 1e-3
+        self.incli_scale = read_num(self.compass, 'in_incli_scale') or 1e-3
+
+    def ok(self):
+        return self.magn is not None
+
+    def read(self):
+        r = {}
+        if self.compass:
+            az = read_num(self.compass, 'in_rot_from_north_magnetic_tilt_comp_raw')
+            r['azimuth'] = None if az is None else (az * self.rot_scale) % 360
+            p = read_num(self.compass, 'in_incli_x_raw')
+            q = read_num(self.compass, 'in_incli_y_raw')
+            r['pitch'] = None if p is None else p * self.incli_scale
+            r['roll'] = None if q is None else q * self.incli_scale
+            r['compass_acc'] = read_num(self.compass, 'accuracy')
+        raw = [read_num(self.magn, f'in_magn_{a}_raw') for a in 'xyz']
+        bias = [read_num(self.magn, f'in_magn_{a}_calibbias') for a in 'xyz']
+        if None not in raw:
+            # Android semantics: the hub reports the calibrated field and,
+            # separately, the hard-iron bias it removed (uncal = cal + bias)
+            r['cal'] = [v * self.magn_scale for v in raw]
+            r['bias'] = [(b or 0) * self.magn_scale for b in bias]
+            r['raw'] = [v + b for v, b in zip(r['cal'], r['bias'])]
+        r['magn_acc'] = read_num(self.magn, 'accuracy')
+        if self.accel:
+            acc = [read_num(self.accel, f'in_accel_{a}_raw') for a in 'xyz']
+            if None not in acc:
+                r['accel'] = acc
+        return r
+
+
+def own_heading(g, e):
+    """Android SensorManager.getRotationMatrix + getOrientation azimuth."""
+    ax, ay, az = g
+    ex, ey, ez = e
+    hx, hy, hz = ey * az - ez * ay, ez * ax - ex * az, ex * ay - ey * ax
+    nh = math.sqrt(hx * hx + hy * hy + hz * hz)
+    na = math.sqrt(ax * ax + ay * ay + az * az)
+    if nh < 0.1 or na < 0.1:
+        return None
+    hx, hy, hz = hx / nh, hy / nh, hz / nh
+    ax, ay, az = ax / na, ay / na, az / na
+    my = az * hx - ax * hz
+    return math.degrees(math.atan2(hy, my)) % 360
+
+
+def solve4(a, b):
+    """Gaussian elimination for a 4x4 system."""
+    m = [row[:] + [v] for row, v in zip(a, b)]
+    for c in range(4):
+        piv = max(range(c, 4), key=lambda r: abs(m[r][c]))
+        if abs(m[piv][c]) < 1e-12:
+            return None
+        m[c], m[piv] = m[piv], m[c]
+        for r in range(4):
+            if r != c:
+                f = m[r][c] / m[c][c]
+                m[r] = [x - f * y for x, y in zip(m[r], m[c])]
+    return [m[i][4] / m[i][i] for i in range(4)]
+
+
+def fit_sphere(pts):
+    """Least-squares sphere: |p - c|^2 = r^2. Returns (centre, r, rms, spread)."""
+    # x^2+y^2+z^2 = 2cx x + 2cy y + 2cz z + k
+    ata = [[0.0] * 4 for _ in range(4)]
+    atb = [0.0] * 4
+    for x, y, z in pts:
+        row = [2 * x, 2 * y, 2 * z, 1.0]
+        rhs = x * x + y * y + z * z
+        for i in range(4):
+            atb[i] += row[i] * rhs
+            for j in range(4):
+                ata[i][j] += row[i] * row[j]
+    sol = solve4(ata, atb)
+    if sol is None:
+        return None
+    c = sol[:3]
+    r2 = sol[3] + sum(v * v for v in c)
+    if r2 <= 0:
+        return None
+    r = math.sqrt(r2)
+    res = [math.dist(p, c) - r for p in pts]
+    rms = math.sqrt(sum(e * e for e in res) / len(res))
+    # how much of the sphere was covered: spread of directions per axis
+    spread = min(max(p[i] - c[i] for p in pts) - min(p[i] - c[i] for p in pts)
+                 for i in range(3)) / (2 * r)
+    return c, r, rms, spread
+
+
+def load_cal():
+    try:
+        with open(CAL_FILE) as f:
+            d = json.load(f)
+        return [float(v) for v in d['offset']], float(d['radius'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_cal(offset, radius):
+    os.makedirs(os.path.dirname(CAL_FILE), exist_ok=True)
+    with open(CAL_FILE, 'w') as f:
+        json.dump({'offset': offset, 'radius': radius,
+                   'time': time.strftime('%F %T')}, f)
+
+
+def cardinal(deg):
+    return CARDINAL[int((deg + 22.5) // 45) % 8]
+
+
+def angle_diff(a, b):
+    """Shortest signed difference a - b in degrees."""
+    return (a - b + 180) % 360 - 180
+
+
+class Dial(Gtk.DrawingArea):
+    """Compass rose; the shown headings ease towards the targets per frame."""
+
+    def __init__(self):
+        super().__init__(hexpand=True, vexpand=True)
+        self.heading = None	# shown (animated)
+        self.own = None
+        self.target = None
+        self.target_own = None
+        self.last_frame = None
+        self.set_content_width(300)
+        self.set_content_height(300)
+        self.set_draw_func(self.draw)
+        self.add_tick_callback(self.on_frame)
+
+    def set_targets(self, heading, other):
+        self.target, self.target_own = heading, other
+
+    @staticmethod
+    def ease(shown, target, k):
+        if target is None:
+            return None
+        if shown is None:
+            return target
+        return (shown + angle_diff(target, shown) * k) % 360
+
+    def on_frame(self, widget, clock):
+        now = clock.get_frame_time() / 1e6
+        dt = 0 if self.last_frame is None else min(now - self.last_frame, 0.1)
+        self.last_frame = now
+        k = 1 - math.exp(-dt / NEEDLE_TAU) if dt else 1
+        h, o = self.heading, self.own
+        self.heading = self.ease(self.heading, self.target, k)
+        self.own = self.ease(self.own, self.target_own, k)
+        if h != self.heading or o != self.own:
+            self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def draw(self, area, cr, w, h):
+        fg = self.get_color()
+        r = min(w, h) / 2 - 12
+        cx, cy = w / 2, h / 2
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.15)
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.fill()
+        # fixed lubber line at the top: where the phone points
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.9)
+        cr.move_to(cx, cy - r - 10)
+        cr.line_to(cx - 9, cy - r + 6)
+        cr.line_to(cx + 9, cy - r + 6)
+        cr.close_path()
+        cr.fill()
+        if self.heading is None:
+            return
+        cr.save()
+        cr.translate(cx, cy)
+        cr.rotate(-math.radians(self.heading))
+        for i in range(72):
+            a = math.radians(i * 5)
+            long_tick = i % 6 == 0
+            l1 = r - (18 if long_tick else 8)
+            cr.set_line_width(3 if long_tick else 1.5)
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.8)
+            cr.move_to(l1 * math.sin(a), -l1 * math.cos(a))
+            cr.line_to(r * math.sin(a), -r * math.cos(a))
+            cr.stroke()
+        cr.select_font_face('Sans')
+        cr.set_font_size(r * 0.16)
+        for i, name in enumerate(['N', 'E', 'S', 'W']):
+            a = math.radians(i * 90)
+            tx, ty = (r - 42) * math.sin(a), -(r - 42) * math.cos(a)
+            ext = cr.text_extents(name)
+            cr.save()
+            cr.translate(tx, ty)
+            cr.rotate(a)
+            if name == 'N':
+                cr.set_source_rgb(0.88, 0.11, 0.14)
+            else:
+                cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.9)
+            cr.move_to(-ext.width / 2 - ext.x_bearing, ext.height / 2)
+            cr.show_text(name)
+            cr.restore()
+        # needle: red to north
+        cr.set_source_rgb(0.88, 0.11, 0.14)
+        cr.move_to(0, -r * 0.62)
+        cr.line_to(-r * 0.07, 0)
+        cr.line_to(r * 0.07, 0)
+        cr.close_path()
+        cr.fill()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.6)
+        cr.move_to(0, r * 0.62)
+        cr.line_to(-r * 0.07, 0)
+        cr.line_to(r * 0.07, 0)
+        cr.close_path()
+        cr.fill()
+        cr.restore()
+        # sensor hub fusion heading as a thin marker for comparison
+        if self.own is not None:
+            cr.save()
+            cr.translate(cx, cy)
+            cr.rotate(-math.radians(self.own))
+            cr.set_source_rgb(0.2, 0.52, 0.89)
+            cr.set_line_width(3)  # hub fusion, for comparison
+            cr.move_to(0, -r * 0.2)
+            cr.line_to(0, -r * 0.9)
+            cr.stroke()
+            cr.restore()
+
+
+class Graph(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__(hexpand=True)
+        self.set_content_height(160)
+        self.samples = []
+        self.set_draw_func(self.draw)
+
+    def add(self, v):
+        now = time.monotonic()
+        self.samples.append((now, v))
+        while self.samples and self.samples[0][0] < now - HISTORY_S:
+            self.samples.pop(0)
+        self.queue_draw()
+
+    def draw(self, area, cr, w, h):
+        fg = self.get_color()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.1)
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+        if len(self.samples) < 2:
+            return
+        vals = [v for _, v in self.samples]
+        lo, hi = min(vals), max(vals)
+        lo, hi = min(lo, 0), max(hi, 80)
+        span = hi - lo or 1
+        t0 = time.monotonic() - HISTORY_S
+        cr.set_source_rgb(0.2, 0.52, 0.89)
+        cr.set_line_width(2.5)
+        for i, (t, v) in enumerate(self.samples):
+            x = (t - t0) / HISTORY_S * w
+            y = h - (v - lo) / span * (h - 8) - 4
+            (cr.move_to if i == 0 else cr.line_to)(x, y)
+        cr.stroke()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.6)
+        cr.set_font_size(13)
+        cr.move_to(6, 16)
+        cr.show_text(f'{hi:.0f} µT')
+        cr.move_to(6, h - 6)
+        cr.show_text(f'{lo:.0f} µT  ·  last {HISTORY_S} s')
+
+
+def big_label(css):
+    lbl = Gtk.Label(label='–')
+    lbl.add_css_class(css)
+    return lbl
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='Compass')
+        self.set_default_size(400, 760)
+        self.sensors = Sensors()
+        self.cal = load_cal()
+        self.cal_samples = None		# list while calibrating
+        self.f_accel = None		# low-passed vectors
+        self.f_field = None
+        self.cal_end = 0
+
+        stack = Adw.ViewStack()
+        header = Adw.HeaderBar()
+        switcher_bar = Adw.ViewSwitcherBar(stack=stack, reveal=True)
+        view = Adw.ToolbarView(content=stack)
+        view.add_top_bar(header)
+        view.add_bottom_bar(switcher_bar)
+
+        # compass page
+        self.banner = Adw.Banner(button_label='Calibrate')
+        self.banner.connect('button-clicked', self.start_calibration)
+        cal_btn = Gtk.Button(icon_name='view-refresh-symbolic',
+                             tooltip_text='Calibrate')
+        cal_btn.connect('clicked', self.start_calibration)
+        header.pack_end(cal_btn)
+        self.dial = Dial()
+        self.heading = big_label('title-1')
+        self.sub = Gtk.Label(label='')
+        self.sub.add_css_class('dim-label')
+        self.tilt = Gtk.Label(label='')
+        self.tilt.add_css_class('caption')
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=12, margin_bottom=12,
+                      margin_start=12, margin_end=12)
+        box.append(self.dial)
+        box.append(self.heading)
+        box.append(self.sub)
+        box.append(self.tilt)
+        cpage = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        cpage.append(self.banner)
+        cpage.append(box)
+        stack.add_titled_with_icon(cpage, 'compass', 'Compass',
+                                   'find-location-symbolic')
+
+        # magnetic field page
+        self.field = big_label('title-1')
+        self.field_sub = Gtk.Label(label='Total field strength')
+        self.field_sub.add_css_class('dim-label')
+        self.graph = Graph()
+        grid = Gtk.Grid(column_spacing=18, row_spacing=6,
+                        halign=Gtk.Align.CENTER)
+        for c, t in enumerate(['', 'uncalibrated', 'offset', 'calibrated']):
+            lbl = Gtk.Label(label=t, xalign=1)
+            lbl.add_css_class('heading')
+            grid.attach(lbl, c, 0, 1, 1)
+        self.cells = []
+        for r, axis in enumerate('xyz'):
+            grid.attach(Gtk.Label(label=axis, xalign=0), 0, r + 1, 1, 1)
+            row = []
+            for c in range(3):
+                lbl = Gtk.Label(label='–', xalign=1, width_chars=8)
+                lbl.add_css_class('numeric')
+                grid.attach(lbl, c + 1, r + 1, 1, 1)
+                row.append(lbl)
+            self.cells.append(row)
+        self.cal_row = Adw.ActionRow(title='Calibration')
+        self.cal_val = Gtk.Label(label='–')
+        self.cal_row.add_suffix(self.cal_val)
+        self.acc_row = Adw.ActionRow(title='Sensor hub accuracy')
+        self.acc_val = Gtk.Label(label='–')
+        self.acc_row.add_suffix(self.acc_val)
+        self.raw_row = Adw.ActionRow(title='Uncalibrated strength')
+        self.raw_val = Gtk.Label(label='–')
+        self.raw_row.add_suffix(self.raw_val)
+        group = Adw.PreferencesGroup()
+        group.add(self.cal_row)
+        group.add(self.acc_row)
+        group.add(self.raw_row)
+        fbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                       margin_top=24, margin_bottom=12,
+                       margin_start=12, margin_end=12)
+        fbox.append(self.field)
+        fbox.append(self.field_sub)
+        fbox.append(self.graph)
+        fbox.append(grid)
+        fbox.append(group)
+        hint = Gtk.Label(
+            label='Units: µT, Android axes (x right, y up, z out of the '
+                  'screen). Earth\'s field is 25–65 µT.',
+            wrap=True, justify=Gtk.Justification.CENTER)
+        hint.add_css_class('caption')
+        hint.add_css_class('dim-label')
+        fbox.append(hint)
+        scroller = Gtk.ScrolledWindow(child=fbox, vexpand=True)
+        stack.add_titled_with_icon(scroller, 'field', 'Magnetic Field',
+                                   'network-wireless-signal-excellent-symbolic')
+
+        if not self.sensors.ok():
+            view.set_content(Adw.StatusPage(
+                title='No magnetometer', icon_name='dialog-error-symbolic',
+                description='The scp-iio "magn" device was not found.'))
+        self.set_content(view)
+        GLib.timeout_add(POLL_MS, self.tick)
+
+    def start_calibration(self, *args):
+        self.cal_samples = []
+        self.cal_end = time.monotonic() + CAL_SECONDS
+
+    def finish_calibration(self):
+        pts, self.cal_samples = self.cal_samples, None
+        fit = fit_sphere(pts) if len(pts) >= 30 else None
+        if fit is None:
+            self.toast('Calibration failed: not enough data')
+            return
+        c, r, rms, spread = fit
+        if spread < 0.6 or not 15 < r < 100:
+            self.toast(f'Calibration rejected (coverage {spread:.0%}, '
+                       f'field {r:.0f} µT): move through more directions')
+            return
+        self.cal = (c, r)
+        save_cal(c, r)
+        self.toast(f'Calibrated: field {r:.1f} µT, fit error {rms:.1f} µT')
+
+    def toast(self, text):
+        self.banner.set_title(text)
+        self.banner.set_button_label('Calibrate')
+        self.banner.set_revealed(True)
+        GLib.timeout_add_seconds(6, self.hide_banner)
+
+    def hide_banner(self):
+        if self.cal is not None and self.cal_samples is None:
+            self.banner.set_revealed(False)
+        return GLib.SOURCE_REMOVE
+
+    def tick(self):
+        if not self.sensors.ok():
+            return GLib.SOURCE_CONTINUE
+        r = self.sensors.read()
+        if 'raw' not in r:
+            return GLib.SOURCE_CONTINUE
+        raw = r['raw']
+
+        if self.cal_samples is not None:
+            self.cal_samples.append(raw)
+            left = self.cal_end - time.monotonic()
+            self.banner.set_title(
+                f'Keep moving the phone in a figure-8 … {max(left, 0):.0f} s')
+            self.banner.set_button_label('')
+            self.banner.set_revealed(True)
+            if left <= 0:
+                self.finish_calibration()
+        elif self.cal is None:
+            self.banner.set_title('Not calibrated: move in a figure-8 '
+                                  'after pressing Calibrate')
+            self.banner.set_revealed(True)
+
+        if self.cal is not None:
+            offset = self.cal[0]
+            src = 'own calibration'
+        else:
+            offset = r['bias']
+            src = 'sensor hub calibration'
+        cal = [v - o for v, o in zip(raw, offset)]
+
+        lp = lambda f, v: v if f is None else [  # noqa: E731
+            a + (b - a) * SMOOTH for a, b in zip(f, v)]
+        self.f_field = lp(self.f_field, cal)
+        if 'accel' in r:
+            self.f_accel = lp(self.f_accel, r['accel'])
+        own = (own_heading(self.f_accel, self.f_field)
+               if self.f_accel else None)
+        hub = r.get('azimuth')
+        self.dial.set_targets(own, hub)
+        shown = self.dial.heading if self.dial.heading is not None else own
+        if shown is not None:
+            self.heading.set_label(f'{shown:.0f}°  {cardinal(shown)}')
+        hub_txt = f'{hub:.0f}°' if hub is not None else '–'
+        self.sub.set_label(f'Using {src}  ·  hub fusion {hub_txt} (blue)')
+        if r.get('pitch') is not None:
+            self.tilt.set_label(
+                f'Pitch {r["pitch"]:.0f}°   Roll {r["roll"]:.0f}°')
+
+        acc = r.get('magn_acc')
+        if acc is not None:
+            self.acc_val.set_label(f'{ACCURACY[int(acc) & 3]} ({int(acc)})')
+        self.cal_val.set_label(
+            f'own, sphere {self.cal[1]:.1f} µT' if self.cal else 'sensor hub')
+        strength = math.sqrt(sum(v * v for v in cal))
+        self.field.set_label(f'{strength:.1f} µT')
+        self.raw_val.set_label(f'{math.sqrt(sum(v * v for v in raw)):.1f} µT')
+        self.graph.add(strength)
+        for row, vals in zip(self.cells, zip(raw, offset, cal)):
+            for lbl, v in zip(row, vals):
+                lbl.set_label(f'{v:.1f}')
+        return GLib.SOURCE_CONTINUE
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='org.cezanne.Compass')
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+if __name__ == '__main__':
+    App().run(None)

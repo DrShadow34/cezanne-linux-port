@@ -1,0 +1,2 @@
+# libcamera software ISP buffers: let the logged-in user allocate dma-bufs
+SUBSYSTEM=="dma_heap", GROUP="video", MODE="0660", TAG+="uaccess"

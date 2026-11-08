@@ -1,0 +1,31 @@
+# Power settings app for the Redmi K30 Ultra (cezanne): what the phone does
+# while it sleeps (always-on clock, Wi-Fi and Bluetooth in standby, later
+# wake gestures and sensors), with the measured cost of each, and the battery
+# use of the last locked periods (cezanne-standby-log), and the switch for the
+# microphone's noise reduction (cezanne-voice). The standby settings are read
+# by the cezanne-aod shell extension (mainline/rootfs/display).
+# After installing: systemctl enable --now cezanne-standby-log
+pkgname=cezanne-power
+pkgver=1.0
+pkgrel=5
+pkgdesc="Standby settings and measured battery use"
+arch=(any)
+license=(MIT)
+depends=(python python-gobject gtk4 libadwaita)
+optdepends=('cezanne-voice: microphone noise reduction (the Microphone switch)')
+source=(cezanne-power
+        cezanne-standby-log
+        cezanne-standby-log.service
+        org.cezanne.power.gschema.xml
+        org.cezanne.Power.desktop
+        org.cezanne.Power.svg)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 cezanne-power "$pkgdir/usr/bin/cezanne-power"
+  install -Dm755 cezanne-standby-log "$pkgdir/usr/lib/cezanne-power/cezanne-standby-log"
+  install -Dm644 cezanne-standby-log.service "$pkgdir/usr/lib/systemd/system/cezanne-standby-log.service"
+  install -Dm644 org.cezanne.power.gschema.xml "$pkgdir/usr/share/glib-2.0/schemas/org.cezanne.power.gschema.xml"
+  install -Dm644 org.cezanne.Power.desktop "$pkgdir/usr/share/applications/org.cezanne.Power.desktop"
+  install -Dm644 org.cezanne.Power.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.cezanne.Power.svg"
+}

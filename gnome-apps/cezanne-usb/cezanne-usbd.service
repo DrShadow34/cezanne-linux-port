@@ -1,0 +1,15 @@
+[Unit]
+Description=USB modes (charge only / data storage / video stream / developer network)
+After=sys-kernel-config.mount systemd-modules-load.service
+# it owns the gadget now
+Conflicts=usb-gadget.service
+
+[Service]
+Type=dbus
+BusName=org.cezanne.Usb
+ExecStart=/usr/bin/cezanne-usbd
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,87 @@
+rtc: mt6397: optional MediaTek BSP year encoding (years since 1968)
+
+diff --git a/drivers/rtc/rtc-mt6397.c b/drivers/rtc/rtc-mt6397.c
+index 3d857681f..ed29ee30e 100644
+--- a/drivers/rtc/rtc-mt6397.c
++++ b/drivers/rtc/rtc-mt6397.c
+@@ -11,6 +11,7 @@
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/rtc.h>
+ #include <linux/mfd/mt6397/rtc.h>
+@@ -76,7 +77,7 @@ static int __mtk_rtc_read_time(struct mt6397_rtc *rtc,
+ 	tm->tm_mday = data[RTC_OFFSET_DOM];
+ 	tm->tm_wday = data[RTC_OFFSET_DOW];
+ 	tm->tm_mon = data[RTC_OFFSET_MTH] & RTC_TC_MTH_MASK;
+-	tm->tm_year = data[RTC_OFFSET_YEAR];
++	tm->tm_year = data[RTC_OFFSET_YEAR] + rtc->year_base;
+ 
+ 	ret = regmap_read(rtc->regmap, rtc->addr_base + RTC_TC_SEC, sec);
+ exit:
+@@ -118,7 +119,7 @@ static int mtk_rtc_set_time(struct device *dev, struct rtc_time *tm)
+ 	data[RTC_OFFSET_DOM] = tm->tm_mday;
+ 	data[RTC_OFFSET_DOW] = tm->tm_wday;
+ 	data[RTC_OFFSET_MTH] = tm->tm_mon;
+-	data[RTC_OFFSET_YEAR] = tm->tm_year;
++	data[RTC_OFFSET_YEAR] = tm->tm_year - rtc->year_base;
+ 
+ 	mutex_lock(&rtc->lock);
+ 	ret = regmap_bulk_write(rtc->regmap, rtc->addr_base + RTC_TC_SEC,
+@@ -164,7 +165,7 @@ static int mtk_rtc_read_alarm(struct device *dev, struct rtc_wkalrm *alm)
+ 	tm->tm_hour = data[RTC_OFFSET_HOUR] & RTC_AL_HOU_MASK;
+ 	tm->tm_mday = data[RTC_OFFSET_DOM] & RTC_AL_DOM_MASK;
+ 	tm->tm_mon = data[RTC_OFFSET_MTH] & RTC_AL_MTH_MASK;
+-	tm->tm_year = data[RTC_OFFSET_YEAR] & RTC_AL_YEA_MASK;
++	tm->tm_year = (data[RTC_OFFSET_YEAR] & RTC_AL_YEA_MASK) + rtc->year_base;
+ 
+ 	tm->tm_mon--;
+ 
+@@ -200,7 +201,7 @@ static int mtk_rtc_set_alarm(struct device *dev, struct rtc_wkalrm *alm)
+ 	data[RTC_OFFSET_MTH] = ((data[RTC_OFFSET_MTH] & ~(RTC_AL_MTH_MASK)) |
+ 				(tm->tm_mon & RTC_AL_MTH_MASK));
+ 	data[RTC_OFFSET_YEAR] = ((data[RTC_OFFSET_YEAR] & ~(RTC_AL_YEA_MASK)) |
+-				(tm->tm_year & RTC_AL_YEA_MASK));
++				((tm->tm_year - rtc->year_base) & RTC_AL_YEA_MASK));
+ 
+ 	if (alm->enabled) {
+ 		ret = regmap_bulk_write(rtc->regmap,
+@@ -288,10 +289,20 @@ static int mtk_rtc_probe(struct platform_device *pdev)
+ 	device_init_wakeup(&pdev->dev, true);
+ 
+ 	rtc->rtc_dev->ops = &mtk_rtc_ops;
+-	rtc->rtc_dev->range_min = RTC_TIMESTAMP_BEGIN_1900;
+-	rtc->rtc_dev->range_max = mktime64(2027, 12, 31, 23, 59, 59);
+-	rtc->rtc_dev->start_secs = mktime64(1968, 1, 2, 0, 0, 0);
+-	rtc->rtc_dev->set_start_time = true;
++	/*
++	 * MediaTek's Android kernels and bootloaders store the year counted
++	 * from 1968; keep that encoding when sharing the RTC with them.
++	 */
++	if (device_property_read_bool(&pdev->dev, "mediatek,year-base-1968")) {
++		rtc->year_base = 68;
++		rtc->rtc_dev->range_min = mktime64(1968, 1, 1, 0, 0, 0);
++		rtc->rtc_dev->range_max = mktime64(2095, 12, 31, 23, 59, 59);
++	} else {
++		rtc->rtc_dev->range_min = RTC_TIMESTAMP_BEGIN_1900;
++		rtc->rtc_dev->range_max = mktime64(2027, 12, 31, 23, 59, 59);
++		rtc->rtc_dev->start_secs = mktime64(1968, 1, 2, 0, 0, 0);
++		rtc->rtc_dev->set_start_time = true;
++	}
+ 
+ 	return devm_rtc_register_device(rtc->rtc_dev);
+ }
+diff --git a/include/linux/mfd/mt6397/rtc.h b/include/linux/mfd/mt6397/rtc.h
+index 27883af44..5f7e17106 100644
+--- a/include/linux/mfd/mt6397/rtc.h
++++ b/include/linux/mfd/mt6397/rtc.h
+@@ -75,6 +75,7 @@ struct mt6397_rtc {
+ 	struct regmap           *regmap;
+ 	int                     irq;
+ 	u32                     addr_base;
++	int                     year_base;
+ 	const struct mtk_rtc_data *data;
+ };
+ 

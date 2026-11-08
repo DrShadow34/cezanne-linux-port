@@ -1,0 +1,41 @@
+MediaTek connectivity (Wi-Fi + Bluetooth) for mainline 7.2, out of tree.
+
+Sources: github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-<repo>,
+branch android-15-release-vvob35 (conninfra, wlan-adaptor, wlan-core-gen4m, common, connfem).
+Clone them into src/connectivity/<repo>, apply patches/<repo>.patch, copy compat/,
+and symlink the Android layout:
+  src/vtop/vendor/mediatek/kernel_modules/connectivity/{conninfra,common,connfem,
+    wlan/adaptor -> wlan-adaptor, wlan/core/gen4m -> wlan-core-gen4m}
+
+Build (kernel Module.symvers = vmlinux.symvers, cfg80211 built in):
+  build.sh conninfra
+  build2.sh wlan-adaptor CONNAC_VER=2_0 MODULE_NAME=wmt_chrdev_wifi_connac2
+  build2.sh wlan-core-gen4m SEGMENT=SP MODULE_NAME=wlan_drv_gen4m_6885 \
+	KO_CODE_PATH=$HOME/arch-port/src/connectivity/wlan-core-gen4m
+Install the stripped .ko into /usr/lib/modules/$(uname -r)/extra, depmod.
+Runtime: cezanne-wifi.service (mainline/rootfs). Firmware: MIUI vendor/firmware soc3_0_*.
+
+Bluetooth:
+  - btif: the 4.14 BSP BTIF driver (AP <-> CONNSYS serial link), not in the vendor
+    repos: copy src/kernel-port/drivers/misc/mediatek/btif/common into
+    src/connectivity/btif, apply patches/btif.patch (adds Kbuild + compat_btif.h).
+  - bt-mt66xx: vendor-mediatek-kernel_modules-connectivity-bt-mt66xx (same branch),
+    apply patches/bt-mt66xx.patch (BlueZ mode: USE_DEVICE_NODE=0, CFG_SUPPORT_BLUEZ,
+    late hci registration, set_bdaddr + quirks, connfem stubs).
+  - symlinks: src/vtop/.../connectivity/{btif -> btif, bt -> bt-mt66xx}
+  Build:
+    build.sh btif
+    build2.sh bt-mt66xx/6885          (-> bt_drv_6885.ko, needs CONFIG_BT=y)
+  Runtime: cezanne-bt.service (after cezanne-wifi). Firmware: soc3_0_ram_{mcu,bt}_1_1_hdr.bin,
+  BT_FW.cfg (MIUI vendor/firmware).
+
+GNSS (GPS data link):
+  - gps: vendor-mediatek-kernel_modules-connectivity-gps (same branch), apply
+    patches/gps.patch (KO_PATH from $(M): 7.x makes $(src) relative; compat include
+    as conninfra; void platform remove). MT6885 = data_link/plat/v010 (symlinks into
+    data_link/).
+  Build:
+    build2.sh gps/data_link/plat/v010 CONFIG_MTK_GPS_SUPPORT=y   (-> gps_drv_dl_v010.ko)
+  Runtime: cezanne-gps.service (after cezanne-wifi; udev load blacklisted), DT node gps
+  + gps-reserve-memory (1 MiB). /dev/gpsdl0 (L1), /dev/gpsdl1 (L5), /dev/gps_emi.
+  The DSP needs its RAM code downloaded by the host after open (MIUI: libmnl).

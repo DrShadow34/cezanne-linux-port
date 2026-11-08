@@ -1,0 +1,7 @@
+{
+  "uuid": "cezanne-portrait-calendar@arch-port",
+  "name": "Cezanne Portrait Calendar",
+  "description": "Stacks the clock popup's calendar above its notification list in portrait so both fit the phone screen; stock layout in landscape.",
+  "shell-version": ["51"],
+  "session-modes": ["user", "unlock-dialog"]
+}

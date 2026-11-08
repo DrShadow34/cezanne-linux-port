@@ -1,0 +1,14 @@
+# libcamera runtime configuration (Redmi K30 Ultra).
+# The front camera's media device (cezanne_camsv.ko) is called "mtk-seninf";
+# libcamera's simple pipeline handler knows it but expects an MDP converter,
+# so turn the software ISP on (GPU debayer when EGL works, CPU otherwise).
+---
+version: 1
+configuration:
+  pipelines:
+    simple:
+      supported_devices:
+        - driver: mtk-seninf
+          software_isp: true
+  software_isp:
+    mode: gpu

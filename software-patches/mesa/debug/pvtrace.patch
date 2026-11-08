@@ -1,0 +1,294 @@
+panvk: render pass / image trace for profiling (debug only, not packaged)
+
+While /tmp/pvtrace exists, every closed JM batch logs to /tmp/pvtrace.log:
+caller offset in libvulkan_panfrost.so, job count, framebuffer size,
+tile size, first / spilled batch, and per attachment format / modifier
+(AFBC, UINT, LIN) / load op (- none, C clear, L load, ! always) / store.
+While /tmp/pvtrace-img exists, every image creation logs format, extent,
+usage, flags and the chosen modifier. /tmp is shared with Steam's
+pressure-vessel containers, so it works for Proton games.
+Apply on top of the series: git apply mainline/mesa-g77/debug/pvtrace.patch
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index bc5fe87..8080e3e 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -25,12 +25,15 @@
+ #include "panvk_meta.h"
+ #include "panvk_physical_device.h"
+ #include "panvk_priv_bo.h"
++#include "panvk_pvtrace.h"
+ 
+ #include "pan_desc.h"
+ #include "pan_encoder.h"
+ #include "pan_props.h"
+ #include "pan_samples.h"
+ 
++#include "drm-uapi/drm_fourcc.h"
++#include "util/format/u_format.h"
+ #include "vk_descriptor_update_template.h"
+ #include "vk_format.h"
+ 
+@@ -65,6 +68,91 @@ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
+    return VK_SUCCESS;
+ }
+ 
++static char
++pvtrace_load_op(const struct pan_fb_load_target *t)
++{
++   switch (t->in_bounds_load) {
++   case PAN_FB_LOAD_NONE:
++      return '-';
++   case PAN_FB_LOAD_CLEAR:
++      return 'C';
++   case PAN_FB_LOAD_IMAGE:
++      return 'L';
++   default:
++      return '?';
++   }
++}
++
++static const char *
++pvtrace_mod(const struct pan_image_view *a, const struct pan_image_view *b)
++{
++   const struct pan_image_view *iview = a ? a : b;
++   if (!iview)
++      return "none";
++   struct pan_image_plane_ref ref = pan_image_view_get_first_plane(iview);
++   if (!ref.image)
++      return "none";
++   uint64_t m = ref.image->props.modifier;
++   if (drm_is_afbc(m))
++      return "AFBC";
++   if (m == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED)
++      return "UINT";
++   if (m == DRM_FORMAT_MOD_LINEAR)
++      return "LIN";
++   return "other";
++}
++
++static void
++pvtrace_batch(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch,
++              const void *caller, bool has_fb)
++{
++   FILE *f = panvk_pvtrace_file();
++   const struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
++
++   fprintf(f, "%llu BATCH cb %p from 0x%lx jobs %u tiler %d",
++           (unsigned long long)panvk_pvtrace_ms(), (void *)cmdbuf,
++           (unsigned long)panvk_pvtrace_offset(caller),
++           batch->vtc_jc.job_index, batch->vtc_jc.first_tiler != NULL);
++   if (!has_fb) {
++      fprintf(f, " nofb\n");
++      return;
++   }
++
++   const struct pan_fb_layout *fb = &render->fb.layout;
++   const struct pan_fb_load *load =
++      render->fb.needs_load ? &render->fb.load : &render->fb.spill.load;
++   const struct pan_fb_store *store =
++      render->fb.needs_store ? &render->fb.store : &render->fb.spill.store;
++
++   fprintf(f, " fb %ux%u area %u,%u-%u,%u s%u layers %u tile %u %s%s",
++           fb->width_px, fb->height_px, fb->render_area_px.min_x,
++           fb->render_area_px.min_y, fb->render_area_px.max_x,
++           fb->render_area_px.max_y, fb->sample_count, batch->fb.layer_count,
++           fb->tile_size_px, render->fb.needs_load ? "first" : "SPILLLOAD",
++           render->fb.needs_store ? "" : " SPILLSTORE");
++   for (unsigned rt = 0; rt < fb->rt_count; rt++) {
++      if (fb->rt_formats[rt] == PIPE_FORMAT_NONE)
++         continue;
++      fprintf(f, " rt%u=%s/%s/%c%s/%c", rt,
++              util_format_short_name(fb->rt_formats[rt]),
++              pvtrace_mod(store->rts[rt].iview, load->rts[rt].iview),
++              pvtrace_load_op(&load->rts[rt]),
++              load->rts[rt].always ? "!" : "",
++              store->rts[rt].store ? 'S' : '-');
++   }
++   if (fb->z_format != PIPE_FORMAT_NONE)
++      fprintf(f, " z=%s/%s/%c%s/%c", util_format_short_name(fb->z_format),
++              pvtrace_mod(store->zs.iview, load->z.iview),
++              pvtrace_load_op(&load->z), load->z.always ? "!" : "",
++              store->zs.store ? 'S' : '-');
++   if (fb->s_format != PIPE_FORMAT_NONE)
++      fprintf(f, " s=%s/%s/%c%s/%c", util_format_short_name(fb->s_format),
++              pvtrace_mod(store->s.iview, load->s.iview),
++              pvtrace_load_op(&load->s), load->s.always ? "!" : "",
++              store->s.store ? 'S' : '-');
++   fprintf(f, "\n");
++}
++
+ void
+ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
+ {
+@@ -125,11 +213,20 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
+    if (batch->tls.cpu)
+       GENX(pan_emit_tls)(&batch->tlsinfo, batch->tls.cpu);
+ 
++   if (!(batch->fb.desc.cpu &&
++         (cmdbuf->cur_batch->vtc_jc.first_tiler ||
++          cmdbuf->state.gfx.render.fb.needs_store)) &&
++       panvk_pvtrace_on())
++      pvtrace_batch(cmdbuf, batch, __builtin_return_address(0), false);
++
+    if (batch->fb.desc.cpu &&
+        (cmdbuf->cur_batch->vtc_jc.first_tiler ||
+         cmdbuf->state.gfx.render.fb.needs_store)) {
+       panvk_per_arch(cmd_select_tile_size)(cmdbuf);
+ 
++      if (panvk_pvtrace_on())
++         pvtrace_batch(cmdbuf, batch, __builtin_return_address(0), true);
++
+       /* At this point, we should know sample count and the tile size should
+        * have been calculated
+        */
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index d9441a2..c89aec4 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -21,12 +21,18 @@
+ #include "panvk_image.h"
+ #include "panvk_instance.h"
+ #include "panvk_physical_device.h"
++#include "panvk_pvtrace.h"
++
++#include <dlfcn.h>
++#include <time.h>
++#include <unistd.h>
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ #include "util/u_atomic.h"
+ #include "util/u_debug.h"
+ #include "util/u_drm.h"
+ 
++#include "vk_enum_to_str.h"
+ #include "vk_format.h"
+ #include "vk_log.h"
+ #include "vk_object.h"
+@@ -658,6 +664,90 @@ panvk_image_get_sparse_size(const struct panvk_image *image)
+    return ALIGN_POT(image_size, page_size);
+ }
+ 
++
++uint64_t
++panvk_pvtrace_ms(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return ts.tv_sec * 1000ull + ts.tv_nsec / 1000000;
++}
++
++static bool
++pvtrace_check(const char *path, uint64_t *next, bool *state)
++{
++   uint64_t now = panvk_pvtrace_ms();
++   if (now >= *next) {
++      *state = access(path, F_OK) == 0;
++      *next = now + 200;
++   }
++   return *state;
++}
++
++bool
++panvk_pvtrace_on(void)
++{
++   static uint64_t next;
++   static bool state;
++   return pvtrace_check("/tmp/pvtrace", &next, &state);
++}
++
++bool
++panvk_pvtrace_img_on(void)
++{
++   static uint64_t next;
++   static bool state;
++   return pvtrace_check("/tmp/pvtrace-img", &next, &state);
++}
++
++FILE *
++panvk_pvtrace_file(void)
++{
++   static FILE *f;
++   if (!f) {
++      f = fopen("/tmp/pvtrace.log", "a");
++      if (f)
++         setvbuf(f, NULL, _IOLBF, 0);
++   }
++   return f ? f : stderr;
++}
++
++uintptr_t
++panvk_pvtrace_offset(const void *addr)
++{
++   Dl_info info;
++   if (dladdr(addr, &info) && info.dli_fbase)
++      return (uintptr_t)addr - (uintptr_t)info.dli_fbase;
++   return (uintptr_t)addr;
++}
++
++static void
++pvtrace_image(const struct panvk_image *image)
++{
++   const char *mod = "?";
++   uint64_t m = image->vk.drm_format_mod;
++   if (drm_is_afbc(m))
++      mod = "AFBC";
++   else if (m == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED)
++      mod = "UINT";
++   else if (m == DRM_FORMAT_MOD_LINEAR)
++      mod = "LIN";
++   else if (m == DRM_FORMAT_MOD_ARM_INTERLEAVED_64K)
++      mod = "I64K";
++
++   fprintf(panvk_pvtrace_file(),
++           "%llu IMG %p %s %ux%ux%u l%u m%u s%u type%d usage 0x%llx sus 0x%llx "
++           "flags 0x%llx tiling %d mod %s 0x%llx\n",
++           (unsigned long long)panvk_pvtrace_ms(), (void *)image,
++           vk_Format_to_str(image->vk.format), image->vk.extent.width,
++           image->vk.extent.height, image->vk.extent.depth,
++           image->vk.array_layers, image->vk.mip_levels, image->vk.samples,
++           image->vk.image_type, (unsigned long long)image->vk.usage,
++           (unsigned long long)image->vk.stencil_usage,
++           (unsigned long long)image->vk.create_flags, image->vk.tiling, mod,
++           (unsigned long long)m);
++}
++
+ VkResult
+ panvk_image_init(struct panvk_image *image,
+                  const VkImageCreateInfo *pCreateInfo)
+@@ -679,6 +769,9 @@ panvk_image_init(struct panvk_image *image,
+     * we apply additional flags here. */
+    panvk_image_post_mod_select_meta_adjustments(image);
+ 
++   if (panvk_pvtrace_img_on())
++      pvtrace_image(image);
++
+    return panvk_image_init_layouts(image, pCreateInfo);
+ }
+ 
+diff --git a/src/panfrost/vulkan/panvk_pvtrace.h b/src/panfrost/vulkan/panvk_pvtrace.h
+new file mode 100644
+index 0000000..69f0c80
+--- /dev/null
++++ b/src/panfrost/vulkan/panvk_pvtrace.h
+@@ -0,0 +1,20 @@
++/*
++ * Temporary render pass trace for profiling (not for upstream).
++ * Active while /tmp/pvtrace exists; lines go to /tmp/pvtrace.log.
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef PANVK_PVTRACE_H
++#define PANVK_PVTRACE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++
++bool panvk_pvtrace_on(void);
++bool panvk_pvtrace_img_on(void);
++FILE *panvk_pvtrace_file(void);
++uint64_t panvk_pvtrace_ms(void);
++/* caller offset inside libvulkan_panfrost.so, for addr2line */
++uintptr_t panvk_pvtrace_offset(const void *addr);
++
++#endif

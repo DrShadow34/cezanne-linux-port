@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+# cezanne-usbd: what the USB-C port does when a computer is plugged in,
+# like a phone's "Use USB for" choice (Redmi K30 Ultra, cezanne port).
+#
+# Owns the configfs gadget (mtu3, high speed) and switches it by mode:
+#   none     cable in, nothing chosen yet: an empty card reader (mass
+#            storage, no medium), only so that a host enumerates us; that
+#            is how a computer is told from a charger (BC1.2 says SDP behind
+#            PD chargers as well, a charger never configures a gadget)
+#   charge   no gadget: charging only
+#   storage  MTP (umtprd on FunctionFS): the caller's home folder, files
+#            owned by them
+#   stream   UVC webcam, MJPEG; cezanne-usb-stream (user session) feeds it
+#            the screen or a camera
+#   network  RNDIS + DHCP on 172.16.42.1 (the former usb-gadget.service)
+# Unplugging (the Type-C partner goes) falls back to none. While storage,
+# stream or network serve a host a logind sleep block inhibitor is held: a
+# suspend drops the USB link (the AOD's own suspend honours it).
+#
+# System bus: org.cezanne.Usb at /org/cezanne/Usb. SetMode is for the
+# active local session (polkit org.cezanne.usb.set-mode); the GNOME Shell
+# extension cezanne-usb@arch-port asks the user and calls it.
+import os
+import pwd
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+import gi
+gi.require_version('GUdev', '1.0')
+from gi.repository import Gio, GLib, GUdev
+try:
+    gi.require_version('GLibUnix', '2.0')
+    from gi.repository import GLibUnix
+    signal_add = GLibUnix.signal_add
+except (ValueError, ImportError):
+    signal_add = GLib.unix_signal_add
+
+BUS_NAME = 'org.cezanne.Usb'
+OBJ_PATH = '/org/cezanne/Usb'
+ACTION = 'org.cezanne.usb.set-mode'
+
+CONFIGFS = '/sys/kernel/config/usb_gadget'
+GADGET = f'{CONFIGFS}/cezanne'
+OLD_GADGETS = ['g1']		# usb-gadget.service (RNDIS) before this daemon
+PARTNER = '/sys/class/typec/port0-partner'
+RUN = '/run/cezanne-usb'
+FFS = f'{RUN}/ffs-mtp'
+UMTPRD_CONF = f'{RUN}/umtprd.conf'
+NET_ADDR = '172.16.42.1/24'
+# a host left undecided (no extension asking, or nobody answering) goes to
+# charge only: in none, every s2idle doze of a locked phone re-enumerates
+# the probe on the computer
+UNDECIDED_S = 120
+
+# Linux Foundation "Multifunction Composite Gadget"; bcdDevice differs per
+# mode so that hosts (Windows caches drivers by VID:PID:bcdDevice) never
+# mix them up
+VID, PID = 0x1d6b, 0x0104
+BCD = {'none': 0x0100, 'storage': 0x0200, 'stream': 0x0300, 'network': 0x0400}
+MODES = ('none', 'charge', 'storage', 'stream', 'network')
+
+# Stream sources: id, label, libcamera camera id ('' = the screen)
+SOURCES = [
+    ('screen', 'Phone screen', ''),
+    ('main', 'Main camera', '/base/soc/i2c@11d01000/camera-sensor@1a'),
+    ('ultrawide', 'Ultrawide camera', '/base/soc/i2c@11d02000/camera-sensor@20'),
+    ('macro', 'Macro camera', '/base/soc/i2c@11d04000/camera-sensor@2d'),
+    ('front', 'Front camera', '/base/soc/i2c@11d02000/camera-sensor@56'),
+]
+# UVC frame sizes per function: the screen is portrait, the sensors
+# landscape. MJPEG (CPU jpegenc does ~33 fps at 1080x2400 / 1920x1080), and
+# one small YUYV frame, what a client that does not ask for MJPEG gets
+# (OBS's default showed nothing): w * h * 2 bytes a frame within the 8 MB/s.
+UVC_FRAMES = {
+    'uvc.screen': [(1080, 2400), (720, 1600)],
+    'uvc.camera': [(1920, 1080), (1280, 720)],
+}
+UVC_YUYV = {
+    'uvc.screen': ((360, 800), 1000000),	# 10 fps, 5.8 MB/s
+    'uvc.camera': ((640, 360), 666666),		# 15 fps, 6.9 MB/s
+}
+UVC_INTERVALS = [333333, 666666]	# 30 and 15 fps, in 100 ns
+
+IFACE_XML = '''
+<node>
+  <interface name="org.cezanne.Usb">
+    <method name="SetMode">
+      <arg name="mode" type="s" direction="in"/>
+      <arg name="source" type="s" direction="in"/>
+    </method>
+    <property name="Plugged" type="b" access="read"/>
+    <property name="Host" type="b" access="read"/>
+    <property name="Mode" type="s" access="read"/>
+    <property name="Source" type="s" access="read"/>
+    <property name="Sources" type="a(sss)" access="read"/>
+    <property name="VideoDevice" type="s" access="read"/>
+    <property name="Error" type="s" access="read"/>
+  </interface>
+</node>
+'''
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def write(path, value):
+    with open(path, 'w') as f:
+        f.write(str(value))
+
+
+def read(path, default=''):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def udc_name():
+    names = sorted(os.listdir('/sys/class/udc'))
+    return names[0] if names else None
+
+
+def remove_gadget(path):
+    """Unbind and remove a configfs gadget: symlinks first, then the
+    directories deepest first (default groups refuse rmdir and go with
+    their parent)."""
+    if not os.path.isdir(path):
+        return
+    try:
+        write(f'{path}/UDC', '')
+    except OSError:
+        pass
+    for root, dirs, files in os.walk(path, topdown=False):
+        for name in dirs + files:
+            p = os.path.join(root, name)
+            if os.path.islink(p):
+                os.unlink(p)
+    for root, dirs, _files in os.walk(path, topdown=False):
+        for name in dirs:
+            try:
+                os.rmdir(os.path.join(root, name))
+            except OSError:
+                pass
+    try:
+        os.rmdir(path)
+    except OSError as e:
+        log(f'cannot remove {path}: {e}')
+
+
+class Gadget:
+    """The configfs gadget with every function created once; a mode is the
+    set of functions linked into configs/c.1 while bound."""
+
+    def __init__(self):
+        self.udc = udc_name()
+        for old in OLD_GADGETS:
+            remove_gadget(f'{CONFIGFS}/{old}')
+        # a previous run's gadget: its functions may be outdated
+        remove_gadget(GADGET)
+        g = GADGET
+        os.makedirs(f'{g}/strings/0x409')
+        write(f'{g}/idVendor', hex(VID))
+        write(f'{g}/idProduct', hex(PID))
+        write(f'{g}/bcdUSB', '0x0200')
+        write(f'{g}/strings/0x409/manufacturer', 'Arch Linux ARM')
+        write(f'{g}/strings/0x409/product', 'Redmi K30 Ultra')
+        write(f'{g}/strings/0x409/serialnumber', read('/etc/machine-id')[:16] or 'cezanne')
+        os.makedirs(f'{g}/configs/c.1/strings/0x409')
+        write(f'{g}/configs/c.1/MaxPower', 500)
+        self._probe()
+        self._mtp()
+        # usb_f_uvc (CONFIG_USB_CONFIGFS_F_UVC, linux-cezanne >= 7.3.1-2)
+        try:
+            for name, frames in UVC_FRAMES.items():
+                self._uvc(name, frames, *UVC_YUYV[name])
+            self.uvc = True
+        except OSError as e:
+            log(f'no UVC gadget function: {e}')
+            self.uvc = False
+        os.makedirs(f'{g}/functions/rndis.usb0')
+
+    def _probe(self):
+        f = f'{GADGET}/functions/mass_storage.probe'
+        os.makedirs(f)
+        write(f'{f}/stall', 1)
+        write(f'{f}/lun.0/removable', 1)
+        write(f'{f}/lun.0/ro', 1)
+        write(f'{f}/lun.0/inquiry_string', 'Linux   Redmi K30 Ultra 1.00')
+
+    def _mtp(self):
+        os.makedirs(f'{GADGET}/functions/ffs.mtp')
+        os.makedirs(FFS, exist_ok=True)
+        if not os.path.ismount(FFS):
+            subprocess.run(['mount', '-t', 'functionfs', 'mtp', FFS], check=True)
+
+    def _uvc(self, name, frames, yuyv, yuyv_interval):
+        f = f'{GADGET}/functions/{name}'
+        os.makedirs(f)
+        # one 1024 byte packet per microframe (8 MB/s): with 2 or 3 the mtu3
+        # still sent one per microframe and the host read the rest as
+        # payload headers (NOTES "USB modes")
+        write(f'{f}/streaming_maxpacket', 1024)
+        write(f'{f}/streaming_interval', 1)
+        write(f'{f}/function_name', 'Redmi K30 Ultra')
+        for w, h in frames:
+            d = f'{f}/streaming/mjpeg/m/{w}x{h}'
+            os.makedirs(d)
+            write(f'{d}/wWidth', w)
+            write(f'{d}/wHeight', h)
+            write(f'{d}/dwMaxVideoFrameBufferSize', w * h * 2)
+            write(f'{d}/dwDefaultFrameInterval', UVC_INTERVALS[0])
+            write(f'{d}/dwFrameInterval', '\n'.join(map(str, UVC_INTERVALS)))
+            write(f'{d}/dwMinBitRate', w * h * 8)
+            write(f'{d}/dwMaxBitRate', w * h * 16 * 30)
+        w, h = yuyv
+        d = f'{f}/streaming/uncompressed/u/{w}x{h}'
+        os.makedirs(d)				# guidFormat defaults to YUY2
+        write(f'{d}/wWidth', w)
+        write(f'{d}/wHeight', h)
+        write(f'{d}/dwMaxVideoFrameBufferSize', w * h * 2)
+        write(f'{d}/dwDefaultFrameInterval', yuyv_interval)
+        write(f'{d}/dwFrameInterval', yuyv_interval)
+        write(f'{d}/dwMinBitRate', w * h * 16 * 10000000 // yuyv_interval)
+        write(f'{d}/dwMaxBitRate', w * h * 16 * 10000000 // yuyv_interval)
+        os.makedirs(f'{f}/streaming/header/h')
+        # MJPEG first: format 1, the default
+        os.symlink(f'{f}/streaming/mjpeg/m', f'{f}/streaming/header/h/m')
+        os.symlink(f'{f}/streaming/uncompressed/u', f'{f}/streaming/header/h/u')
+        # no camera terminal / processing unit controls: cezanne-usb-stream
+        # implements none (hosts query what is announced)
+        for attr in ('terminal/camera/default/bmControls', 'processing/default/bmControls'):
+            try:
+                write(f'{f}/control/{attr}', 0)
+            except OSError as e:
+                log(f'{name} {attr}: {e}')
+        for speed in ('fs', 'hs', 'ss'):
+            os.symlink(f'{f}/streaming/header/h', f'{f}/streaming/class/{speed}/h')
+        os.makedirs(f'{f}/control/header/h')
+        for speed in ('fs', 'ss'):
+            os.symlink(f'{f}/control/header/h', f'{f}/control/class/{speed}/h')
+
+    def unbind(self):
+        if read(f'{GADGET}/UDC'):
+            write(f'{GADGET}/UDC', '')
+        c = f'{GADGET}/configs/c.1'
+        for name in os.listdir(c):
+            if os.path.islink(f'{c}/{name}'):
+                os.unlink(f'{c}/{name}')
+
+    def bind(self, mode, function, label):
+        c = f'{GADGET}/configs/c.1'
+        write(f'{GADGET}/bcdDevice', hex(BCD[mode]))
+        write(f'{c}/strings/0x409/configuration', label)
+        os.symlink(f'{GADGET}/functions/{function}', f'{c}/{function}')
+        write(f'{GADGET}/UDC', self.udc)
+
+    def remove(self):
+        remove_gadget(GADGET)
+        if os.path.ismount(FFS):
+            subprocess.run(['umount', FFS])
+
+
+class Daemon:
+    def __init__(self, loop):
+        self.loop = loop
+        self.gadget = Gadget()
+        self.plugged = os.path.exists(PARTNER)
+        self.host = False
+        self.mode = None
+        self.source = ''
+        self.video = ''
+        self.error = ''
+        self.user = None		# pwd entry of the caller of SetMode
+        self.children = []
+        self.inhibit_fd = None
+        self.undecided_id = 0
+        self.conn = None
+        self.reg_id = 0
+
+        self.udev = GUdev.Client(subsystems=['typec'])
+        self.udev.connect('uevent', self._on_uevent)
+        self._watch_udc()
+        self._apply('none', '')
+
+    # ---- cable and host ----
+
+    def _on_uevent(self, _client, action, dev):
+        if dev.get_devtype() != 'typec_partner' or action not in ('add', 'remove'):
+            return
+        plugged = action == 'add'
+        if plugged == self.plugged:
+            return
+        log(f'cable {"in" if plugged else "out"}')
+        self.plugged = plugged
+        changed = {'Plugged': GLib.Variant('b', plugged)}
+        if not plugged:
+            self.host = False
+            changed['Host'] = GLib.Variant('b', False)
+            if self.mode != 'none':
+                self._apply('none', '')
+        self._emit(changed)
+        self._sync_inhibitor()
+
+    def _watch_udc(self):
+        # the UDC's state attribute is sysfs_notify()ed on every change
+        self.state_fd = os.open(f'/sys/class/udc/{self.gadget.udc}/state', os.O_RDONLY)
+        self._on_udc_state()
+        GLib.io_add_watch(self.state_fd, GLib.PRIORITY_DEFAULT,
+                          GLib.IOCondition.PRI | GLib.IOCondition.ERR,
+                          lambda *_: self._on_udc_state() or True)
+
+    def _on_udc_state(self):
+        os.lseek(self.state_fd, 0, os.SEEK_SET)
+        state = os.read(self.state_fd, 64).decode().strip()
+        # without a Type-C event (a cable plugged before boot)
+        if state == 'configured' and not self.plugged:
+            self.plugged = os.path.exists(PARTNER)
+            self._emit({'Plugged': GLib.Variant('b', self.plugged)})
+        if state == 'configured' and not self.host:
+            log('host configured the gadget')
+            self.host = True
+            self._emit({'Host': GLib.Variant('b', True)})
+            self._sync_inhibitor()
+            self._sync_undecided()
+
+    def _sync_undecided(self):
+        want = self.host and self.mode == 'none'
+        if want and not self.undecided_id:
+            self.undecided_id = GLib.timeout_add_seconds(UNDECIDED_S, self._on_undecided)
+        elif not want and self.undecided_id:
+            GLib.source_remove(self.undecided_id)
+            self.undecided_id = 0
+
+    def _on_undecided(self):
+        self.undecided_id = 0
+        log('no choice made: charge only')
+        self._apply('charge', '')
+        return GLib.SOURCE_REMOVE
+
+    # ---- modes ----
+
+    def _stop_children(self):
+        for p in self.children:
+            p.terminate()
+        for p in self.children:
+            try:
+                p.wait(3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        self.children = []
+
+    def _apply(self, mode, source):
+        """Switch the gadget; returns an error string or ''."""
+        log(f'mode {mode} {source}'.rstrip())
+        self.gadget.unbind()
+        self._stop_children()
+        if os.path.exists(UMTPRD_CONF):
+            os.unlink(UMTPRD_CONF)
+        error = ''
+        try:
+            if mode == 'none':
+                self.gadget.bind(mode, 'mass_storage.probe', 'USB')
+            elif mode == 'storage':
+                self._start_mtp()
+                self.gadget.bind(mode, 'ffs.mtp', 'MTP')
+            elif mode == 'stream':
+                if not self.gadget.uvc:
+                    raise RuntimeError('this kernel has no USB webcam function')
+                function = 'uvc.screen' if source == 'screen' else 'uvc.camera'
+                self.gadget.bind(mode, function, 'Webcam')
+            elif mode == 'network':
+                self.gadget.bind(mode, 'rndis.usb0', 'RNDIS')
+                self._start_network()
+        except (OSError, subprocess.SubprocessError, RuntimeError) as e:
+            error = f'{mode}: {e}'
+            log(error)
+            self.gadget.unbind()
+            self._stop_children()
+            mode, source = 'charge', ''
+        self.mode, self.source = mode, source if mode == 'stream' else ''
+        self.video = self._find_video() if mode == 'stream' else ''
+        self.error = error
+        self._emit({
+            'Mode': GLib.Variant('s', self.mode),
+            'Source': GLib.Variant('s', self.source),
+            'VideoDevice': GLib.Variant('s', self.video),
+            'Error': GLib.Variant('s', self.error),
+        })
+        self._sync_inhibitor()
+        self._sync_undecided()
+        return error
+
+    def _start_mtp(self):
+        if not shutil.which('umtprd'):
+            raise RuntimeError('data storage needs the umtp-responder package')
+        user = self.user or pwd.getpwnam('arch')
+        with open(UMTPRD_CONF, 'w') as f:
+            f.write(f'''loop_on_disconnect 1
+storage "{user.pw_dir}" "Home" "rw,uid={user.pw_uid},gid={user.pw_gid}"
+manufacturer "Arch Linux ARM"
+product "Redmi K30 Ultra"
+serial "{read('/etc/machine-id')[:16] or 'cezanne'}"
+firmware_version "1.0"
+interface "MTP"
+usb_vendor_id {hex(VID)}
+usb_product_id {hex(PID)}
+usb_class 0x6
+usb_subclass 0x1
+usb_protocol 0x1
+usb_dev_version {hex(BCD['storage'])}
+usb_functionfs_mode 0x1
+usb_dev_path "{FFS}/ep0"
+usb_epin_path "{FFS}/ep1"
+usb_epout_path "{FFS}/ep2"
+usb_epint_path "{FFS}/ep3"
+usb_max_packet_size 0x200
+''')
+        self.children.append(subprocess.Popen(['umtprd', '-conf', UMTPRD_CONF]))
+        # FunctionFS creates the endpoint files once umtprd wrote its
+        # descriptors; binding before that fails
+        deadline = time.monotonic() + 5
+        while not os.path.exists(f'{FFS}/ep1'):
+            if self.children[-1].poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError('umtprd did not start')
+            time.sleep(0.05)
+
+    def _start_network(self):
+        iface = read(f'{GADGET}/functions/rndis.usb0/ifname')
+        if not iface or not os.path.exists(f'/sys/class/net/{iface}'):
+            raise RuntimeError('no RNDIS interface')
+        subprocess.run(['ip', 'addr', 'replace', NET_ADDR, 'dev', iface], check=True)
+        subprocess.run(['ip', 'link', 'set', iface, 'up'], check=True)
+        self.children.append(subprocess.Popen([
+            'dnsmasq', '--no-daemon', '--port=0', f'--interface={iface}',
+            '--bind-interfaces', '--dhcp-range=172.16.42.2,172.16.42.10,1h',
+            '--dhcp-option=3', '--dhcp-option=6', '--dhcp-leasefile=/run/cezanne-usb/dnsmasq.leases']))
+
+    def _find_video(self):
+        want = 'uvc.screen' if self.source == 'screen' else 'uvc.camera'
+        for _ in range(40):
+            for n in sorted(os.listdir('/sys/class/video4linux')):
+                if read(f'/sys/class/video4linux/{n}/function_name') == want:
+                    return f'/dev/{n}'
+            time.sleep(0.05)
+        return ''
+
+    def _sync_inhibitor(self):
+        want = self.plugged and self.host and self.mode in ('storage', 'stream', 'network')
+        if want and self.inhibit_fd is None:
+            try:
+                ret, fds = Gio.bus_get_sync(Gio.BusType.SYSTEM).call_with_unix_fd_list_sync(
+                    'org.freedesktop.login1', '/org/freedesktop/login1',
+                    'org.freedesktop.login1.Manager', 'Inhibit',
+                    GLib.Variant('(ssss)', ('sleep', 'cezanne-usb',
+                                            f'USB {self.mode} in use', 'block')),
+                    GLib.VariantType('(h)'), Gio.DBusCallFlags.NONE, -1, None, None)
+                self.inhibit_fd = fds.get(ret.unpack()[0])
+            except GLib.Error as e:
+                log(f'inhibit: {e.message}')
+        elif not want and self.inhibit_fd is not None:
+            os.close(self.inhibit_fd)
+            self.inhibit_fd = None
+
+    # ---- D-Bus ----
+
+    def on_bus(self, conn, _name):
+        self.conn = conn
+        info = Gio.DBusNodeInfo.new_for_xml(IFACE_XML).interfaces[0]
+        self.reg_id = conn.register_object(OBJ_PATH, info, self._on_call, self._on_get, None)
+
+    def _props(self):
+        return {
+            'Plugged': GLib.Variant('b', self.plugged),
+            'Host': GLib.Variant('b', self.host),
+            'Mode': GLib.Variant('s', self.mode or 'none'),
+            'Source': GLib.Variant('s', self.source),
+            'Sources': GLib.Variant('a(sss)', SOURCES),
+            'VideoDevice': GLib.Variant('s', self.video),
+            'Error': GLib.Variant('s', self.error),
+        }
+
+    def _on_get(self, _conn, _sender, _path, _iface, name):
+        return self._props().get(name)
+
+    def _emit(self, changed):
+        if not self.conn:
+            return
+        self.conn.emit_signal(None, OBJ_PATH, 'org.freedesktop.DBus.Properties',
+                              'PropertiesChanged',
+                              GLib.Variant('(sa{sv}as)', ('org.cezanne.Usb', changed, [])))
+
+    def _on_call(self, conn, sender, _path, _iface, method, params, invocation):
+        if method != 'SetMode':
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.UnknownMethod', method)
+            return
+        mode, source = params.unpack()
+        if mode not in MODES or (mode == 'stream' and source not in [s[0] for s in SOURCES]):
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.InvalidArgs',
+                                         f'unknown mode {mode} {source}')
+            return
+        subject = ('system-bus-name', {'name': GLib.Variant('s', sender)})
+        conn.call('org.freedesktop.PolicyKit1', '/org/freedesktop/PolicyKit1/Authority',
+                  'org.freedesktop.PolicyKit1.Authority', 'CheckAuthorization',
+                  GLib.Variant('((sa{sv})sa{ss}us)', (subject, ACTION, {}, 0, '')),
+                  GLib.VariantType('((bba{ss}))'), Gio.DBusCallFlags.NONE, -1, None,
+                  self._on_authorized, (sender, mode, source, invocation))
+
+    def _on_authorized(self, conn, result, data):
+        sender, mode, source, invocation = data
+        try:
+            authorized = conn.call_finish(result).unpack()[0][0]
+        except GLib.Error as e:
+            invocation.return_gerror(e)
+            return
+        if not authorized:
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
+                                         'not allowed to change the USB mode')
+            return
+        uid = conn.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                             'org.freedesktop.DBus', 'GetConnectionUnixUser',
+                             GLib.Variant('(s)', (sender,)), GLib.VariantType('(u)'),
+                             Gio.DBusCallFlags.NONE, -1, None).unpack()[0]
+        self.user = pwd.getpwuid(uid)
+        if mode == 'none' or not self.plugged:
+            mode, source = 'none', ''	# nothing to serve without a cable
+        error = self._apply(mode, source)
+        if error:
+            invocation.return_dbus_error('org.cezanne.Usb.Error.Failed', error)
+        else:
+            invocation.return_value(None)
+
+    def shutdown(self):
+        self._stop_children()
+        self.gadget.remove()
+        if self.inhibit_fd is not None:
+            os.close(self.inhibit_fd)
+        self.loop.quit()
+
+
+def main():
+    os.makedirs(RUN, exist_ok=True)
+    loop = GLib.MainLoop()
+    daemon = Daemon(loop)
+    Gio.bus_own_name(Gio.BusType.SYSTEM, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                     daemon.on_bus, None, lambda *_: daemon.shutdown())
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: daemon.shutdown() or False)
+    loop.run()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

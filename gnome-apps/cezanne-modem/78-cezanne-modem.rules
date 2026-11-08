@@ -1,0 +1,8 @@
+# The modem's AT port (cezanne-ccci WWAN port): primary AT port for
+# ModemManager, which may take it only after cezanne-modemd has powered the
+# SIM (it creates /run/cezanne-modem/at-ready and sends a change event).
+# The packet data links (DPMAIF, wwan0 = the modem's first interface) exist
+# from boot and wait for the same flag, so the modem shows up whole.
+SUBSYSTEM=="wwan", KERNEL=="wwan0at0", DRIVERS=="cezanne-ccci", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
+SUBSYSTEM=="wwan", KERNEL=="wwan0at0", DRIVERS=="cezanne-ccci", TEST!="/run/cezanne-modem/at-ready", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="net", DRIVERS=="cezanne-ccci", TEST!="/run/cezanne-modem/at-ready", ENV{ID_MM_DEVICE_IGNORE}="1"

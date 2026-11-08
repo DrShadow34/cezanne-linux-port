@@ -1,0 +1,2 @@
+# built against the gst-plugins-bad ALARM ships (cezanne-build type "track")
+PROBE=gst-plugins-bad-libs

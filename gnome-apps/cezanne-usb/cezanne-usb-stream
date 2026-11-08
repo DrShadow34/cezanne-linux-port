@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+# cezanne-usb-stream: the user-session side of cezanne-usbd's "stream" mode,
+# so OBS (or any UVC client) on the computer sees the phone as a webcam:
+#   screen   mutter's ScreenCast API (RecordMonitor, the panel shows the
+#            screen sharing indicator) -> pipewiresrc, as GNOME's recorder
+#   cameras  libcamerasrc by libcamera camera id, cropped to 16:9
+# then videoconvertscale + videorate to the frame size / rate the host
+# committed and jpegenc (MJPEG) or nothing (YUYV) into an appsink.
+#
+# The UVC device side is done here, as the kernel's uvc-gadget sample does,
+# not with GStreamer's uvcsink: uvcsink answers the host's controls and
+# STREAMON / STREAMOFF from its pipeline's streaming thread, and that thread
+# blocks in v4l2sink whenever the host stops reading, so control requests
+# timed out, a second stream never started (OBS reopens the device for every
+# setting) and a static screen (pipewiresrc only pushes on damage) delayed
+# everything (NOTES "USB modes"). Here the video node is opened at start
+# (f_uvc connects the gadget to the host while it is open), its events
+# (SETUP / DATA for probe + commit, STREAMON / STREAMOFF) are handled on the
+# main loop, and frames go into the node's mmap'd OUTPUT buffers without
+# ever blocking: a frame with no free buffer is dropped.
+#
+# The pipeline runs only while the host streams, and LINGER_S after (OBS
+# opens and closes the device several times when it is set up): the
+# camera (the front one pops up) is not on for an idle webcam. The link
+# carries one 1024 byte packet per microframe (the mtu3 cannot do more), so
+# jpegenc's quality follows the frame sizes to fit a frame interval.
+#
+# The shell inhibits screencasts on the lock screen and closes running ones
+# (main.js, sessionMode.allowScreencast): the screen stream holds an idle
+# inhibitor so the phone does not lock by itself, and when it is locked
+# anyway (power key) the frames stop until org.gnome.ScreenSaver says it is
+# unlocked again. Stopping the share from the panel indicator ends stream
+# mode (charge only).
+#
+# Runs as cezanne-usb-stream.service (user), started by the cezanne-usb
+# extension; exits when the mode ends.
+import errno
+import fcntl
+import glob
+import mmap
+import os
+import signal
+import struct
+import sys
+import threading
+
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gio, GLib, Gst
+try:
+    gi.require_version('GLibUnix', '2.0')
+    from gi.repository import GLibUnix
+    signal_add = GLibUnix.signal_add
+    fd_add = GLibUnix.fd_add_full
+except (ValueError, ImportError):
+    signal_add = GLib.unix_signal_add
+    fd_add = GLib.unix_fd_add_full
+
+USB = ('org.cezanne.Usb', '/org/cezanne/Usb', 'org.cezanne.Usb')
+SCREENCAST = 'org.gnome.Mutter.ScreenCast'
+SCREENSAVER = ('org.gnome.ScreenSaver', '/org/gnome/ScreenSaver', 'org.gnome.ScreenSaver')
+SESSION_MANAGER = ('org.gnome.SessionManager', '/org/gnome/SessionManager',
+                   'org.gnome.SessionManager')
+INHIBIT_IDLE = 8
+LINGER_S = 5
+NBUFFERS = 3
+JPEG_QUALITY = (30, 85)		# min, max
+PAYLOAD = 1024			# cezanne-usbd's streaming_maxpacket
+MICROFRAME = 1250		# 125 us in the UVC's 100 ns units
+
+# linux/videodev2.h, linux/usb/g_uvc.h (sizes as on LP64)
+VIDIOC_S_FMT = 0xc0d05605
+VIDIOC_REQBUFS = 0xc0145608
+VIDIOC_QUERYBUF = 0xc0585609
+VIDIOC_QBUF = 0xc058560f
+VIDIOC_DQBUF = 0xc0585611
+VIDIOC_STREAMON = 0x40045612
+VIDIOC_STREAMOFF = 0x40045613
+VIDIOC_S_PARM = 0xc0cc5616
+VIDIOC_DQEVENT = 0x80885659
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565a
+UVCIOC_SEND_RESPONSE = 0x40405501
+BUF_TYPE_OUTPUT = 2
+MEMORY_MMAP = 1
+FIELD_NONE = 1
+UVC_EVENT_FIRST = 0x08000000
+(EV_CONNECT, EV_DISCONNECT, EV_STREAMON, EV_STREAMOFF, EV_SETUP,
+ EV_DATA) = range(UVC_EVENT_FIRST, UVC_EVENT_FIRST + 6)
+STALL = -errno.EL2HLT		# a negative response length stalls ep0
+
+# UVC 1.1 class requests and controls
+SET_CUR, GET_CUR, GET_MIN, GET_MAX, GET_RES, GET_LEN, GET_INFO, GET_DEF = (
+    0x01, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87)
+VS_PROBE, VS_COMMIT = 1, 2
+VC_REQUEST_ERROR_CODE = 2
+STREAMING_CONTROL = struct.Struct('<HBBIHHHHHIIIBBBB')	# 34 bytes
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def call(bus, dest, method, args=None, reply=None):
+    return bus.call_sync(*dest, method, args,
+                         GLib.VariantType(reply) if reply else None,
+                         Gio.DBusCallFlags.NONE, -1, None)
+
+
+def fourcc(s):
+    return struct.unpack('<I', s.encode())[0]
+
+
+class Frame:
+    def __init__(self, path, kind):
+        self.index = int(read(f'{path}/bFrameIndex'))
+        self.width = int(read(f'{path}/wWidth'))
+        self.height = int(read(f'{path}/wHeight'))
+        self.intervals = [int(i) for i in read(f'{path}/dwFrameInterval').split()]
+        self.default_interval = int(read(f'{path}/dwDefaultFrameInterval') or self.intervals[0])
+        self.max_size = (self.width * self.height * 2 if kind == 'yuyv'
+                         else int(read(f'{path}/dwMaxVideoFrameBufferSize')))
+
+
+class Format:
+    def __init__(self, path, kind):
+        self.kind = kind			# 'mjpeg' or 'yuyv'
+        self.index = int(read(f'{path}/bFormatIndex'))
+        self.default_frame = int(read(f'{path}/bDefaultFrameIndex') or 1)
+        frames = [Frame(d, kind) for d in glob.glob(f'{path}/*/') if os.path.exists(f'{d}wWidth')]
+        self.frames = {f.index: f for f in frames}
+
+
+def formats(device):
+    """The UVC function's formats from configfs, by bFormatIndex."""
+    function = read(f'/sys/class/video4linux/{os.path.basename(device)}/function_name')
+    base = glob.glob(f'/sys/kernel/config/usb_gadget/*/functions/{function}')[0]
+    found = [Format(p, 'mjpeg') for p in glob.glob(f'{base}/streaming/mjpeg/*')]
+    found += [Format(p, 'yuyv') for p in glob.glob(f'{base}/streaming/uncompressed/*')]
+    interfaces = (int(read(f'{base}/control/bInterfaceNumber') or 0),
+                  int(read(f'{base}/streaming/bInterfaceNumber') or 1))
+    return {f.index: f for f in found if f.index and f.frames}, interfaces
+
+
+class Gadget:
+    """The f_uvc video node: host controls, stream on / off, frame buffers."""
+
+    def __init__(self, device, on_stream, on_lost):
+        self.formats, (self.vc_intf, self.vs_intf) = formats(device)
+        self.on_stream = on_stream	# (format, frame, interval) or None
+        self.on_lost = on_lost		# the node went away (gadget rebuilt)
+        self.watch = 0
+        self.lock = threading.Lock()
+        self.maps = []
+        self.free = []
+        self.streaming = False
+        self.control = 0		# selector of the pending SET_CUR
+        self.error_code = 0
+        first = self.formats[min(self.formats)]
+        self.probe = self.commit = self._clamp(first.index, first.default_frame, 0)
+        self.fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+        for ev in (EV_CONNECT, EV_DISCONNECT, EV_STREAMON, EV_STREAMOFF, EV_SETUP, EV_DATA):
+            fcntl.ioctl(self.fd, VIDIOC_SUBSCRIBE_EVENT, struct.pack('<8I', ev, 0, 0, 0, 0, 0, 0, 0))
+        self.watch = fd_add(GLib.PRIORITY_DEFAULT, self.fd,
+                            GLib.IOCondition.PRI | GLib.IOCondition.ERR | GLib.IOCondition.HUP,
+                            self._on_event)
+
+    def close(self):
+        if self.watch:
+            GLib.source_remove(self.watch)
+            self.watch = 0
+        try:
+            self._stream_off()
+        except OSError:
+            pass
+        os.close(self.fd)
+
+    # ---- controls ----
+
+    def _clamp(self, format_index, frame_index, interval):
+        fmt = self.formats.get(format_index) or self.formats[min(self.formats)]
+        frame = fmt.frames.get(frame_index) or fmt.frames[fmt.default_frame]
+        if interval not in frame.intervals:
+            interval = (min(frame.intervals, key=lambda i: abs(i - interval)) if interval
+                        else frame.default_interval)
+        return fmt, frame, interval
+
+    def _control(self, fmt, frame, interval):
+        return STREAMING_CONTROL.pack(1, fmt.index, frame.index, interval, 0, 0, 0, 0, 0,
+                                      frame.max_size, PAYLOAD, 48000000, 3, 1, 1, 1)
+
+    def _streaming_request(self, request, selector):
+        if selector not in (VS_PROBE, VS_COMMIT):
+            return None
+        if request == SET_CUR:
+            self.control = selector
+            return STREAMING_CONTROL.size	# the data comes as EV_DATA
+        if request == GET_CUR:
+            return self._control(*(self.probe if selector == VS_PROBE else self.commit))
+        if request in (GET_MIN, GET_DEF):
+            first = self.formats[min(self.formats)]
+            return self._control(*self._clamp(first.index, first.default_frame, 0))
+        if request == GET_MAX:
+            last = self.formats[max(self.formats)]
+            frame = last.frames[max(last.frames)]
+            return self._control(last, frame, max(frame.intervals))
+        if request == GET_RES:
+            return bytes(STREAMING_CONTROL.size)
+        if request == GET_LEN:
+            return struct.pack('<H', STREAMING_CONTROL.size)
+        if request == GET_INFO:
+            return b'\x03'			# GET and SET supported
+        return None
+
+    def _setup(self, req):
+        request_type, request, value, index, length = struct.unpack('<BBHHH', req)
+        reply = None
+        if request_type & 0x60 == 0x20:		# class
+            selector, intf = value >> 8, index & 0xff
+            if intf == self.vs_intf:
+                reply = self._streaming_request(request, selector)
+            elif intf == self.vc_intf and index >> 8 == 0 and selector == VC_REQUEST_ERROR_CODE:
+                reply = (bytes([self.error_code]) if request == GET_CUR
+                         else b'\x01' if request == GET_INFO else None)
+        # no camera / processing unit controls (cezanne-usbd zeroes them)
+        self.error_code = 0 if reply is not None else 0x06	# invalid control
+        if isinstance(reply, int):
+            resp = struct.pack('<i60x', reply)
+        elif reply is None:
+            resp = struct.pack('<i60x', STALL)
+        else:
+            reply = reply[:length]
+            resp = struct.pack('<i', len(reply)) + reply.ljust(60, b'\0')
+        fcntl.ioctl(self.fd, UVCIOC_SEND_RESPONSE, resp)
+
+    def _data(self, data):
+        length, = struct.unpack_from('<i', data)
+        if self.control not in (VS_PROBE, VS_COMMIT) or length < 9:
+            return
+        payload = data[4:4 + length].ljust(STREAMING_CONTROL.size, b'\0')
+        _, format_index, frame_index, interval = struct.unpack_from('<HBBI', payload)
+        chosen = self._clamp(format_index, frame_index, interval)
+        if self.control == VS_PROBE:
+            self.probe = chosen
+        else:
+            self.commit = chosen
+            fmt, frame, interval = chosen
+            log(f'host committed {fmt.kind} {frame.width}x{frame.height} at '
+                f'{10000000 / interval:.0f} fps')
+
+    def _on_event(self, _fd, _cond):
+        while True:
+            ev = bytearray(136)
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_DQEVENT, ev)
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.ENOENT):
+                    return GLib.SOURCE_CONTINUE
+                log(f'video node: {e}')
+                self.watch = 0
+                self.on_lost()
+                return GLib.SOURCE_REMOVE
+            kind, = struct.unpack_from('<I', ev)
+            u = bytes(ev[8:72])
+            try:
+                if kind == EV_SETUP:
+                    self._setup(u[:8])
+                elif kind == EV_DATA:
+                    self._data(u)
+                elif kind == EV_STREAMON:
+                    self._stream_on()
+                elif kind in (EV_STREAMOFF, EV_DISCONNECT):
+                    self._stream_off()
+            except OSError as e:	# an escaping one would remove the watch
+                log(f'event {kind - UVC_EVENT_FIRST}: {e}')
+                if kind == EV_STREAMON:
+                    self._stream_off()
+
+    # ---- streaming ----
+
+    def _stream_on(self):
+        if self.maps:
+            self._stream_off()		# no STREAMOFF in between
+        fmt, frame, interval = self.commit
+        pix = fourcc('MJPG' if fmt.kind == 'mjpeg' else 'YUYV')
+        bpl = frame.width * 2 if fmt.kind == 'yuyv' else 0
+        size = frame.width * frame.height * 2 if fmt.kind == 'yuyv' else 0
+        f = bytearray(208)
+        struct.pack_into('<I4x8I', f, 0, BUF_TYPE_OUTPUT, frame.width, frame.height, pix,
+                         FIELD_NONE, bpl, size, 0, 0)
+        parm = bytearray(204)
+        struct.pack_into('<I8xII', parm, 0, BUF_TYPE_OUTPUT, interval, 10000000)
+        with self.lock:
+            fcntl.ioctl(self.fd, VIDIOC_S_FMT, f)
+            fcntl.ioctl(self.fd, VIDIOC_S_PARM, parm)
+            rb = bytearray(struct.pack('<4I4x', NBUFFERS, BUF_TYPE_OUTPUT, MEMORY_MMAP, 0))
+            fcntl.ioctl(self.fd, VIDIOC_REQBUFS, rb)
+            for i in range(struct.unpack_from('<I', rb)[0]):
+                b = bytearray(88)
+                struct.pack_into('<II', b, 0, i, BUF_TYPE_OUTPUT)
+                struct.pack_into('<I', b, 60, MEMORY_MMAP)
+                fcntl.ioctl(self.fd, VIDIOC_QUERYBUF, b)
+                offset, length = struct.unpack_from('<I4xI', b, 64)
+                self.maps.append(mmap.mmap(self.fd, length, mmap.MAP_SHARED,
+                                           mmap.PROT_READ | mmap.PROT_WRITE, offset=offset))
+            self.free = list(range(len(self.maps)))
+            # completes the host's SET_INTERFACE (f_uvc delays its status)
+            fcntl.ioctl(self.fd, VIDIOC_STREAMON, struct.pack('<I', BUF_TYPE_OUTPUT))
+            self.streaming = True
+        log('host started streaming')
+        self.on_stream(self.commit)
+
+    def _stream_off(self):
+        with self.lock:
+            if not self.streaming and not self.maps:
+                return
+            self.streaming = False
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_STREAMOFF, struct.pack('<I', BUF_TYPE_OUTPUT))
+            except OSError as e:
+                log(f'STREAMOFF: {e}')
+            for m in self.maps:
+                m.close()
+            self.maps = []
+            self.free = []
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_REQBUFS,
+                            bytearray(struct.pack('<4I4x', 0, BUF_TYPE_OUTPUT, MEMORY_MMAP, 0)))
+            except OSError as e:
+                log(f'REQBUFS 0: {e}')
+        log('host stopped streaming')
+        self.on_stream(None)
+
+    def _reclaim(self):
+        b = bytearray(88)
+        while True:
+            struct.pack_into('<II', b, 0, 0, BUF_TYPE_OUTPUT)
+            struct.pack_into('<I', b, 60, MEMORY_MMAP)
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_DQBUF, b)
+            except OSError as e:
+                if e.errno == errno.EAGAIN:
+                    return
+                raise
+            self.free.append(struct.unpack_from('<I', b)[0])
+
+    def queue(self, data):
+        """A frame from the pipeline (streaming thread); False if dropped."""
+        with self.lock:
+            if not self.streaming:
+                return False
+            self._reclaim()
+            if not self.free or len(data) > len(self.maps[self.free[0]]):
+                return False
+            i = self.free.pop(0)
+            self.maps[i][:len(data)] = data
+            b = bytearray(88)
+            struct.pack_into('<IIII', b, 0, i, BUF_TYPE_OUTPUT, len(data), 0)
+            struct.pack_into('<I', b, 16, FIELD_NONE)
+            struct.pack_into('<I', b, 60, MEMORY_MMAP)
+            fcntl.ioctl(self.fd, VIDIOC_QBUF, b)
+            return True
+
+
+class Stream:
+    def __init__(self, loop):
+        self.loop = loop
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self.pipeline = None
+        self.pipeline_key = None	# (format kind, width, height, interval)
+        self.linger_id = 0
+        self.want = None		# the host's commit while it streams
+        self.node = None		# screencast PipeWire node
+        self.session = None		# mutter ScreenCast session path
+        self.subs = []
+        self.cookie = 0			# gnome-session idle inhibitor
+        self.quality = JPEG_QUALITY[1]
+        self.stopped = False
+        self.code = 0
+        self.gadget = None
+        self.usb = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None, *USB, None)
+        self.usb.connect('g-properties-changed', lambda *_: self._check())
+        self.usb.connect('notify::g-name-owner', lambda *_: self._check())
+
+    def _prop(self, name, default=None):
+        v = self.usb.get_cached_property(name)
+        return v.unpack() if v is not None else default
+
+    def _check(self):
+        """Quit once cezanne-usbd leaves stream mode (or goes away)."""
+        if self.usb.get_name_owner() is None or self._prop('Mode') != 'stream':
+            log('stream mode ended')
+            self.stop()
+
+    def _notify(self, body):
+        """A desktop notification for errors nobody would see in the journal."""
+        self.bus.call('org.freedesktop.Notifications', '/org/freedesktop/Notifications',
+                      'org.freedesktop.Notifications', 'Notify',
+                      GLib.Variant('(susssasa{sv}i)', ('USB', 0, 'camera-web-symbolic',
+                                                       'USB video stream', body, [], {}, -1)),
+                      None, Gio.DBusCallFlags.NONE, -1, None, None, None)
+
+    def start(self):
+        if self._prop('Mode') != 'stream' or not self._prop('VideoDevice'):
+            log('cezanne-usbd is not in stream mode')
+            return False
+        source = self._prop('Source')
+        self.camera = next((c for s, _l, c in self._prop('Sources', []) if s == source), None)
+        if self.camera is None:
+            log(f'unknown source {source}')
+            return False
+        if not self.camera:
+            self.bus.signal_subscribe(SCREENSAVER[0], SCREENSAVER[2], 'ActiveChanged',
+                                      SCREENSAVER[1], None, Gio.DBusSignalFlags.NONE,
+                                      self._on_screensaver)
+        self.gadget = Gadget(self._prop('VideoDevice'), self._on_stream, self.stop)
+        log(f'webcam of {source} on {self._prop("VideoDevice")}')
+        return True
+
+    def _on_stream(self, commit):
+        """The host started (commit) or stopped (None) streaming."""
+        self.want = commit
+        if self.linger_id:
+            GLib.source_remove(self.linger_id)
+            self.linger_id = 0
+        if commit:
+            self._sync_source()
+        elif self.pipeline or self.session:
+            self.linger_id = GLib.timeout_add_seconds(LINGER_S, self._on_linger)
+
+    def _on_linger(self):
+        self.linger_id = 0
+        self._stop_pipeline()
+        self._end_screencast(stop=True)
+        return GLib.SOURCE_REMOVE
+
+    def _sync_source(self):
+        if self.camera:
+            self._run(f'libcamerasrc camera-name="{self.camera}" ! '
+                      f'video/x-raw,framerate=30/1 ! aspectratiocrop aspect-ratio=16/9')
+        elif self.node is not None:
+            self._run(f'pipewiresrc path={self.node} do-timestamp=true keepalive-time=500 '
+                      f'resend-last=true ! video/x-raw,max-framerate=30/1')
+        elif not self.session:
+            self._screencast()
+
+    # ---- screen ----
+
+    def _locked(self):
+        try:
+            return call(self.bus, SCREENSAVER, 'GetActive', reply='(b)').unpack()[0]
+        except GLib.Error:
+            return False
+
+    def _on_screensaver(self, _conn, _sender, _path, _iface, _signal, params):
+        if not params.unpack()[0] and self.want and not self.session and not self.stopped:
+            log('unlocked: screen stream again')
+            self._screencast()
+
+    def _screencast(self):
+        try:
+            path = call(self.bus, (SCREENCAST, '/org/gnome/Mutter/ScreenCast', SCREENCAST),
+                        'CreateSession', GLib.Variant('(a{sv})', ({},)), '(o)').unpack()[0]
+        except GLib.Error as e:
+            if 'inhibited' not in e.message:
+                raise
+            log('screencasts inhibited (locked): waiting for an unlock')
+            return
+        self.session = path
+        session = (SCREENCAST, path, f'{SCREENCAST}.Session')
+        stream = call(self.bus, session, 'RecordMonitor',
+                      GLib.Variant('(sa{sv})', ('', {'cursor-mode': GLib.Variant('u', 1)})),
+                      '(o)').unpack()[0]
+
+        def added(_conn, _sender, _path, _iface, _signal, params):
+            self.node = params.unpack()[0]
+            log(f'screencast node {self.node}')
+            if self.want:
+                self._sync_source()
+
+        self.subs = [
+            self.bus.signal_subscribe(SCREENCAST, f'{SCREENCAST}.Stream', 'PipeWireStreamAdded',
+                                      stream, None, Gio.DBusSignalFlags.NONE, added),
+            self.bus.signal_subscribe(SCREENCAST, f'{SCREENCAST}.Session', 'Closed', path, None,
+                                      Gio.DBusSignalFlags.NONE, self._on_closed),
+        ]
+        call(self.bus, session, 'Start')
+        self._inhibit_idle(True)
+
+    def _on_closed(self, *_args):
+        """Mutter ended the screencast: locked, or stopped from the panel."""
+        self._stop_pipeline()
+        self._end_screencast()
+        if self.stopped:
+            return
+        if self._locked():
+            log('screen locked: frames again after an unlock')
+        else:
+            log('screen sharing stopped by the user: charge only')
+            self.usb.call('SetMode', GLib.Variant('(ss)', ('charge', '')),
+                          Gio.DBusCallFlags.NONE, -1, None, None, None)
+
+    def _end_screencast(self, stop=False):
+        for sub in self.subs:
+            self.bus.signal_unsubscribe(sub)
+        self.subs = []
+        if stop and self.session:
+            try:
+                call(self.bus, (SCREENCAST, self.session, f'{SCREENCAST}.Session'), 'Stop')
+            except GLib.Error:
+                pass		# closed already
+        self.session = None
+        self.node = None
+        self._inhibit_idle(False)
+
+    def _inhibit_idle(self, on):
+        """No blanking / locking while the screen streams: that would end it."""
+        if on and not self.cookie:
+            self.cookie = call(self.bus, SESSION_MANAGER, 'Inhibit',
+                               GLib.Variant('(susu)', ('org.cezanne.Usb', 0,
+                                                       'Streaming the screen over USB',
+                                                       INHIBIT_IDLE)), '(u)').unpack()[0]
+        elif not on and self.cookie:
+            try:
+                call(self.bus, SESSION_MANAGER, 'Uninhibit', GLib.Variant('(u)', (self.cookie,)))
+            except GLib.Error:
+                pass
+            self.cookie = 0
+
+    # ---- pipeline ----
+
+    def _run(self, source):
+        fmt, frame, interval = self.want
+        key = (fmt.kind, frame.width, frame.height, interval)
+        if self.pipeline and key == self.pipeline_key:
+            return
+        self._stop_pipeline()
+        rate = 10000000 / interval	# 333333 is 30/1, not 10000000/333333
+        fps = f'{round(rate)}/1' if abs(rate - round(rate)) < 0.01 else f'10000000/{interval}'
+        raw = 'YUY2' if fmt.kind == 'yuyv' else 'I420'
+        enc = f'jpegenc name=enc quality={self.quality} ! ' if fmt.kind == 'mjpeg' else ''
+        desc = (f'{source} ! queue max-size-buffers=2 leaky=downstream ! '
+                f'videoconvertscale n-threads=4 ! videorate drop-only=true ! '
+                f'video/x-raw,format={raw},width={frame.width},height={frame.height},'
+                f'framerate={fps} ! {enc}'
+                f'appsink name=sink emit-signals=true sync=false max-buffers=1 drop=true')
+        log(desc)
+        # a full frame interval of payloads, less headers and some slack
+        self.budget = int(interval / MICROFRAME * (PAYLOAD - 12) * 0.85)
+        self.pipeline = Gst.parse_launch(desc)
+        self.pipeline_key = key
+        self.enc = self.pipeline.get_by_name('enc')
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self._on_error)
+        self.pipeline.get_by_name('sink').connect('new-sample', self._on_sample)
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+    def _stop_pipeline(self):
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline.get_bus().remove_signal_watch()
+            self.pipeline = None
+            self.pipeline_key = None
+
+    def _on_sample(self, sink):
+        buf = sink.emit('pull-sample').get_buffer()
+        data = buf.extract_dup(0, buf.get_size())
+        self.gadget.queue(data)
+        if self.enc:
+            # bigger than the link carries in a frame interval: the host
+            # would get fewer frames
+            q = self.quality
+            if len(data) > self.budget:
+                q = max(JPEG_QUALITY[0], q - max(2, int((len(data) / self.budget - 1) * 40)))
+            elif len(data) < self.budget * 0.6:
+                q = min(JPEG_QUALITY[1], q + 1)
+            if q != self.quality:
+                self.quality = q
+                self.enc.props.quality = q
+        return Gst.FlowReturn.OK
+
+    def _on_error(self, _bus, msg):
+        err, dbg = msg.parse_error()
+        log(f'error: {err.message} ({dbg})')
+        self._notify(f'The stream stopped: {err.message}')
+        self.stop(1)
+
+    def stop(self, code=0):
+        if self.stopped:
+            return		# mutter's Closed follows our own Stop
+        self.stopped = True
+        self._stop_pipeline()
+        self._end_screencast(stop=True)
+        if self.gadget:
+            self.gadget.close()
+        self.code = code
+        self.loop.quit()
+
+
+def main():
+    Gst.init(None)
+    loop = GLib.MainLoop()
+    stream = Stream(loop)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: stream.stop() or False)
+    try:
+        if not stream.start():
+            return 0
+    except (GLib.Error, OSError) as e:
+        log(f'error: {e}')
+        stream._notify(f'The stream could not start: {e}')
+        return 1
+    loop.run()
+    return stream.code
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,36 @@
+# USB modes for the Redmi K30 Ultra (cezanne): with a computer on the USB-C
+# port the cezanne-usb extension (cezanne-base) asks what it is for:
+# video stream (UVC webcam of the screen or a camera, e.g. for OBS), data
+# storage (MTP: the home folder), developer network (RNDIS, 172.16.42.1)
+# or charge only. cezanne-usbd owns the configfs gadget (replaces
+# cezanne-base's usb-gadget.service), cezanne-usb-stream feeds the webcam
+# from the session. The webcam needs the kernel's UVC gadget (linux-cezanne
+# >= 7.3.1-2; not a dependency: the clean chroot would install the kernel
+# and run its boot-flashing hook).
+pkgname=cezanne-usb
+pkgver=1.0
+pkgrel=5
+pkgdesc="USB modes: webcam stream, MTP storage, developer network, charge only"
+arch=(any)
+license=(MIT)
+depends=(python python-gobject libgudev polkit iproute2 dnsmasq
+         gstreamer gst-plugins-base gst-plugins-good
+         gst-plugin-libcamera gst-plugin-pipewire
+         umtp-responder)	# Data storage (packaging/umtp-responder)
+install=cezanne-usb.install
+source=(cezanne-usbd
+        cezanne-usb-stream
+        cezanne-usbd.service
+        cezanne-usb-stream.service
+        org.cezanne.Usb.conf
+        org.cezanne.usb.policy)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 cezanne-usbd "$pkgdir/usr/bin/cezanne-usbd"
+  install -Dm755 cezanne-usb-stream "$pkgdir/usr/bin/cezanne-usb-stream"
+  install -Dm644 cezanne-usbd.service "$pkgdir/usr/lib/systemd/system/cezanne-usbd.service"
+  install -Dm644 cezanne-usb-stream.service "$pkgdir/usr/lib/systemd/user/cezanne-usb-stream.service"
+  install -Dm644 org.cezanne.Usb.conf "$pkgdir/usr/share/dbus-1/system.d/org.cezanne.Usb.conf"
+  install -Dm644 org.cezanne.usb.policy "$pkgdir/usr/share/polkit-1/actions/org.cezanne.usb.policy"
+}

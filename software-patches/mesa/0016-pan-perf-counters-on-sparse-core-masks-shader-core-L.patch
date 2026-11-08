@@ -1,0 +1,73 @@
+From bd51b55dea2078d1f08d1737efb88b38f993c964 Mon Sep 17 00:00:00 2001
+From: arch-port <26345330+DrShadow34@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 20:03:44 +0100
+Subject: [PATCH 16/17] pan/perf: counters on sparse core masks, shader core /
+ L2 block counts
+
+Two bugs made the hardware counters useless on the G77 MC9:
+- The panfrost kmod sized the dump buffer for 2 + cores + L2 slices
+  blocks, the kernel copies 2 + L2 slices + fls64(shader_present) blocks
+  (holes of a sparse core mask included). shader_present 0x660067 is 9
+  cores but 23 blocks: the dump overflowed the heap buffer and the core
+  counters read garbage.
+- mali_perf_block_count() returned the core count for MEMSYS blocks and
+  the L2 count for SHADER_CORE blocks: core counters summed 4 of 9 cores
+  (core utilisation 40% instead of 90%), L2 counters read 5 core blocks
+  as L2 slices.
+
+panquick in a GPU-bound game now shows the 9 cores ~90% active, the 4
+L2 slices with matching read counts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013fD3if93WntovhmD8fGa8C
+---
+ src/panfrost/lib/kmod/panfrost_kmod.c | 9 +++++++--
+ src/panfrost/perf/mali_perf.h         | 4 ++--
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/panfrost_kmod.c b/src/panfrost/lib/kmod/panfrost_kmod.c
+index 2a33283..4944554 100644
+--- a/src/panfrost/lib/kmod/panfrost_kmod.c
++++ b/src/panfrost/lib/kmod/panfrost_kmod.c
+@@ -12,6 +12,7 @@
+ #include <sys/eventfd.h>
+ #include <sys/timerfd.h>
+ 
++#include "util/bitscan.h"
+ #include "util/hash_table.h"
+ #include "util/macros.h"
+ #include "util/stack_array.h"
+@@ -657,8 +658,12 @@ panfrost_kmod_bo_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const c
+ static uint32_t
+ panthor_kmod_perf_hw_sample_size(struct pan_kmod_dev *dev)
+ {
+-   uint32_t hw_blk_cnt =
+-      2 + pan_query_core_count(&dev->props) + pan_query_l2_slices(&dev->props);
++   /* The kernel dumps a block for every core up to the highest present one,
++    * holes in a sparse shader_present included (G77 MC9: 0x660067 = 23
++    * blocks for 9 cores).
++    */
++   uint32_t hw_blk_cnt = 2 + util_last_bit64(dev->props.shader_present) +
++                         pan_query_l2_slices(&dev->props);
+    uint32_t counters_per_block = pan_query_perf_counter_per_block(&dev->props);
+    uint32_t hw_blk_sz = counters_per_block * sizeof(uint32_t);
+ 
+diff --git a/src/panfrost/perf/mali_perf.h b/src/panfrost/perf/mali_perf.h
+index 01a5a6a..414cf24 100644
+--- a/src/panfrost/perf/mali_perf.h
++++ b/src/panfrost/perf/mali_perf.h
+@@ -135,9 +135,9 @@ mali_perf_block_count(enum mali_perf_block_type block_type,
+ {
+    switch (block_type) {
+    case MALI_PERF_BLOCK_MEMSYS:
+-      return constants->shader_core_count;
+-   case MALI_PERF_BLOCK_SHADER_CORE:
+       return constants->l2_cache_count;
++   case MALI_PERF_BLOCK_SHADER_CORE:
++      return constants->shader_core_count;
+    case MALI_PERF_BLOCK_GPU_FRONT_END:
+    case MALI_PERF_BLOCK_TILER:
+    case MALI_PERF_BLOCK_NONE:
+-- 
+2.56.0
+

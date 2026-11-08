@@ -1,0 +1,264 @@
+diff --git a/drivers/thermal/mediatek/lvts_thermal.c b/drivers/thermal/mediatek/lvts_thermal.c
+index 52f99f3e6..4116ccaaf 100644
+--- a/drivers/thermal/mediatek/lvts_thermal.c
++++ b/drivers/thermal/mediatek/lvts_thermal.c
+@@ -90,6 +90,9 @@
+ #define LVTS_GOLDEN_TEMP_DEFAULT	50
+ #define LVTS_COEFF_A_MT8195			-250460
+ #define LVTS_COEFF_B_MT8195			250460
++/* MT6885: same LVTS layout and efuse map as MT8192, own coefficients (BSP mtk_lvts_tc.c) */
++#define LVTS_COEFF_A_MT6885			-252500
++#define LVTS_COEFF_B_MT6885			252500
+ #define LVTS_COEFF_A_MT7987			-204650
+ #define LVTS_COEFF_B_MT7987			204650
+ #define LVTS_COEFF_A_MT7988			-204650
+@@ -157,6 +160,19 @@ struct lvts_data {
+ 	int num_init_cmd;
+ 	int temp_factor;
+ 	int temp_offset;
++	/*
++	 * Manual RCK (MT6885): measure each sensor's RC count after the init
++	 * commands and scale its calibration with it. rc_ref() decodes the
++	 * efuse reference count of controller rc_ctrl_base + index.
++	 */
++	u32 (*rc_ref)(const u8 *calib, size_t len, int ctrl);
++	int rc_ctrl_base;
++	/* measurement timing/filter; 0 for SoCs that use the defaults */
++	u32 hw_filter;
++	u32 period_unit;
++	u32 group_interval;
++	u32 filter_interval;
++	u32 sensor_interval;
+ 	int gt_calib_bit_offset;
+ 	unsigned int def_calibration;
+ 	u16 msr_offset;
+@@ -181,6 +197,8 @@ struct lvts_ctrl {
+ 	void __iomem *base;
+ 	int low_thresh;
+ 	int high_thresh;
++	/* efuse reference RC count for SoCs doing a manual RCK at boot */
++	u32 count_rc_ref;
+ };
+ 
+ struct lvts_domain {
+@@ -984,6 +1002,11 @@ static int lvts_ctrl_init(struct device *dev, struct lvts_domain *lvts_td,
+ 		 */
+ 		lvts_ctrl[i].mode = lvts_data->lvts_ctrl[i].mode;
+ 
++		if (lvts_data->rc_ref)
++			lvts_ctrl[i].count_rc_ref =
++				lvts_data->rc_ref(lvts_td->calib, lvts_td->calib_len,
++						  lvts_data->rc_ctrl_base + i);
++
+ 		lvts_ctrl[i].low_thresh = INT_MIN;
+ 		lvts_ctrl[i].high_thresh = INT_MIN;
+ 	}
+@@ -1134,11 +1157,79 @@ static int lvts_ctrl_connect(struct device *dev, struct lvts_ctrl *lvts_ctrl)
+ 	return 0;
+ }
+ 
++#define LVTS_RDATA0(__base)		(__base + 0x00B0)
++#define LVTS_DEVICE_ACCESS_START	BIT(24)
++#define LVTS_DEVICE_SENSING_STATUS	BIT(25)
++
++static void lvts_wait_config(struct lvts_ctrl *lvts_ctrl, u32 busy)
++{
++	u32 val;
++
++	readl_poll_timeout(LVTS_CONFIG(lvts_ctrl->base), val, !(val & busy), 2, 200);
++}
++
++static void lvts_dev_write(struct lvts_ctrl *lvts_ctrl, u8 reg, u8 data)
++{
++	writel(0xC1030000 | reg << 8 | data, LVTS_CONFIG(lvts_ctrl->base));
++	usleep_range(5, 10);
++	lvts_wait_config(lvts_ctrl, LVTS_DEVICE_ACCESS_START);
++}
++
++static u32 lvts_dev_read(struct lvts_ctrl *lvts_ctrl, u8 reg)
++{
++	writel(0x81020000 | reg << 8, LVTS_CONFIG(lvts_ctrl->base));
++	usleep_range(5, 10);
++	lvts_wait_config(lvts_ctrl, LVTS_DEVICE_ACCESS_START);
++	return readl(LVTS_RDATA0(lvts_ctrl->base));
++}
++
++/*
++ * BSP lvts_device_read_count_RC_N() with LVTS_REFINE_MANUAL_RCK_WITH_EFUSE:
++ * count each sensor's RC oscillator, fall back to the efuse reference when the
++ * count is missing or more than 6% off, and fold it into the calibration
++ * (LVTS_EDATA = count_r * count_rc_now >> 14).
++ */
++static void lvts_ctrl_manual_rck(struct device *dev, struct lvts_ctrl *lvts_ctrl)
++{
++	u32 ref = lvts_ctrl->count_rc_ref;
++	int i, n = hweight8(lvts_ctrl->valid_sensor_mask);
++
++	lvts_dev_write(lvts_ctrl, 0x0e, 0x00);		/* manual RCK */
++	for (i = 0; i < n; i++) {
++		u32 rc;
++
++		lvts_dev_write(lvts_ctrl, 0x0d, i);	/* sensor i with RCK */
++		lvts_dev_write(lvts_ctrl, 0x06, 0x78);
++		lvts_dev_write(lvts_ctrl, 0x07, 0xa6);
++		lvts_dev_write(lvts_ctrl, 0x08, 0xf5);	/* TS_EN */
++		lvts_dev_write(lvts_ctrl, 0x08, 0xfc);	/* toggle TSDIV_EN/TSVCO_TG */
++		lvts_dev_write(lvts_ctrl, 0x08, 0xf5);
++		udelay(10);
++		lvts_dev_write(lvts_ctrl, 0x03, 0x02);	/* kick off RCK counting */
++		udelay(30);
++		lvts_wait_config(lvts_ctrl, LVTS_DEVICE_SENSING_STATUS);
++		rc = lvts_dev_read(lvts_ctrl, 0x00) & GENMASK(23, 0);
++		lvts_dev_write(lvts_ctrl, 0x08, 0xf1);	/* TS_EN off */
++
++		if (!rc || (ref && (max(rc, ref) * 1000ULL / min(rc, ref) > 1061))) {
++			dev_dbg(dev, "sensor %d: RC count %u, using efuse %u\n", i, rc, ref);
++			rc = ref;
++		}
++		if (rc)
++			lvts_ctrl->calibration[i] =
++				((u64)lvts_ctrl->calibration[i] * rc) >> 14;
++	}
++	lvts_dev_write(lvts_ctrl, 0x0d, 0x10);		/* sensors without RCK */
++	lvts_dev_write(lvts_ctrl, 0x06, 0xb8);		/* single mode */
++}
++
+ static int lvts_ctrl_initialize(struct device *dev, struct lvts_ctrl *lvts_ctrl)
+ {
+ 	const struct lvts_data *lvts_data = lvts_ctrl->lvts_data;
+ 
+ 	lvts_write_config(lvts_ctrl, lvts_data->init_cmd, lvts_data->num_init_cmd);
++	if (lvts_data->rc_ref)
++		lvts_ctrl_manual_rck(dev, lvts_ctrl);
+ 
+ 	return 0;
+ }
+@@ -1219,8 +1310,8 @@ static int lvts_ctrl_configure(struct device *dev, struct lvts_ctrl *lvts_ctrl)
+ 	 * 6-8  : Sensor2 filter
+ 	 * 9-11 : Sensor3 filter
+ 	 */
+-	value = LVTS_HW_FILTER << 9 |  LVTS_HW_FILTER << 6 |
+-			LVTS_HW_FILTER << 3 | LVTS_HW_FILTER;
++	value = lvts_ctrl->lvts_data->hw_filter ?: LVTS_HW_FILTER;
++	value = value << 9 | value << 6 | value << 3 | value;
+ 	writel(value, LVTS_MSRCTL0(lvts_ctrl->base));
+ 
+ 	/*
+@@ -1263,7 +1354,8 @@ static int lvts_ctrl_configure(struct device *dev, struct lvts_ctrl *lvts_ctrl)
+ 	 *       9 - 0  : Period unit
+ 	 *
+ 	 */
+-	value = LVTS_GROUP_INTERVAL << 20 | LVTS_PERIOD_UNIT;
++	value = (lvts_ctrl->lvts_data->group_interval ?: LVTS_GROUP_INTERVAL) << 20 |
++		(lvts_ctrl->lvts_data->period_unit ?: LVTS_PERIOD_UNIT);
+ 	writel(value, LVTS_MONCTL1(lvts_ctrl->base));
+ 
+ 	/*
+@@ -1276,7 +1368,8 @@ static int lvts_ctrl_configure(struct device *dev, struct lvts_ctrl *lvts_ctrl)
+ 	 *       9-0  : Interval unit in PERIOD_UNIT between each sensor
+ 	 *
+ 	 */
+-	value = LVTS_FILTER_INTERVAL << 16 | LVTS_SENSOR_INTERVAL;
++	value = (lvts_ctrl->lvts_data->filter_interval ?: LVTS_FILTER_INTERVAL) << 16 |
++		(lvts_ctrl->lvts_data->sensor_interval ?: LVTS_SENSOR_INTERVAL);
+ 	writel(value, LVTS_MONCTL2(lvts_ctrl->base));
+ 
+ 	return lvts_irq_init(lvts_ctrl);
+@@ -1618,6 +1711,36 @@ static const u32 default_init_cmds[] = {
+ 	0xC10300FC, 0xC103009D, 0xC10300F1, 0xC10300E1
+ };
+ 
++/*
++ * MT6885 (BSP lvts_Device_Enable_Init_all_Devices with LVTS_DEVICE_AUTO_RCK = 0):
++ * manual RCK, counting window 20 us, TSV2F/TSBG chopper settings, TS_EN with a
++ * TSDIV_EN/TSVCO toggle, then single mode. The MT8192 default list enables
++ * auto-RCK, which gives spurious samples on this SoC.
++ */
++static const u32 mt6885_init_cmds[] = {
++	0xC1030300, 0xC1030420, 0xC1030500, 0xC1030AC4, 0xC1030C7C,
++	0xC103098D, 0xC10308F5, 0xC10308FC, 0xC10308F5, 0xC10307A6
++};
++
++/*
++ * Efuse reference RC counts (BSP lvts_thermal_cal_prepare): controller 0 (MCU
++ * big0) in word 21 [23:0]; controllers 1..6 packed in the top bytes of words
++ * 3k-2, 3k-1, 3k.
++ */
++static u32 lvts_mt6885_rc_ref(const u8 *calib, size_t len, int ctrl)
++{
++	const __le32 *w = (const __le32 *)calib;
++	int k = 3 * ctrl;
++
++	if (len < 22 * 4 || ctrl < 0 || ctrl > 6)
++		return 0;
++	if (!ctrl)
++		return le32_to_cpu(w[21]) & GENMASK(23, 0);
++	return (le32_to_cpu(w[k - 2]) >> 24) << 16 |
++	       (le32_to_cpu(w[k - 1]) >> 24) << 8 |
++	       (le32_to_cpu(w[k]) >> 24);
++}
++
+ static const u32 mt7987_init_cmds[] = {
+ 	0xC1030300, 0xC1030420, 0xC1030500, 0xC10307A6, 0xC10308C7,
+ 	0xC103098D, 0xC1030C7C, 0xC1030AA8, 0xC10308CE, 0xC10308C7,
+@@ -2130,6 +2253,51 @@ static const struct lvts_data mt8192_lvts_ap_data = {
+ 	.ops = &lvts_platform_ops_mt7988,
+ };
+ 
++static const struct lvts_data mt6885_lvts_mcu_data = {
++	.lvts_ctrl	= mt8192_lvts_mcu_data_ctrl,
++	.conn_cmd	= default_conn_cmds,
++	.init_cmd	= mt6885_init_cmds,
++	.num_lvts_ctrl	= ARRAY_SIZE(mt8192_lvts_mcu_data_ctrl),
++	.num_conn_cmd	= ARRAY_SIZE(default_conn_cmds),
++	.num_init_cmd	= ARRAY_SIZE(mt6885_init_cmds),
++	.temp_factor	= LVTS_COEFF_A_MT6885,
++	.temp_offset	= LVTS_COEFF_B_MT6885,
++	.rc_ref		= lvts_mt6885_rc_ref,
++	/* BSP tc_speed {1, 0xc, 1, 1} and LVTSMSRCTL0 = 0x492 (filter 2 per stage) */
++	.hw_filter	= 2,
++	.period_unit	= 0xc,
++	.group_interval	= 1,
++	.filter_interval = 1,
++	.sensor_interval = 1,
++	.gt_calib_bit_offset = 24,
++	.def_calibration = 35000,
++	.num_cal_offsets = LVTS_NUM_CAL_OFFSETS_MT7988,
++	.ops = &lvts_platform_ops_mt7988,
++};
++
++static const struct lvts_data mt6885_lvts_ap_data = {
++	.lvts_ctrl	= mt8192_lvts_ap_data_ctrl,
++	.conn_cmd	= default_conn_cmds,
++	.init_cmd	= mt6885_init_cmds,
++	.num_lvts_ctrl	= ARRAY_SIZE(mt8192_lvts_ap_data_ctrl),
++	.num_conn_cmd	= ARRAY_SIZE(default_conn_cmds),
++	.num_init_cmd	= ARRAY_SIZE(mt6885_init_cmds),
++	.temp_factor	= LVTS_COEFF_A_MT6885,
++	.temp_offset	= LVTS_COEFF_B_MT6885,
++	.rc_ref		= lvts_mt6885_rc_ref,
++	.rc_ctrl_base	= 3,
++	/* BSP tc_speed {1, 0xc, 1, 1} and LVTSMSRCTL0 = 0x492 (filter 2 per stage) */
++	.hw_filter	= 2,
++	.period_unit	= 0xc,
++	.group_interval	= 1,
++	.filter_interval = 1,
++	.sensor_interval = 1,
++	.gt_calib_bit_offset = 24,
++	.def_calibration = 35000,
++	.num_cal_offsets = LVTS_NUM_CAL_OFFSETS_MT7988,
++	.ops = &lvts_platform_ops_mt7988,
++};
++
+ static const struct lvts_data mt8195_lvts_mcu_data = {
+ 	.lvts_ctrl	= mt8195_lvts_mcu_data_ctrl,
+ 	.conn_cmd	= default_conn_cmds,
+@@ -2190,6 +2358,8 @@ static const struct of_device_id lvts_of_match[] = {
+ 	{ .compatible = "mediatek,mt8186-lvts", .data = &mt8186_lvts_data },
+ 	{ .compatible = "mediatek,mt8188-lvts-mcu", .data = &mt8188_lvts_mcu_data },
+ 	{ .compatible = "mediatek,mt8188-lvts-ap", .data = &mt8188_lvts_ap_data },
++	{ .compatible = "mediatek,mt6885-lvts-mcu", .data = &mt6885_lvts_mcu_data },
++	{ .compatible = "mediatek,mt6885-lvts-ap", .data = &mt6885_lvts_ap_data },
+ 	{ .compatible = "mediatek,mt8192-lvts-mcu", .data = &mt8192_lvts_mcu_data },
+ 	{ .compatible = "mediatek,mt8192-lvts-ap", .data = &mt8192_lvts_ap_data },
+ 	{ .compatible = "mediatek,mt8195-lvts-mcu", .data = &mt8195_lvts_mcu_data },

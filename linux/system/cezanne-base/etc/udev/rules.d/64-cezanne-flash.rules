@@ -1,0 +1,4 @@
+# Rear flash LEDs (MT6360 FLED1/FLED2): torch and flash for the video group
+# (camera app, GNOME flashlight toggle).
+SUBSYSTEM=="leds", KERNEL=="white:flash-*", \
+  RUN+="/bin/sh -c 'cd /sys%p && chgrp video brightness flash_brightness flash_strobe flash_timeout && chmod g+w brightness flash_brightness flash_strobe flash_timeout'"

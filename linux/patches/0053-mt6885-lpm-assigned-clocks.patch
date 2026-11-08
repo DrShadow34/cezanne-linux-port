@@ -1,0 +1,37 @@
+mt6885-lpm: apply the unused-clocks node's assigned clocks first
+
+lk runs mdp_sel from TVDPLL, its only user, so TVDPLL stays on and
+blocks the SPM's bus26m constraint. The DT node now moves mdp_sel to
+MAINPLL_D4 before its clocks are dropped.
+
+diff --git a/drivers/soc/mediatek/mt6885-lpm.c b/drivers/soc/mediatek/mt6885-lpm.c
+index 478bf41aa..c0d1f4d89 100644
+--- a/drivers/soc/mediatek/mt6885-lpm.c
++++ b/drivers/soc/mediatek/mt6885-lpm.c
+@@ -16,13 +16,16 @@
+  * node: lk leaves them running, nothing on Arch uses them, and they block
+  * the SPM constraints. With clk_ignore_unused (needed: blanket gating hits
+  * firmware clocks nothing references) they would stay on, so take and drop
+- * each once; a clock some driver holds stays on.
++ * each once; a clock some driver holds stays on. The node's assigned-clocks
++ * are applied first, so a mux lk left on an otherwise unused PLL can move
++ * off it before the PLL is dropped.
+  *
+  * Only done when ATF runs the SPM resource constraints, i.e. lk loaded the
+  * SPM firmware (normal / boot-slot boot; a recovery-slot boot has none).
+  */
+ #include <linux/arm-smccc.h>
+ #include <linux/clk.h>
++#include <linux/clk/clk-conf.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+ #include <linux/of.h>
+@@ -99,6 +102,8 @@ static void __init mt6885_lpm_gate_unused(void)
+ 	np = of_find_compatible_node(NULL, NULL, "cezanne,mt6885-lpm-unused-clocks");
+ 	if (!np)
+ 		return;
++	if (of_clk_set_defaults(np, false))
++		pr_warn("mt6885-lpm: assigned clocks not applied\n");
+ 	n = of_count_phandle_with_args(np, "clocks", "#clock-cells");
+ 	for (i = 0; i < n; i++) {
+ 		struct clk *clk = of_clk_get(np, i);

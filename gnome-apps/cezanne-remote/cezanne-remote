@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Remote control for the cezanne's IR blaster (/dev/lirc0): TVs by brand and
+air conditioners, with codes from IRext (https://github.com/irext, MIT).
+
+TV codes are stored decoded in the database (build-db.py); an AC code depends
+on the whole state (power, mode, temperature, fan, swing), so it comes from
+IRext's decoder library (libirdecode.so) and the remote's protocol binary.
+IR is one-way: the AC state shown is the one last sent.
+"""
+import array
+import ctypes
+import fcntl
+import json
+import os
+import sqlite3
+import struct
+import sys
+import threading
+import zlib
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = 'org.cezanne.Remote'
+VERSION = '1.1'
+HERE = os.path.dirname(os.path.realpath(__file__))
+DATA_DIRS = [os.environ.get('CEZANNE_REMOTE_DATA'), '/usr/share/cezanne-remote', HERE]
+LIB_DIRS = [os.environ.get('CEZANNE_REMOTE_LIB'), '/usr/lib/cezanne-remote', HERE]
+STATE_FILE = os.path.join(GLib.get_user_config_dir(), 'cezanne-remote', 'state.json')
+LIRC = os.environ.get('CEZANNE_REMOTE_LIRC', '/dev/lirc0')
+CARRIER = 38000
+CAT_AC, CAT_TV = 1, 2
+
+LIRC_SET_SEND_CARRIER = 0x40046913	# _IOW('i', 0x13, __u32)
+LIRC_MAX_ENTRIES = 1023			# lirc_dev: LIRCBUF_SIZE, odd count
+LIRC_MAX_US = 500000			# IR_MAX_DURATION per entry
+
+# IRext AC: ir_decode key codes and the state's enumerations
+AC_KEY_POWER, AC_KEY_MODE, AC_KEY_TEMP_UP, AC_KEY_TEMP_DOWN = 0, 1, 2, 3
+AC_KEY_SPEED, AC_KEY_SWING = 9, 10
+AC_MODES = ['Cool', 'Heat', 'Auto', 'Fan', 'Dry']
+AC_SPEEDS = ['Auto', 'Low', 'Medium', 'High']
+AC_TEMP_MIN = 16
+
+# sizes (Preferences): buttons and spacing in percent; phone-sized defaults
+SIZE_DEFAULT, SPACING_DEFAULT = 150, 125
+SIZE_RANGE, SPACING_RANGE = (100, 175), (50, 175)
+
+
+def find(dirs, name):
+    for d in dirs:
+        if d and os.path.exists(os.path.join(d, name)):
+            return os.path.join(d, name)
+    raise FileNotFoundError(name)
+
+
+def sanitize(durations):
+    """a code LIRC takes: no zero entries (a zero pulse or space joins its
+    neighbours), none over 500 ms, starting and ending on a pulse; None when
+    nothing is left (IRext stores keys a remote lacks as "0")"""
+    seq = []
+    for i, v in enumerate(durations or ()):
+        if v <= 0:
+            continue
+        kind = i % 2		# 0 pulse, 1 space
+        if seq and seq[-1][0] == kind:
+            seq[-1][1] += v
+        else:
+            seq.append([kind, v])
+    while seq and seq[0][0] == 1:
+        seq.pop(0)
+    while seq and seq[-1][0] == 1:
+        seq.pop()
+    out = [min(v, LIRC_MAX_US) for _, v in seq]
+    return out if out and len(out) <= LIRC_MAX_ENTRIES else None
+
+
+class AcStatus(ctypes.Structure):
+    """IRext t_remote_ac_status (enums are ints)"""
+    _fields_ = [('power', ctypes.c_int), ('temp', ctypes.c_int), ('mode', ctypes.c_int),
+                ('wind_dir', ctypes.c_int), ('wind_speed', ctypes.c_int),
+                ('display', ctypes.c_uint8), ('sleep', ctypes.c_uint8), ('timer', ctypes.c_uint8),
+                ('change_wind_direction', ctypes.c_uint8)]
+
+
+class AcDecoder:
+    """IRext's decoder: one remote open at a time (the library keeps a global
+    context), so every call opens the binary again"""
+
+    def __init__(self):
+        self.lib = ctypes.CDLL(find(LIB_DIRS, 'libirdecode.so'))
+        self.lock = threading.Lock()
+
+    def _open(self, binary):
+        self._buf = (ctypes.c_uint8 * len(binary)).from_buffer_copy(binary)
+        if self.lib.ir_binary_open(CAT_AC, 1, self._buf, len(binary)) != 0:
+            raise ValueError('IRext cannot parse this remote')
+
+    def capabilities(self, binary):
+        """{'modes': [mode...], mode: {'temps': (lo, hi) or None, 'speeds': [...]},
+        'swing': bool}"""
+        with self.lock:
+            self._open(binary)
+            try:
+                caps = {}
+                m = ctypes.c_uint8()
+                self.lib.get_supported_mode(ctypes.byref(m))
+                caps['modes'] = [i for i in range(len(AC_MODES)) if m.value >> i & 1]
+                for mode in caps['modes']:
+                    lo, hi, sp = ctypes.c_int8(), ctypes.c_int8(), ctypes.c_uint8()
+                    self.lib.get_temperature_range(mode, ctypes.byref(lo), ctypes.byref(hi))
+                    self.lib.get_supported_wind_speed(mode, ctypes.byref(sp))
+                    caps[mode] = {
+                        'temps': (lo.value + AC_TEMP_MIN, hi.value + AC_TEMP_MIN) if lo.value >= 0 else None,
+                        'speeds': [i for i in range(len(AC_SPEEDS)) if sp.value >> i & 1],
+                    }
+                sw = ctypes.c_uint8()
+                self.lib.get_supported_swing(caps['modes'][0] if caps['modes'] else 0, ctypes.byref(sw))
+                caps['swing'] = sw.value != 0
+                return caps
+            finally:
+                self.lib.ir_close()
+
+    def encode(self, binary, key, state):
+        with self.lock:
+            self._open(binary)
+            try:
+                st = AcStatus(0 if state['power'] else 1, state['temp'] - AC_TEMP_MIN, state['mode'],
+                              0 if state['swing'] else 1, state['speed'], 0, 0, 0, 0)
+                out = (ctypes.c_uint16 * 2048)()
+                n = self.lib.ir_decode(key, out, ctypes.byref(st))
+                return list(out[:n])
+            finally:
+                self.lib.ir_close()
+
+
+class Blaster:
+    """sends pulse / space durations (microseconds) on the LIRC transmitter,
+    one code at a time, off the UI thread"""
+
+    def __init__(self, on_error):
+        self.on_error = on_error
+        self.lock = threading.Lock()
+
+    def send(self, durations):
+        durations = sanitize(durations)
+        if not durations:
+            self.on_error('No code for this key on this remote')
+            return
+        threading.Thread(target=self._send, args=(durations,), daemon=True).start()
+
+    def _send(self, durations):
+        with self.lock:
+            try:
+                fd = os.open(LIRC, os.O_WRONLY)
+                try:
+                    fcntl.ioctl(fd, LIRC_SET_SEND_CARRIER, struct.pack('I', CARRIER))
+                    os.write(fd, array.array('I', durations).tobytes())
+                finally:
+                    os.close(fd)
+            except OSError as e:
+                GLib.idle_add(self.on_error, 'IR transmitter: %s' % e.strerror)
+
+
+class Db:
+    def __init__(self):
+        self.db = sqlite3.connect(find(DATA_DIRS, 'remotes.db'), check_same_thread=False)
+
+    def brands(self, category):
+        return self.db.execute("select b.id, b.name from brand b where b.category = ? "
+                               "order by b.priority, lower(b.name)", (category,)).fetchall()
+
+    def remotes(self, brand):
+        """(id, label): IRext's remote number for ACs, the protocol for TVs"""
+        return [(rid, 'IRext %s' % name if proto == 'new_ac' else proto)
+                for rid, proto, name in self.db.execute(
+                    "select id, protocol, name from remote where brand = ? order by position", (brand,))]
+
+    def tv_keys(self, remote):
+        """the remote's keys that have a usable code"""
+        keys = {}
+        for k, c in self.db.execute("select key, code from tv_key where remote = ?", (remote,)):
+            d = sanitize(array.array('I', zlib.decompress(c)).tolist())
+            if d:
+                keys[k] = d
+        return keys
+
+    def ac_binary(self, remote):
+        return self.db.execute("select data from ac_binary where remote = ?", (remote,)).fetchone()[0]
+
+
+class State:
+    def __init__(self):
+        try:
+            with open(STATE_FILE) as f:
+                self.d = json.load(f)
+        except (OSError, ValueError):
+            self.d = {}
+
+    def get(self, key, default=None):
+        return self.d.get(key, default)
+
+    def set(self, key, value):
+        self.d[key] = value
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(self.d, f)
+        os.replace(tmp, STATE_FILE)
+
+
+class Sizer:
+    """button and spacing sizes: CSS from the size factor, container spacing
+    from the spacing factor (both from Preferences, applied live)"""
+
+    def __init__(self, state):
+        self.state = state
+        self.size = state.get('ui_size', SIZE_DEFAULT)
+        self.spacing = state.get('ui_spacing', SPACING_DEFAULT)
+        self.spaced = []	# (widget, base spacing)
+        self.css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def space(self, widget, base):
+        """register a Box / Grid whose spacing follows the setting"""
+        self.spaced.append((widget, base))
+        return widget
+
+    def set(self, size=None, spacing=None):
+        if size is not None:
+            self.size = int(size)
+            self.state.set('ui_size', self.size)
+        if spacing is not None:
+            self.spacing = int(spacing)
+            self.state.set('ui_spacing', self.spacing)
+        self.apply()
+
+    def apply(self):
+        s, sp = self.size / 100, self.spacing / 100
+        t = 1 + (s - 1) * 0.7		# text grows a bit less than the buttons
+
+        def px(v):
+            return '%dpx' % round(v * s)
+        self.css.load_from_string("""
+            .remote-page { font-size: %d%%; }
+            .remote-page button.key { min-width: %s; min-height: %s; border-radius: %s; }
+            .remote-page button.key image { -gtk-icon-size: %s; }
+            .remote-page button.key.pill { min-width: %s; border-radius: 999px; }
+            .remote-page button.power { min-width: %s; min-height: %s; border-radius: 999px; }
+            .remote-page button.power image { -gtk-icon-size: %s; }
+            .remote-page button.round { min-width: %s; min-height: %s; border-radius: 999px; }
+            .remote-page button.round image { -gtk-icon-size: %s; }
+            .remote-page button.picker image { -gtk-icon-size: %s; }
+            .remote-page .ac-temp { font-size: %s; font-weight: 800; font-feature-settings: "tnum";
+                                    min-width: %s; }
+            .remote-page button.ac-power { min-width: %s; min-height: %s; }
+            .remote-page toggle { min-height: %s; }
+        """ % (round(100 * t), px(56), px(52), px(12), px(18), px(96), px(76), px(76), px(28),
+               px(58), px(58), px(20), px(16), px(46), px(112), px(200), px(52), px(38)))
+        for w, base in self.spaced:
+            v = round(base * sp)
+            if isinstance(w, Gtk.Grid):
+                w.set_row_spacing(v)
+                w.set_column_spacing(v)
+            else:
+                w.set_spacing(v)
+
+
+def brand_row(title, brands, selected, on_changed):
+    """searchable brand list"""
+    names = Gtk.StringList.new([n for _, n in brands])
+    row = Adw.ComboRow(title=title, model=names, enable_search=True)
+    row.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, 'string'))
+    ids = [b for b, _ in brands]
+    if selected in ids:
+        row.set_selected(ids.index(selected))
+    row.connect('notify::selected', lambda r, _: on_changed(ids[r.get_selected()]))
+    return row, ids
+
+
+class RemotePicker(Adw.ActionRow):
+    """which of the brand's remotes: previous / next, and a test button"""
+
+    def __init__(self, on_changed, on_test=None, test_label=None):
+        super().__init__(title='Remote')
+        self.on_changed = on_changed
+        self.remotes, self.pos = [], 0
+        self.prev = Gtk.Button(icon_name='go-previous-symbolic', valign=Gtk.Align.CENTER,
+                               tooltip_text='Previous remote')
+        self.next = Gtk.Button(icon_name='go-next-symbolic', valign=Gtk.Align.CENTER,
+                               tooltip_text='Next remote')
+        for b in (self.prev, self.next):
+            b.add_css_class('flat')
+            b.add_css_class('picker')
+            self.add_suffix(b)
+        self.prev.connect('clicked', lambda _: self.select(self.pos - 1))
+        self.next.connect('clicked', lambda _: self.select(self.pos + 1))
+        if on_test:
+            t = Gtk.Button(label=test_label, valign=Gtk.Align.CENTER)
+            t.connect('clicked', lambda _: on_test())
+            self.add_suffix(t)
+
+    def set_remotes(self, remotes, pos):
+        self.remotes = remotes
+        self.select(min(max(pos, 0), max(len(remotes) - 1, 0)), notify=False)
+
+    def select(self, pos, notify=True):
+        if not self.remotes:
+            self.set_subtitle('No remotes')
+            return
+        self.pos = pos % len(self.remotes)
+        self.set_subtitle('%d of %d · %s' % (self.pos + 1, len(self.remotes),
+                                              self.remotes[self.pos][1]))
+        self.prev.set_sensitive(len(self.remotes) > 1)
+        self.next.set_sensitive(len(self.remotes) > 1)
+        if notify:
+            self.on_changed()
+
+    @property
+    def remote(self):
+        return self.remotes[self.pos][0] if self.remotes else None
+
+
+class Page(Gtk.ScrolledWindow):
+    """a scrolling page whose sizes follow the Preferences"""
+
+    def __init__(self, app):
+        # sizes are picked to fit a phone at the largest setting; should a
+        # page still be wider, it scrolls instead of widening the window
+        super().__init__(hscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+        self.app = app
+        self.add_css_class('remote-page')
+        self.box = app.sizer.space(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_top=12,
+                                           margin_bottom=24, margin_start=12, margin_end=12), 18)
+        self.set_child(Adw.Clamp(maximum_size=640, child=self.box))
+
+    def row(self, base=12, **kw):
+        return self.app.sizer.space(Gtk.Box(halign=Gtk.Align.CENTER, **kw), base)
+
+
+class TvPage(Page):
+    def __init__(self, app):
+        super().__init__(app)
+        self.keys = {}
+        self.buttons = {}
+        box = self.box
+
+        group = Adw.PreferencesGroup()
+        brands = app.db.brands(CAT_TV)
+        sel = app.state.get('tv_brand')
+        if sel is None:
+            sel = next((b for b, n in brands if n.upper() == 'LG'), brands[0][0])
+        self.brand_row, ids = brand_row('Brand', brands, sel, self.brand_changed)
+        self.brand = sel if sel in ids else ids[0]
+        self.picker = RemotePicker(self.remote_changed, lambda: self.press('vol+'), 'Test')
+        self.picker.set_tooltip_text('Find the right remote: "Test" sends volume up')
+        group.add(self.brand_row)
+        group.add(self.picker)
+        box.append(group)
+
+        # power, input, mute
+        top = self.row(24)
+        top.append(self.key('input', icon='video-display-symbolic', tooltip='Input'))
+        top.append(self.key('power', icon='system-shutdown-symbolic', css=('destructive-action', 'power'),
+                            tooltip='Power'))
+        top.append(self.key('mute', icon='audio-volume-muted-symbolic', tooltip='Mute'))
+        box.append(top)
+
+        # navigation
+        pad = app.sizer.space(Gtk.Grid(halign=Gtk.Align.CENTER), 6)
+        pad.attach(self.key('up', icon='go-up-symbolic'), 1, 0, 1, 1)
+        pad.attach(self.key('left', icon='go-previous-symbolic'), 0, 1, 1, 1)
+        pad.attach(self.key('ok', label='OK', css=('suggested-action',)), 1, 1, 1, 1)
+        pad.attach(self.key('right', icon='go-next-symbolic'), 2, 1, 1, 1)
+        pad.attach(self.key('down', icon='go-down-symbolic'), 1, 2, 1, 1)
+        box.append(pad)
+
+        nav = self.row(12)
+        nav.append(self.key('back', icon='edit-undo-symbolic', tooltip='Back'))
+        nav.append(self.key('home', icon='go-home-symbolic', tooltip='Home'))
+        nav.append(self.key('menu', icon='open-menu-symbolic', tooltip='Menu'))
+        nav.append(self.key('set', icon='emblem-system-symbolic', tooltip='Settings'))
+        box.append(nav)
+
+        vol = self.row(12)
+        vol.append(self.key('vol-', icon='audio-volume-low-symbolic', css=('pill',), tooltip='Volume down'))
+        vol.append(self.key('vol+', icon='audio-volume-high-symbolic', css=('pill',), tooltip='Volume up'))
+        box.append(vol)
+
+        digits = app.sizer.space(Gtk.Grid(halign=Gtk.Align.CENTER, margin_top=6), 6)
+        for i in range(9):
+            digits.attach(self.key(str(i + 1), label=str(i + 1), css=('flat',)), i % 3, i // 3, 1, 1)
+        digits.attach(self.key('0', label='0', css=('flat',)), 1, 3, 1, 1)
+        exp = Gtk.Expander(label='Numbers', child=digits, halign=Gtk.Align.CENTER,
+                           expanded=app.state.get('tv_digits', False))
+        exp.connect('notify::expanded', lambda e, _: app.state.set('tv_digits', e.get_expanded()))
+        box.append(exp)
+
+        self.load_brand(app.state.get('tv_remote', {}).get(str(self.brand), 0))
+
+    def key(self, name, label=None, icon=None, css=(), tooltip=None):
+        b = Gtk.Button(label=label) if label else Gtk.Button(icon_name=icon)
+        b.add_css_class('key')
+        for c in css:
+            b.add_css_class(c)
+        if tooltip:
+            b.set_tooltip_text(tooltip)
+        b.connect('clicked', lambda _: self.press(name))
+        self.buttons[name] = b
+        return b
+
+    def press(self, name):
+        self.app.blaster.send(self.keys.get(name))
+
+    def brand_changed(self, brand):
+        self.brand = brand
+        self.app.state.set('tv_brand', brand)
+        self.load_brand(self.app.state.get('tv_remote', {}).get(str(brand), 0))
+
+    def load_brand(self, pos):
+        self.picker.set_remotes(self.app.db.remotes(self.brand), pos)
+        self.remote_changed(save=False)
+
+    def remote_changed(self, save=True):
+        remote = self.picker.remote
+        self.keys = self.app.db.tv_keys(remote) if remote else {}
+        for name, b in self.buttons.items():
+            b.set_sensitive(name in self.keys)
+        if save:
+            pos = self.app.state.get('tv_remote', {})
+            pos[str(self.brand)] = self.picker.pos
+            self.app.state.set('tv_remote', pos)
+
+
+class AcPage(Page):
+    DEFAULT = {'power': False, 'mode': 0, 'temp': 24, 'speed': 0, 'swing': False}
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.binary, self.caps, self.st = None, None, dict(self.DEFAULT)
+        self.updating = False
+        box = self.box
+
+        group = Adw.PreferencesGroup()
+        brands = app.db.brands(CAT_AC)
+        sel = app.state.get('ac_brand')
+        if sel is None:
+            sel = next((b for b, n in brands if n.upper() == 'AUX'), brands[0][0])
+        self.brand_row, ids = brand_row('Brand', brands, sel, self.brand_changed)
+        self.brand = sel if sel in ids else ids[0]
+        self.picker = RemotePicker(self.remote_changed)
+        group.add(self.brand_row)
+        group.add(self.picker)
+        box.append(group)
+
+        # temperature with - / +, the power button under it
+        temp = self.row(16)
+        self.minus = Gtk.Button(icon_name='list-remove-symbolic', valign=Gtk.Align.CENTER,
+                                tooltip_text='Colder')
+        self.plus = Gtk.Button(icon_name='list-add-symbolic', valign=Gtk.Align.CENTER,
+                               tooltip_text='Warmer')
+        for b in (self.minus, self.plus):
+            b.add_css_class('round')
+        self.temp_label = Gtk.Label()
+        self.temp_label.add_css_class('ac-temp')
+        self.minus.connect('clicked', lambda _: self.change_temp(-1))
+        self.plus.connect('clicked', lambda _: self.change_temp(1))
+        temp.append(self.minus)
+        temp.append(self.temp_label)
+        temp.append(self.plus)
+        box.append(temp)
+
+        self.power = Gtk.Button(halign=Gtk.Align.CENTER)
+        self.power.add_css_class('pill')
+        self.power.add_css_class('ac-power')
+        self.power.connect('clicked', lambda _: self.toggle_power())
+        box.append(self.power)
+
+        # mode and fan as full-width choices, so they stay readable when large
+        self.modes = Adw.ToggleGroup(homogeneous=True, hexpand=True)
+        self.speeds = Adw.ToggleGroup(homogeneous=True, hexpand=True)
+        self.mode_box = self.choice('Mode', self.modes)
+        self.speed_box = self.choice('Fan', self.speeds)
+        box.append(self.mode_box)
+        box.append(self.speed_box)
+        swing = Adw.PreferencesGroup()
+        self.swing_row = Adw.SwitchRow(title='Swing')
+        swing.add(self.swing_row)
+        box.append(swing)
+        self.modes.connect('notify::active', lambda g, _: self.set_field('mode', g.get_active_name(), AC_KEY_MODE))
+        self.speeds.connect('notify::active', lambda g, _: self.set_field('speed', g.get_active_name(), AC_KEY_SPEED))
+        self.swing_row.connect('notify::active', lambda r, _: self.set_field('swing', r.get_active(), AC_KEY_SWING))
+
+        note = Gtk.Label(label='IR is one-way: this is the state last sent, not read from the unit.',
+                         wrap=True, justify=Gtk.Justification.CENTER)
+        note.add_css_class('dim-label')
+        note.add_css_class('caption')
+        box.append(note)
+
+        self.load_brand(app.state.get('ac_remote', {}).get(str(self.brand), 0))
+
+    def choice(self, title, group):
+        b = self.app.sizer.space(Gtk.Box(orientation=Gtk.Orientation.VERTICAL), 6)
+        label = Gtk.Label(label=title, xalign=0)
+        label.add_css_class('heading')
+        b.append(label)
+        b.append(group)
+        return b
+
+    def brand_changed(self, brand):
+        self.brand = brand
+        self.app.state.set('ac_brand', brand)
+        self.load_brand(self.app.state.get('ac_remote', {}).get(str(brand), 0))
+
+    def load_brand(self, pos):
+        self.picker.set_remotes(self.app.db.remotes(self.brand), pos)
+        self.remote_changed(save=False)
+
+    def remote_changed(self, save=True):
+        remote = self.picker.remote
+        if save:
+            pos = self.app.state.get('ac_remote', {})
+            pos[str(self.brand)] = self.picker.pos
+            self.app.state.set('ac_remote', pos)
+        self.binary = self.app.db.ac_binary(remote) if remote else None
+        try:
+            self.caps = self.app.ac.capabilities(self.binary) if self.binary else None
+        except ValueError as e:
+            self.caps = None
+            self.app.toast(str(e))
+        saved = self.app.state.get('ac_state', {}).get(str(remote))
+        self.st = dict(self.DEFAULT, **(saved or {}))
+        self.fit_state()
+        self.refresh()
+
+    def fit_state(self):
+        """keep the state within what this remote supports"""
+        c = self.caps
+        if not c or not c['modes']:
+            return
+        if self.st['mode'] not in c['modes']:
+            self.st['mode'] = c['modes'][0]
+        m = c[self.st['mode']]
+        if m['temps']:
+            self.st['temp'] = min(max(self.st['temp'], m['temps'][0]), m['temps'][1])
+        if m['speeds'] and self.st['speed'] not in m['speeds']:
+            self.st['speed'] = m['speeds'][0]
+
+    def refresh(self):
+        """show the state; rebuild the mode / fan choices for this remote"""
+        self.updating = True
+        c, st = self.caps, self.st
+        ok = c is not None and bool(c['modes'])
+        for w in (self.minus, self.plus, self.power, self.mode_box, self.speed_box, self.swing_row):
+            w.set_sensitive(ok)
+        if ok:
+            m = c[st['mode']]
+            self.modes.remove_all()
+            for i in c['modes']:
+                self.modes.add(Adw.Toggle(label=AC_MODES[i], name=str(i)))
+            self.modes.set_active_name(str(st['mode']))
+            self.speeds.remove_all()
+            for i in m['speeds']:
+                self.speeds.add(Adw.Toggle(label=AC_SPEEDS[i], name=str(i)))
+            self.speed_box.set_visible(bool(m['speeds']))
+            if m['speeds']:
+                self.speeds.set_active_name(str(st['speed']))
+            self.swing_row.set_visible(c['swing'])
+            self.swing_row.set_active(st['swing'])
+            if m['temps']:
+                self.temp_label.set_label('%d °C' % st['temp'])
+                self.minus.set_sensitive(st['temp'] > m['temps'][0])
+                self.plus.set_sensitive(st['temp'] < m['temps'][1])
+            else:
+                self.temp_label.set_label('—')
+                self.minus.set_sensitive(False)
+                self.plus.set_sensitive(False)
+        else:
+            self.temp_label.set_label('—')
+        on = st['power']
+        self.power.set_label('Turn off' if on else 'Turn on')
+        self.power.remove_css_class('destructive-action' if not on else 'suggested-action')
+        self.power.add_css_class('destructive-action' if on else 'suggested-action')
+        self.temp_label.set_opacity(1.0 if on else 0.5)
+        self.updating = False
+
+    def save(self):
+        remote = self.picker.remote
+        states = self.app.state.get('ac_state', {})
+        states[str(remote)] = self.st
+        self.app.state.set('ac_state', states)
+
+    def send(self, key):
+        if not self.binary:
+            return
+        try:
+            self.app.blaster.send(self.app.ac.encode(self.binary, key, self.st))
+        except ValueError as e:
+            self.app.toast(str(e))
+
+    def toggle_power(self):
+        self.st['power'] = not self.st['power']
+        self.save()
+        self.refresh()
+        # the power key sends the state with power on / off
+        self.send(AC_KEY_POWER)
+
+    def change_temp(self, d):
+        m = self.caps[self.st['mode']]
+        if not m['temps']:
+            return
+        self.st['temp'] = min(max(self.st['temp'] + d, m['temps'][0]), m['temps'][1])
+        self.after_change(AC_KEY_TEMP_UP if d > 0 else AC_KEY_TEMP_DOWN)
+
+    def set_field(self, field, value, key):
+        if self.updating or value is None:
+            return
+        if field in ('mode', 'speed'):
+            value = int(value)
+        if self.st[field] == value:
+            return
+        self.st[field] = value
+        self.fit_state()
+        self.after_change(key)
+
+    def after_change(self, key):
+        self.save()
+        self.refresh()
+        # an AC only listens while on; changes while off are kept for later
+        if self.st['power']:
+            self.send(key)
+
+
+def size_row(title, subtitle, lo, hi, value, on_change):
+    """a slider in percent, snapping to 5 %"""
+    row = Adw.PreferencesRow(activatable=False)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=12, margin_bottom=6,
+                  margin_start=12, margin_end=12)
+    head = Gtk.Label(label=title, xalign=0)
+    sub = Gtk.Label(label=subtitle, xalign=0, wrap=True)
+    sub.add_css_class('dim-label')
+    sub.add_css_class('caption')
+    adj = Gtk.Adjustment(lower=lo, upper=hi, step_increment=5, page_increment=25, value=value)
+    scale = Gtk.Scale(adjustment=adj, hexpand=True, draw_value=True, digits=0,
+                      value_pos=Gtk.PositionType.RIGHT)
+    scale.set_format_value_func(lambda s, v: '%d %%' % v)
+    for m in range(lo, hi + 1, 25):
+        scale.add_mark(m, Gtk.PositionType.BOTTOM, None)
+
+    def changed(a):
+        v = round(a.get_value() / 5) * 5
+        if v != a.get_value():
+            a.set_value(v)
+            return
+        on_change(v)
+    adj.connect('value-changed', changed)
+    for w in (head, sub, scale):
+        box.append(w)
+    row.set_child(box)
+    return row, adj
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.window = None
+        for name, cb in (('preferences', self.show_preferences), ('about', self.show_about)):
+            a = Gio.SimpleAction(name=name)
+            a.connect('activate', lambda *_, cb=cb: cb())
+            self.add_action(a)
+        self.set_accels_for_action('app.preferences', ['<Control>comma'])
+
+    def do_activate(self):
+        if self.window:
+            self.window.present()
+            return
+        self.state = State()
+        self.sizer = Sizer(self.state)
+        self.db = Db()
+        self.ac = AcDecoder()
+        self.blaster = Blaster(self.toast)
+
+        self.window = Adw.ApplicationWindow(application=self, title='Remote Control',
+                                            default_width=420, default_height=760)
+        self.toasts = Adw.ToastOverlay()
+        stack = Adw.ViewStack()
+        stack.add_titled_with_icon(TvPage(self), 'tv', 'TV', 'video-display-symbolic')
+        stack.add_titled_with_icon(AcPage(self), 'ac', 'Air Conditioner', 'weather-few-clouds-symbolic')
+        stack.set_visible_child_name(self.state.get('page', 'tv'))
+        stack.connect('notify::visible-child-name',
+                      lambda s, _: self.state.set('page', s.get_visible_child_name()))
+
+        menu = Gio.Menu()
+        menu.append('Preferences', 'app.preferences')
+        menu.append('About Remote Control', 'app.about')
+        header = Adw.HeaderBar(title_widget=Adw.WindowTitle(title='Remote Control'))
+        header.pack_end(Gtk.MenuButton(icon_name='open-menu-symbolic', menu_model=menu,
+                                       primary=True, tooltip_text='Main Menu'))
+        bar = Adw.ViewSwitcherBar(stack=stack, reveal=True)
+        view = Adw.ToolbarView(content=stack)
+        view.add_top_bar(header)
+        view.add_bottom_bar(bar)
+        self.toasts.set_child(view)
+        self.window.set_content(self.toasts)
+        self.sizer.apply()
+        self.window.maximize()	# a phone app
+        self.window.present()
+
+    def show_preferences(self):
+        dlg = Adw.PreferencesDialog(title='Preferences')
+        page = Adw.PreferencesPage(title='Display', icon_name='preferences-desktop-display-symbolic')
+        group = Adw.PreferencesGroup(title='Size', description='Changes show behind this dialog right away.')
+        size, size_adj = size_row('Buttons', 'Size of the keys, controls and text', *SIZE_RANGE,
+                                  self.sizer.size, lambda v: self.sizer.set(size=v))
+        space, space_adj = size_row('Spacing', 'Room between the keys', *SPACING_RANGE,
+                                    self.sizer.spacing, lambda v: self.sizer.set(spacing=v))
+        group.add(size)
+        group.add(space)
+        reset = Adw.ButtonRow(title='Restore Defaults')
+        reset.connect('activated', lambda _: (size_adj.set_value(SIZE_DEFAULT),
+                                              space_adj.set_value(SPACING_DEFAULT)))
+        group.add(reset)
+        page.add(group)
+        dlg.add(page)
+        dlg.present(self.window)
+
+    def show_about(self):
+        about = Adw.AboutDialog(application_name='Remote Control', application_icon=APP_ID,
+                                version=VERSION, developer_name='cezanne port',
+                                comments='TV and air conditioner remote for the IR blaster.',
+                                license_type=Gtk.License.MIT_X11,
+                                website='https://github.com/irext')
+        about.add_credit_section('IR codes and decoder', ['IRext https://github.com/irext'])
+        about.present(self.window)
+
+    def toast(self, text):
+        if self.window:
+            self.toasts.add_toast(Adw.Toast(title=text))
+        return False
+
+
+if __name__ == '__main__':
+    sys.exit(App().run(sys.argv))

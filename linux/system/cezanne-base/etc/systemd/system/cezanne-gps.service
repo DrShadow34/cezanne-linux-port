@@ -1,0 +1,12 @@
+[Unit]
+Description=GNSS data link (cezanne, MediaTek CONNSYS GPS: /dev/gpsdl0 L1, /dev/gpsdl1 L5)
+After=cezanne-wifi.service
+Requires=cezanne-wifi.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/modprobe gps_drv_dl_v010
+
+[Install]
+WantedBy=multi-user.target

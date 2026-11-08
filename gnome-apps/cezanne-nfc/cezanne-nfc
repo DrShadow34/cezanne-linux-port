@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""NFC tags and cards for the cezanne (NXP SN100U, mainline nxp-nci + neard):
+read a tag or card, keep it in a list, write links / text / Wi-Fi / contacts
+to writable tags, and copy a saved tag onto another one.
+
+NDEF data, tag types and writing go through neard (org.neard, system bus).
+What neard does not tell, the card's ATQA / SAK / ATS (enough to name the
+chip family), comes from the kernel's NFC netlink API: the target list may
+be read and its events received by any user; polling stays with neard.
+While the window is open the reader polls even when the NFC switch in Quick
+Settings (cezanne-nfc extension) is off; it is put back on close.
+"""
+import datetime
+import json
+import os
+import select
+import socket
+import struct
+import sys
+import uuid
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = 'org.cezanne.Nfc'
+VERSION = '1.0'
+DATA_FILE = os.path.join(GLib.get_user_data_dir(), 'cezanne-nfc', 'tags.json')
+
+NEARD = 'org.neard'
+ADAPTER_IFACE, TAG_IFACE, DEVICE_IFACE, RECORD_IFACE = (
+    'org.neard.Adapter', 'org.neard.Tag', 'org.neard.Device', 'org.neard.Record')
+PROPS_IFACE, OM_IFACE = 'org.freedesktop.DBus.Properties', 'org.freedesktop.DBus.ObjectManager'
+RECORD_WAIT_MS = 600	# records come in after their tag
+
+# kernel NFC generic netlink (include/uapi/linux/nfc.h)
+NETLINK_GENERIC, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP = 16, 270, 1
+GENL_ID_CTRL, CTRL_CMD_GETFAMILY = 0x10, 3
+CTRL_ATTR_FAMILY_ID, CTRL_ATTR_FAMILY_NAME, CTRL_ATTR_MCAST_GROUPS = 1, 2, 7
+NLM_F_REQUEST, NLM_F_DUMP, NLMSG_ERROR, NLMSG_DONE = 1, 0x300, 2, 3
+NFC_CMD_GET_TARGET, NFC_EVENT_TARGETS_FOUND = 8, 9
+A_DEV_INDEX, A_PROTOCOLS, A_TARGET_INDEX = 1, 3, 4
+A_SENS_RES, A_SEL_RES, A_NFCID1, A_SENSB, A_SENSF = 5, 6, 7, 8, 9
+A_ISO15693_DSFID, A_ISO15693_UID, A_ATS = 26, 27, 32
+
+TAG_TYPES = {
+    'Type 1': 'NFC Forum Type 1 (Topaz)',
+    'Type 2': 'NFC Forum Type 2',
+    'Type 3': 'NFC Forum Type 3 (FeliCa)',
+    'Type 4': 'NFC Forum Type 4 (ISO-DEP)',
+    'Type 4A': 'NFC Forum Type 4A (ISO-DEP)',
+    'Type 4B': 'NFC Forum Type 4B (ISO-DEP)',
+    'Type 5': 'NFC Forum Type 5 (ISO 15693)',
+}
+
+WRITE_KINDS = [
+    ('Link', 'web-browser-symbolic'),
+    ('Text', 'format-text-plain-symbolic'),
+    ('Phone number', 'call-start-symbolic'),
+    ('Email', 'mail-unread-symbolic'),
+    ('Wi-Fi network', 'network-wireless-symbolic'),
+    ('Contact', 'avatar-default-symbolic'),
+]
+
+
+def hexs(data, sep=':'):
+    return sep.join(f'{b:02X}' for b in data)
+
+
+def chip_name(t):
+    """the chip family from the kernel's target data (ATQA / SAK for NFC-A)"""
+    if A_SENSF in t:
+        return 'FeliCa'
+    if A_ISO15693_UID in t:
+        return 'ISO 15693 (vicinity) tag'
+    if A_SENSB in t:
+        return 'ISO 14443-B card'
+    sak = t.get(A_SEL_RES)
+    atqa = t.get(A_SENS_RES)
+    if sak is None:
+        return None
+    if sak == 0x00:
+        return 'MIFARE Ultralight / NTAG' if atqa == 0x0044 else 'ISO 14443-3A tag'
+    known = {
+        0x08: 'MIFARE Classic 1K', 0x88: 'MIFARE Classic 1K', 0x18: 'MIFARE Classic 4K',
+        0x09: 'MIFARE Mini', 0x10: 'MIFARE Plus 2K', 0x11: 'MIFARE Plus 4K',
+        0x28: 'Smart card with MIFARE Classic 1K', 0x38: 'Smart card with MIFARE Classic 4K',
+    }
+    if sak in known:
+        return known[sak]
+    if sak & 0x20:
+        return 'MIFARE DESFire' if atqa == 0x0344 else 'ISO 14443-4 smart card'
+    return f'NFC-A, SAK {sak:02X}'
+
+
+class Netlink:
+    """kernel NFC target details: TARGETS_FOUND events, then a target dump"""
+
+    def __init__(self, on_target):
+        self.on_target = on_target
+        self.s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_GENERIC)
+        self.s.bind((0, 0))
+        self.seq = 0
+        self.family, group = self._ctrl_family()
+        self.s.setsockopt(SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, group)
+        GLib.io_add_watch(self.s.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, self._readable)
+        self.dump(0)	# a target already in the field (nfc0)
+
+    def dump(self, dev):
+        self._send(self.family, NFC_CMD_GET_TARGET, self.attr(A_DEV_INDEX, struct.pack('I', dev)),
+                   NLM_F_REQUEST | NLM_F_DUMP)
+
+    @staticmethod
+    def attr(t, data):
+        n = 4 + len(data)
+        return struct.pack('HH', n, t) + data + b'\0' * ((4 - n % 4) % 4)
+
+    @staticmethod
+    def attrs(buf):
+        out = {}
+        while len(buf) >= 4:
+            n, t = struct.unpack_from('HH', buf)
+            if n < 4:
+                break
+            out[t & 0x3fff] = buf[4:n]
+            buf = buf[(n + 3) & ~3:]
+        return out
+
+    def _send(self, fam, cmd, payload, flags=NLM_F_REQUEST):
+        self.seq += 1
+        body = struct.pack('BBH', cmd, 1, 0) + payload
+        self.s.send(struct.pack('IHHII', 16 + len(body), fam, flags, self.seq, 0) + body)
+
+    def _messages(self, data):
+        while len(data) >= 16:
+            n, typ, _, _, _ = struct.unpack_from('IHHII', data)
+            yield typ, data[16:n]
+            data = data[(n + 3) & ~3:]
+
+    def _ctrl_family(self):
+        self._send(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, self.attr(CTRL_ATTR_FAMILY_NAME, b'nfc\0'))
+        r, _, _ = select.select([self.s], [], [], 2)
+        for typ, body in self._messages(self.s.recv(65536) if r else b''):
+            if typ == NLMSG_ERROR:
+                break
+            a = self.attrs(body[4:])
+            fam = struct.unpack('H', a[CTRL_ATTR_FAMILY_ID][:2])[0]
+            for grp in self.attrs(a[CTRL_ATTR_MCAST_GROUPS]).values():
+                g = self.attrs(grp)
+                if g.get(1, b'').rstrip(b'\0') == b'events':
+                    return fam, struct.unpack('I', g[2])[0]
+        raise OSError('no NFC netlink family')
+
+    def _readable(self, *args):
+        try:
+            data = self.s.recv(65536)
+        except OSError:
+            return True
+        for typ, body in self._messages(data):
+            if typ != self.family:
+                continue
+            cmd, a = body[0], self.attrs(body[4:])
+            if cmd == NFC_EVENT_TARGETS_FOUND and A_DEV_INDEX in a:
+                self.dump(struct.unpack('I', a[A_DEV_INDEX][:4])[0])
+            elif cmd == NFC_CMD_GET_TARGET and A_TARGET_INDEX in a:
+                t = {}
+                for k, v in a.items():
+                    if k == A_SENS_RES:
+                        t[k] = struct.unpack('H', v[:2])[0]
+                    elif k in (A_SEL_RES, A_ISO15693_DSFID):
+                        t[k] = v[0]
+                    elif k == A_PROTOCOLS:
+                        t[k] = struct.unpack('I', v[:4])[0]
+                    else:
+                        t[k] = bytes(v)
+                self.on_target(t)
+        return True
+
+
+class Neard:
+    """the first adapter of neard: polling, tags in the field, writing"""
+
+    def __init__(self, on_change, on_tag, on_gone):
+        self.on_change, self.on_tag, self.on_gone = on_change, on_tag, on_gone
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        self.adapter = None
+        self.powered = self.polling = False
+        self.restore = None		# (powered, polling) to put back on close
+        self.tags = {}			# path -> {'props', 'records', 'device'}
+        self.current = None
+        for iface, sig, cb in ((OM_IFACE, 'InterfacesAdded', self._added),
+                               (OM_IFACE, 'InterfacesRemoved', self._removed),
+                               (PROPS_IFACE, 'PropertiesChanged', self._changed)):
+            self.bus.signal_subscribe(NEARD, iface, sig, None, None, 0,
+                                      lambda c, s, p, i, n, params, cb=cb: cb(p, params))
+        self.watch = Gio.bus_watch_name(Gio.BusType.SYSTEM, NEARD,
+                                        Gio.BusNameWatcherFlags.AUTO_START,
+                                        lambda *a: self._appeared(), lambda *a: self._vanished())
+
+    def call(self, path, iface, method, args=None, done=None):
+        def finish(bus, res):
+            try:
+                ret = bus.call_finish(res)
+                err = None
+            except GLib.Error as e:
+                ret, err = None, e
+            if done:
+                done(ret, err)
+        self.bus.call(NEARD, path, iface, method, args, None, 0, 10000, None, finish)
+
+    def _appeared(self):
+        def got(ret, err):
+            if err:
+                return
+            objects = ret.unpack()[0]
+            for path, ifaces in objects.items():
+                if ADAPTER_IFACE in ifaces and not self.adapter:
+                    self._set_adapter(path, ifaces[ADAPTER_IFACE])
+            # a tag already in the field, then its records
+            for path in sorted(objects, key=len):
+                if ADAPTER_IFACE not in objects[path]:
+                    self._add_object(path, objects[path])
+        self.call('/', OM_IFACE, 'GetManagedObjects', None, got)
+
+    def _vanished(self):
+        self.adapter = None
+        self.on_change()
+
+    def _set_adapter(self, path, props):
+        self.adapter = path
+        self.powered = props.get('Powered', False)
+        self.polling = props.get('Polling', False)
+        self.restore = (self.powered, self.polling)
+        self.on_change()
+        self.ensure_polling()
+
+    def ensure_polling(self):
+        if not self.adapter or self.current:
+            return
+        args = GLib.Variant('(ssv)', (ADAPTER_IFACE, 'Powered', GLib.Variant('b', True)))
+        self.call(self.adapter, PROPS_IFACE, 'Set', args,
+                  lambda r, e: self.call(self.adapter, ADAPTER_IFACE, 'StartPollLoop',
+                                         GLib.Variant('(s)', ('Initiator',))))
+
+    def close(self):
+        """back to how the Quick Settings switch left it"""
+        if not self.adapter or not self.restore or self.restore[1]:
+            return
+        try:
+            if self.polling:
+                self.bus.call_sync(NEARD, self.adapter, ADAPTER_IFACE, 'StopPollLoop',
+                                   None, None, 0, 3000, None)
+            if not self.restore[0]:
+                off = GLib.Variant('(ssv)', (ADAPTER_IFACE, 'Powered', GLib.Variant('b', False)))
+                self.bus.call_sync(NEARD, self.adapter, PROPS_IFACE, 'Set', off, None, 0, 3000, None)
+        except GLib.Error:
+            pass
+
+    def _changed(self, path, params):
+        iface, changed, _ = params.unpack()
+        if path == self.adapter and iface == ADAPTER_IFACE:
+            self.powered = changed.get('Powered', self.powered)
+            self.polling = changed.get('Polling', self.polling)
+            self.on_change()
+
+    def _added(self, _path, params):
+        self._add_object(*params.unpack())
+
+    def _add_object(self, path, ifaces):
+        if ADAPTER_IFACE in ifaces and not self.adapter:
+            self._set_adapter(path, ifaces[ADAPTER_IFACE])
+        elif TAG_IFACE in ifaces or DEVICE_IFACE in ifaces:
+            device = DEVICE_IFACE in ifaces
+            self.tags[path] = {'props': ifaces.get(TAG_IFACE, ifaces.get(DEVICE_IFACE)),
+                               'records': [], 'device': device}
+            self.current = path
+            GLib.timeout_add(RECORD_WAIT_MS, self._report, path)
+        elif RECORD_IFACE in ifaces:
+            parent = self.tags.get(path.rsplit('/', 1)[0])
+            if parent is not None:
+                parent['records'].append(ifaces[RECORD_IFACE])
+                if parent.get('reported'):
+                    self.on_tag(path.rsplit('/', 1)[0], parent)
+
+    def _report(self, path):
+        tag = self.tags.get(path)
+        if tag:
+            tag['reported'] = True
+            self.on_tag(path, tag)
+        return False
+
+    def _removed(self, _path, params):
+        path, ifaces = params.unpack()
+        if path in self.tags and (TAG_IFACE in ifaces or DEVICE_IFACE in ifaces):
+            del self.tags[path]
+            if self.current == path:
+                self.current = None
+                self.on_gone(path)
+        elif path == self.adapter and ADAPTER_IFACE in ifaces:
+            self.adapter = None
+            self.on_change()
+
+    def write(self, path, records, done):
+        """records: list of a{sv} dicts of GLib.Variant values"""
+        if len(records) == 1:
+            arg = records[0]
+        else:
+            arg = {'Records': GLib.Variant('aa{sv}', records)}
+        self.call(path, TAG_IFACE, 'Write', GLib.Variant('(a{sv})', (arg,)), lambda r, e: done(e))
+
+
+def record_to_json(r):
+    out = {}
+    for k, v in r.items():
+        if k in ('Size',):
+            continue
+        out[k] = hexs(v, '') if k == 'MIMEPayload' else v
+    return out
+
+
+def record_summary(r):
+    """(title, value, uri or None) for one NDEF record"""
+    kind = r.get('Type', 'Record')
+    if r.get('URI'):
+        uri = r['URI']
+        title = {'tel': 'Phone number', 'mailto': 'Email', 'geo': 'Location',
+                 'sms': 'Message'}.get(uri.split(':', 1)[0], 'Link')
+        if kind == 'SmartPoster':
+            title = 'Smart poster'
+        return title, uri, uri
+    if r.get('Representation'):
+        return 'Text', r['Representation'], None
+    mime = r.get('MIME') or r.get('MIMEType')
+    if mime:
+        payload = r.get('MIMEPayload') or ''
+        if isinstance(payload, (bytes, list)):
+            payload = hexs(payload, '')
+        if mime == 'application/vnd.wfa.wsc':
+            return 'Wi-Fi network', 'Wi-Fi credentials', None
+        if mime.startswith('text/') and payload:
+            try:
+                return mime, bytes.fromhex(payload).decode('utf-8', 'replace').strip(), None
+            except ValueError:
+                pass
+        return 'Data', mime, None
+    if r.get('AAR'):
+        return 'Android app', r['AAR'], None
+    return kind, '', None
+
+
+def record_to_write(r):
+    """a saved record back to neard's Write attributes"""
+    kind = r.get('Type')
+    v = {}
+    if kind in ('URI', 'SmartPoster') and r.get('URI'):
+        v = {'Type': GLib.Variant('s', 'URI'), 'URI': GLib.Variant('s', r['URI'])}
+    elif kind == 'Text':
+        v = {'Type': GLib.Variant('s', 'Text'),
+             'Encoding': GLib.Variant('s', r.get('Encoding') or 'UTF-8'),
+             'Language': GLib.Variant('s', r.get('Language') or 'en'),
+             'Representation': GLib.Variant('s', r.get('Representation', ''))}
+    elif kind == 'MIME' and (r.get('MIME') or r.get('MIMEType')):
+        v = {'Type': GLib.Variant('s', 'MIME'), 'MIME': GLib.Variant('s', r.get('MIME') or r.get('MIMEType'))}
+        if r.get('MIMEPayload'):
+            v['Payload'] = GLib.Variant('ay', bytes.fromhex(r['MIMEPayload']))
+    return v or None
+
+
+class Store:
+    def __init__(self):
+        self.tags = []
+        try:
+            with open(DATA_FILE) as f:
+                self.tags = json.load(f)
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        tmp = DATA_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(self.tags, f, indent=1)
+        os.replace(tmp, DATA_FILE)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='NFC', default_width=540, default_height=1100)
+        self.store = Store()
+        self.shown = None		# the tag on the Read page, as saved
+        self.pending_write = None	# records waiting for a tag
+        self.targets = {}		# uid hex -> kernel target data
+
+        self.toasts = Adw.ToastOverlay()
+        self.nav = Adw.NavigationView()
+        self.toasts.set_child(self.nav)
+        self.set_content(self.toasts)
+
+        self.stack = Adw.ViewStack()
+        self.stack.add_titled_with_icon(self._read_page(), 'read', 'Read', 'find-location-symbolic')
+        self.stack.add_titled_with_icon(self._write_page(), 'write', 'Write', 'document-edit-symbolic')
+        self.stack.add_titled_with_icon(self._saved_page(), 'saved', 'Saved', 'starred-symbolic')
+        header = Adw.HeaderBar()
+        menu = Gio.Menu()
+        menu.append('About NFC', 'app.about')
+        header.pack_end(Gtk.MenuButton(icon_name='open-menu-symbolic', menu_model=menu))
+        view = Adw.ToolbarView(content=self.stack)
+        view.add_top_bar(header)
+        view.add_bottom_bar(Adw.ViewSwitcherBar(stack=self.stack, reveal=True))
+        self.nav.add(Adw.NavigationPage(child=view, title='NFC', tag='main'))
+
+        try:
+            self.netlink = Netlink(self._kernel_target)
+        except OSError as e:
+            print(f'nfc netlink: {e}', file=sys.stderr)
+        self.neard = Neard(self._adapter_changed, self._tag, self._gone)
+        self.connect('close-request', lambda *a: self.neard.close() or False)
+        self._adapter_changed()
+        self._refresh_saved()
+
+    # --- Read ---------------------------------------------------------
+    def _read_page(self):
+        self.read_status = Adw.StatusPage(icon_name='find-location-symbolic', title='Hold a tag near the camera',
+                                          description='Tags and cards are read on the back, next to the camera.')
+        self.read_details = Adw.PreferencesPage()
+        self.read_card = Adw.PreferencesGroup(title='Tag')
+        self.read_data = Adw.PreferencesGroup(title='Data')
+        self.read_details.add(self.read_card)
+        self.read_details.add(self.read_data)
+        save = Adw.ButtonRow(title='Save', start_icon_name='starred-symbolic')
+        save.add_css_class('suggested-action')
+        save.connect('activated', self._save_shown)
+        actions = Adw.PreferencesGroup()
+        actions.add(save)
+        self.read_details.add(actions)
+        self.read_card_rows, self.read_data_rows = [], []
+        self.read_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.read_stack.add_named(self.read_status, 'wait')
+        self.read_stack.add_named(self.read_details, 'tag')
+        return self.read_stack
+
+    def _adapter_changed(self):
+        n = self.neard
+        if not n.adapter:
+            self.read_status.set_title('NFC is not available')
+            self.read_status.set_description('neard has no NFC adapter.')
+        elif self.pending_write:
+            self.read_status.set_title('Hold a writable tag near the camera')
+        else:
+            self.read_status.set_title('Hold a tag near the camera')
+            self.read_status.set_description('Tags and cards are read on the back, next to the camera.')
+
+    def _kernel_target(self, t):
+        uid = t.get(A_NFCID1) or t.get(A_ISO15693_UID)
+        if uid:
+            self.targets[hexs(uid, '')] = t
+            if self.shown and self.shown.get('uid') == hexs(uid) and not self.shown.get('chip'):
+                self._fill_kernel(self.shown, t)
+                self._show(self.shown)
+
+    @staticmethod
+    def _fill_kernel(entry, t):
+        entry['chip'] = chip_name(t)
+        if A_SENS_RES in t:
+            entry['atqa'] = f'{t[A_SENS_RES]:04X}'
+        if A_SEL_RES in t:
+            entry['sak'] = f'{t[A_SEL_RES]:02X}'
+        if A_ATS in t:
+            entry['ats'] = hexs(t[A_ATS], ' ')
+
+    def _entry(self, tag):
+        p = tag['props']
+        uid = bytes(p.get('Uid', b''))
+        entry = {
+            'id': str(uuid.uuid4()),
+            'device': tag['device'],
+            'type': p.get('Type'), 'protocol': p.get('Protocol'),
+            'readonly': p.get('ReadOnly', False),
+            'uid': hexs(uid) if uid else None,
+            'records': [record_to_json(r) for r in tag['records']],
+        }
+        t = self.targets.get(hexs(uid, '')) if uid else None
+        if t:
+            self._fill_kernel(entry, t)
+        return entry
+
+    def _tag(self, path, tag):
+        if self.pending_write and not tag['device']:
+            self._do_write(path)
+            return
+        self.shown = self._entry(tag)
+        self.stack.set_visible_child_name('read')
+        self._show(self.shown)
+
+    def _gone(self, path):
+        if self.shown:
+            self.read_card.set_description('Last read; the tag has left the field.')
+
+    def _rows(self, group, rows, items):
+        for r in rows:
+            group.remove(r)
+        rows.clear()
+        for title, value, uri in items:
+            row = Adw.ActionRow(title=title, subtitle=value, subtitle_selectable=True, use_markup=False)
+            row.add_css_class('property')
+            if uri:
+                b = Gtk.Button(icon_name='external-link-symbolic', valign=Gtk.Align.CENTER,
+                               tooltip_text='Open')
+                b.add_css_class('flat')
+                b.connect('clicked', lambda b, u=uri: Gtk.UriLauncher(uri=u).launch(self, None, None))
+                row.add_suffix(b)
+            if value:
+                b = Gtk.Button(icon_name='edit-copy-symbolic', valign=Gtk.Align.CENTER, tooltip_text='Copy')
+                b.add_css_class('flat')
+                b.connect('clicked', lambda b, v=value: self._copy(v))
+                row.add_suffix(b)
+            group.add(row)
+            rows.append(row)
+
+    def _card_items(self, e):
+        if e.get('device'):
+            kind = 'NFC device (peer to peer)'
+        elif e.get('records'):
+            kind = TAG_TYPES.get(e.get('type'), e.get('type') or 'Tag')
+        elif e.get('protocol') == 'ISO-DEP':
+            kind = 'Contactless card'
+        else:
+            kind = f"{TAG_TYPES.get(e.get('type'), e.get('type') or 'Tag')}, empty"
+        items = [('Kind', kind, None)]
+        if e.get('chip'):
+            items.append(('Chip', e['chip'], None))
+        if e.get('protocol'):
+            items.append(('Protocol', e['protocol'], None))
+        if e.get('uid'):
+            items.append(('UID', e['uid'], None))
+        if e.get('atqa'):
+            items.append(('ATQA / SAK', f"{e['atqa']} / {e.get('sak', '-')}", None))
+        if e.get('ats'):
+            items.append(('ATS', e['ats'], None))
+        if not e.get('device'):
+            items.append(('Writable', 'No' if e.get('readonly') else 'Yes', None))
+        return items
+
+    def _show(self, e):
+        self.read_card.set_title(e.get('name') or 'Tag')
+        self.read_card.set_description(None)
+        self._rows(self.read_card, self.read_card_rows, self._card_items(e))
+        recs = [record_summary(r) for r in e.get('records', [])]
+        self.read_data.set_visible(bool(recs))
+        self._rows(self.read_data, self.read_data_rows, recs)
+        self.read_stack.set_visible_child_name('tag')
+
+    def _copy(self, text):
+        Gdk.Display.get_default().get_clipboard().set(text)
+        self.toasts.add_toast(Adw.Toast(title='Copied'))
+
+    def _save_shown(self, *a):
+        if not self.shown:
+            return
+        e = dict(self.shown, id=str(uuid.uuid4()),
+                 saved=datetime.datetime.now().isoformat(timespec='seconds'))
+        first = record_summary(e['records'][0])[1] if e['records'] else None
+        e['name'] = (first or e.get('chip') or self._card_items(e)[0][1])[:60]
+        self.store.tags.insert(0, e)
+        self.store.save()
+        self._refresh_saved()
+        self.toasts.add_toast(Adw.Toast(title=f"Saved as “{e['name']}”"))
+
+    # --- Write --------------------------------------------------------
+    def _write_page(self):
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(title='New tag content',
+                                     description='Written as NDEF; phones open links and join Wi-Fi from it.')
+        self.kind_row = Adw.ComboRow(title='Content', model=Gtk.StringList.new([k for k, _ in WRITE_KINDS]))
+        group.add(self.kind_row)
+        self.fields = {}
+        for key, title in (('value', 'Link'), ('name', 'Name'), ('phone', 'Phone'), ('email', 'Email')):
+            row = Adw.EntryRow(title=title)
+            group.add(row)
+            self.fields[key] = row
+        self.fields['password'] = Adw.PasswordEntryRow(title='Password')
+        group.add(self.fields['password'])
+        page.add(group)
+        actions = Adw.PreferencesGroup()
+        self.write_button = Adw.ButtonRow(title='Write to tag', start_icon_name='document-edit-symbolic')
+        self.write_button.add_css_class('suggested-action')
+        self.write_button.connect('activated', lambda *a: self._start_write(self._compose()))
+        actions.add(self.write_button)
+        page.add(actions)
+        self.kind_row.connect('notify::selected', lambda *a: self._kind_changed())
+        self._kind_changed()
+        return page
+
+    def _kind_changed(self):
+        kind = WRITE_KINDS[self.kind_row.get_selected()][0]
+        show = {
+            'Link': {'value': 'Web address'}, 'Text': {'value': 'Text'},
+            'Phone number': {'value': 'Phone number'}, 'Email': {'value': 'Email address'},
+            'Wi-Fi network': {'value': 'Network name (SSID)', 'password': 'Password'},
+            'Contact': {'name': 'Name', 'phone': 'Phone', 'email': 'Email'},
+        }[kind]
+        for key, row in self.fields.items():
+            row.set_visible(key in show)
+            if key in show:
+                row.set_title(show[key])
+
+    def _compose(self):
+        kind = WRITE_KINDS[self.kind_row.get_selected()][0]
+        value = self.fields['value'].get_text().strip()
+        s = lambda x: GLib.Variant('s', x)  # noqa: E731
+        if kind == 'Contact':
+            name = self.fields['name'].get_text().strip()
+            if not name:
+                return None
+            vcard = ['BEGIN:VCARD', 'VERSION:3.0', f'FN:{name}', f'N:{name};;;;']
+            if self.fields['phone'].get_text().strip():
+                vcard.append(f"TEL:{self.fields['phone'].get_text().strip()}")
+            if self.fields['email'].get_text().strip():
+                vcard.append(f"EMAIL:{self.fields['email'].get_text().strip()}")
+            vcard.append('END:VCARD')
+            return [{'Type': s('MIME'), 'MIME': s('text/vcard'),
+                     'Payload': GLib.Variant('ay', ('\r\n'.join(vcard) + '\r\n').encode())}]
+        if not value:
+            return None
+        if kind == 'Link':
+            if '://' not in value:
+                value = 'https://' + value
+            return [{'Type': s('URI'), 'URI': s(value)}]
+        if kind == 'Text':
+            return [{'Type': s('Text'), 'Encoding': s('UTF-8'), 'Language': s('en'),
+                     'Representation': s(value)}]
+        if kind == 'Phone number':
+            return [{'Type': s('URI'), 'URI': s('tel:' + value.replace(' ', ''))}]
+        if kind == 'Email':
+            return [{'Type': s('URI'), 'URI': s('mailto:' + value)}]
+        if kind == 'Wi-Fi network':
+            return [{'Type': s('MIME'), 'MIME': s('application/vnd.wfa.wsc'), 'SSID': s(value),
+                     'Passphrase': s(self.fields['password'].get_text())}]
+        return None
+
+    def _start_write(self, records):
+        if not records:
+            self.toasts.add_toast(Adw.Toast(title='Fill in the content first'))
+            return
+        self.pending_write = records
+        self.dialog = Adw.AlertDialog(heading='Hold a tag near the camera',
+                                      body='The content is written to the next writable tag.')
+        self.dialog.add_response('cancel', 'Cancel')
+        self.dialog.connect('response', lambda d, r: self._cancel_write())
+        self.dialog.present(self)
+        self._adapter_changed()
+        # a tag already in the field
+        if self.neard.current and not self.neard.tags[self.neard.current]['device']:
+            self._do_write(self.neard.current)
+
+    def _cancel_write(self):
+        self.pending_write = None
+        self._adapter_changed()
+
+    def _do_write(self, path):
+        records, self.pending_write = self.pending_write, None
+
+        def done(err):
+            self.dialog.force_close()
+            self._adapter_changed()
+            msg = 'Written' if not err else f"Could not write: {err.message.split(': ')[-1]}"
+            self.toasts.add_toast(Adw.Toast(title=msg))
+        self.neard.write(path, records, done)
+
+    # --- Saved --------------------------------------------------------
+    def _saved_page(self):
+        self.saved_page = Adw.PreferencesPage()
+        self.saved_group = Adw.PreferencesGroup()
+        self.saved_page.add(self.saved_group)
+        self.saved_empty = Adw.StatusPage(icon_name='starred-symbolic', title='No saved tags',
+                                          description='Read a tag and press Save to keep it here.')
+        self.saved_stack = Gtk.Stack()
+        self.saved_stack.add_named(self.saved_empty, 'empty')
+        self.saved_stack.add_named(self.saved_page, 'list')
+        self.saved_rows = []
+        return self.saved_stack
+
+    def _refresh_saved(self):
+        for r in self.saved_rows:
+            self.saved_group.remove(r)
+        self.saved_rows = []
+        for e in self.store.tags:
+            when = e.get('saved', '').replace('T', ' ')[:16]
+            row = Adw.ActionRow(title=e.get('name') or 'Tag', use_markup=False, activatable=True,
+                                subtitle=f"{self._card_items(e)[0][1]} · {when}")
+            row.add_suffix(Gtk.Image(icon_name='go-next-symbolic'))
+            row.connect('activated', lambda r, e=e: self._open_saved(e))
+            self.saved_group.add(row)
+            self.saved_rows.append(row)
+        self.saved_stack.set_visible_child_name('list' if self.store.tags else 'empty')
+
+    def _open_saved(self, e):
+        page = Adw.PreferencesPage()
+        name = Adw.PreferencesGroup()
+        name_row = Adw.EntryRow(title='Name', text=e.get('name') or '', show_apply_button=True)
+
+        def rename(row):
+            e['name'] = row.get_text().strip() or e.get('name')
+            self.store.save()
+            self._refresh_saved()
+        name_row.connect('apply', rename)
+        name.add(name_row)
+        page.add(name)
+        card = Adw.PreferencesGroup(title='Tag', description=f"Saved {e.get('saved', '').replace('T', ' ')}")
+        rows = []
+        self._rows(card, rows, self._card_items(e))
+        page.add(card)
+        recs = [record_summary(r) for r in e.get('records', [])]
+        if recs:
+            data = Adw.PreferencesGroup(title='Data')
+            self._rows(data, [], recs)
+            page.add(data)
+        actions = Adw.PreferencesGroup()
+        writable = [w for w in (record_to_write(r) for r in e.get('records', [])) if w]
+        if writable:
+            b = Adw.ButtonRow(title='Write copy to a tag', start_icon_name='document-edit-symbolic')
+            b.add_css_class('suggested-action')
+            b.connect('activated', lambda *a: self._start_write(writable))
+            actions.add(b)
+        delete = Adw.ButtonRow(title='Delete', start_icon_name='user-trash-symbolic')
+        delete.add_css_class('destructive-action')
+
+        def remove(*a):
+            self.store.tags = [t for t in self.store.tags if t.get('id') != e.get('id')]
+            self.store.save()
+            self._refresh_saved()
+            self.nav.pop()
+        delete.connect('activated', remove)
+        actions.add(delete)
+        page.add(actions)
+        view = Adw.ToolbarView(content=page)
+        view.add_top_bar(Adw.HeaderBar())
+        self.nav.push(Adw.NavigationPage(child=view, title=e.get('name') or 'Tag'))
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        about = Gio.SimpleAction.new('about', None)
+        about.connect('activate', self._about)
+        self.add_action(about)
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+    def _about(self, *a):
+        Adw.AboutDialog(application_name='NFC', application_icon=APP_ID, version=VERSION,
+                        comments='Read, save and write NFC tags (neard, NXP SN100U).',
+                        license_type=Gtk.License.MIT_X11).present(self.props.active_window)
+
+
+if __name__ == '__main__':
+    sys.exit(App().run(sys.argv))

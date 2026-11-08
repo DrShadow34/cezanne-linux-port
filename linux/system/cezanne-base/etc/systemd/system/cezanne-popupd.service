@@ -1,0 +1,13 @@
+[Unit]
+Description=Pop-up front camera daemon
+After=systemd-modules-load.service
+# the motor and hall sensor modules load via udev / modules-load.d
+
+[Service]
+ExecStartPre=/usr/bin/modprobe -a pwm-mediatek popup-motor ak09970
+ExecStart=/usr/local/bin/cezanne-popupd
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

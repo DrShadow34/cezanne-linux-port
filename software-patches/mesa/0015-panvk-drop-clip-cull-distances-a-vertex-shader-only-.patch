@@ -1,0 +1,146 @@
+From a22c57e9fa21e3e7523f8339f544f7c42dcf514e Mon Sep 17 00:00:00 2001
+From: arch-port <26345330+DrShadow34@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:39:59 +0100
+Subject: [PATCH] panvk: drop clip / cull distances a vertex shader only sets
+ to 0
+
+v9 emulates clip / cull distances with a fragment discard (0007), which
+costs early ZS and forward pixel kill. DXVK's D3D9 vertex shaders write
+all six user clip planes, 0.0 for the disabled ones (a specialization
+constant in its optimized pipelines): 97% of the draws of a D3D9 game
+paid for planes it never enabled. Components a vertex shader only ever
+sets to a constant >= 0 never clip or cull: they leave the clip / cull
+mask, and without a live one the stores go too (six fewer varyings per
+vertex) and the fragment shaders run without the discard.
+
+Ziggurat (Unity, D3D9, DXVK) title screen at 2400x1080: 14.7 -> 25 fps.
+CTS clipping.*: unchanged (152 pass, the 28 mixed clip + cull fails).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013fD3if93WntovhmD8fGa8C
+---
+ src/panfrost/vulkan/panvk_vX_shader.c | 102 +++++++++++++++++++++++++-
+ 1 file changed, 99 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 5719a40..1cb6ccf 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -1516,15 +1516,111 @@ panvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
+ 
+ static const struct vk_shader_ops panvk_shader_ops;
+ 
++/* clip (bits 0-7) / cull (8-15) distance component a store_output writes,
++ * -1 if not one, or if unknown (indirect) */
++static int
++clip_cull_component(const nir_shader *nir, nir_intrinsic_instr *intr,
++                    unsigned c)
++{
++   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++   nir_src *offset = nir_get_io_offset_src(intr);
++   unsigned base;
++
++   if (sem.location == VARYING_SLOT_CLIP_DIST0 ||
++       sem.location == VARYING_SLOT_CLIP_DIST1)
++      base = (sem.location - VARYING_SLOT_CLIP_DIST0) * 4;
++   else if (sem.location == VARYING_SLOT_CULL_DIST0 ||
++            sem.location == VARYING_SLOT_CULL_DIST1)
++      base = 8 + (sem.location - VARYING_SLOT_CULL_DIST0) * 4;
++   else
++      return -1;
++
++   if (!nir_src_is_const(*offset))
++      return -2;
++
++   unsigned i = base + nir_src_as_uint(*offset) * 4 +
++                nir_intrinsic_component(intr) + c;
++   /* cull distances in the clip array (combined) */
++   if (i < 8 && i >= nir->info.clip_distance_array_size)
++      i = 8 + i - nir->info.clip_distance_array_size;
++   return i < 16 ? (int)i : -2;
++}
++
++static bool
++gather_live_clip_cull(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   uint16_t *live = data;
++
++   if (intr->intrinsic != nir_intrinsic_store_output)
++      return false;
++
++   u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
++      int i = clip_cull_component(b->shader, intr, c);
++      if (i == -1)
++         return false;
++      if (i < 0) {
++         *live = 0xffff;
++         return false;
++      }
++
++      nir_scalar s = nir_scalar_resolved(intr->src[0].ssa, c);
++      if (!nir_scalar_is_const(s) || !(nir_scalar_as_float(s) >= 0.0))
++         *live |= BITFIELD_BIT(i);
++   }
++
++   return false;
++}
++
++static bool
++remove_clip_cull_stores(nir_builder *b, nir_intrinsic_instr *intr,
++                        UNUSED void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_store_output ||
++       clip_cull_component(b->shader, intr, 0) == -1)
++      return false;
++
++   nir_instr_remove(&intr->instr);
++   return true;
++}
++
++/* Clip / cull distance components a vertex shader only ever sets to a
++ * constant >= 0 never clip or cull anything. DXVK's D3D9 shaders write all
++ * six user clip planes, 0.0 for the disabled ones (a specialization
++ * constant in its optimized pipelines): without a live component the
++ * stores go, and the fragment shaders keep early ZS and forward pixel kill
++ * (no clip / cull discard, see lower_clip_cull_fs()). */
++static uint16_t
++live_clip_cull_mask(nir_shader *nir)
++{
++   uint16_t mask = BITFIELD_MASK(nir->info.clip_distance_array_size) |
++                   BITFIELD_MASK(nir->info.cull_distance_array_size) << 8;
++   uint16_t live = 0;
++
++   if (!mask)
++      return 0;
++
++   nir_shader_intrinsics_pass(nir, gather_live_clip_cull, nir_metadata_all,
++                              &live);
++   if (live & mask)
++      return mask & live;
++
++   NIR_PASS(_, nir, nir_shader_intrinsics_pass, remove_clip_cull_stores,
++            nir_metadata_control_flow, NULL);
++   nir->info.clip_distance_array_size = 0;
++   nir->info.cull_distance_array_size = 0;
++   nir->info.outputs_written &=
++      ~(VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1 |
++        VARYING_BIT_CULL_DIST0 | VARYING_BIT_CULL_DIST1);
++   return 0;
++}
++
+ /* hardware vertex shader variant: varying layout, clip / cull distances */
+ static void
+ prepare_hw_vs(struct panvk_shader_variant *variant, nir_shader *nir,
+               struct pan_compile_inputs *inputs,
+               struct pan_varying_layout *varying_layout)
+ {
+-   variant->vs.clip_cull_mask =
+-      BITFIELD_MASK(nir->info.clip_distance_array_size) |
+-      BITFIELD_MASK(nir->info.cull_distance_array_size) << 8;
++   variant->vs.clip_cull_mask = live_clip_cull_mask(nir);
+    pan_varying_collect_formats(varying_layout, nir, inputs->gpu_id,
+                                inputs->trust_varying_flat_highp_types, true);
+    pan_build_varying_layout_compact(varying_layout, nir, inputs->gpu_id);
+-- 
+2.56.0
+

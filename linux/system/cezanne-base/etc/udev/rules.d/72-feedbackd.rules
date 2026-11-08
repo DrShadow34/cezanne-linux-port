@@ -1,0 +1,9 @@
+# Overrides feedbackd's /usr/lib/udev/rules.d/72-feedbackd.rules (same name).
+# feedbackd gets the AW8697 vibrator and the notification light (left AW2015,
+# rgb:status); the right one (rgb:indicator, pop-up glow) stays with
+# 64-cezanne-rgb.rules. Arch ships fbd-ledctrl in /usr/lib, not /usr/libexec;
+# group video instead of feedbackd (the session user is in video).
+ACTION=="remove", GOTO="feedbackd_end"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", SUBSYSTEMS=="input", ATTRS{name}=="aw8697-haptics", TAG+="uaccess", ENV{FEEDBACKD_TYPE}="vibra"
+SUBSYSTEM=="leds", KERNEL=="rgb:status", ENV{FEEDBACKD_TYPE}="led", RUN{builtin}+="kmod load ledtrig-pattern", RUN+="/usr/lib/fbd-ledctrl -p %S%p -t pattern -G video"
+LABEL="feedbackd_end"

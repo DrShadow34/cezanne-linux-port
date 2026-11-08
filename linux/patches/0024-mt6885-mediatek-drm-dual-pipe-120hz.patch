@@ -1,0 +1,1029 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 8e3999102..9e10f5e1c 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -16,6 +16,7 @@
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_framebuffer.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
+@@ -66,6 +67,14 @@ struct mtk_crtc {
+ 	 * update is sent as one frame (single-shot mutex + DSI trigger).
+ 	 */
+ 	struct device			*cmd_dsi;
++	/*
++	 * Dual pipe: dual_comp[] drives the right half of the screen and
++	 * joins ddp_comp[] at index dual_join (DSC); up to there both pipes
++	 * run at half the width and every plane is split between them.
++	 */
++	struct mtk_ddp_comp		**dual_comp;
++	unsigned int			dual_comp_nr;
++	unsigned int			dual_join;
+ 	struct mtk_mutex		*mutex;
+ 	unsigned int			ddp_comp_nr;
+ 	unsigned int			num_conn_routes;
+@@ -233,7 +242,7 @@ static int mtk_crtc_ddp_clk_enable(struct mtk_crtc *mtk_crtc)
+ {
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	int ret;
+-	int i;
++	int i, j;
+ 
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 		ret = mtk_ddp_comp_clk_enable(mtk_crtc->ddp_comp[i]);
+@@ -243,7 +252,18 @@ static int mtk_crtc_ddp_clk_enable(struct mtk_crtc *mtk_crtc)
+ 		}
+ 	}
+ 
++	for (j = 0; j < mtk_crtc->dual_comp_nr; j++) {
++		ret = mtk_ddp_comp_clk_enable(mtk_crtc->dual_comp[j]);
++		if (ret) {
++			drm_err(dev, "Failed to enable pipe 1 clock %d: %d\n", j, ret);
++			goto err_dual;
++		}
++	}
++
+ 	return 0;
++err_dual:
++	while (--j >= 0)
++		mtk_ddp_comp_clk_disable(mtk_crtc->dual_comp[j]);
+ err:
+ 	while (--i >= 0)
+ 		mtk_ddp_comp_clk_disable(mtk_crtc->ddp_comp[i]);
+@@ -254,6 +274,8 @@ static void mtk_crtc_ddp_clk_disable(struct mtk_crtc *mtk_crtc)
+ {
+ 	int i;
+ 
++	for (i = 0; i < mtk_crtc->dual_comp_nr; i++)
++		mtk_ddp_comp_clk_disable(mtk_crtc->dual_comp[i]);
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
+ 		mtk_ddp_comp_clk_disable(mtk_crtc->ddp_comp[i]);
+ }
+@@ -281,6 +303,72 @@ struct mtk_ddp_comp *mtk_ddp_comp_for_plane(struct drm_crtc *crtc,
+ 	return NULL;
+ }
+ 
++/*
++ * Dual pipe: split a plane at the middle of the screen. The OVLs do not
++ * scale, so source and destination move together; pipe 1 starts at its own
++ * x = 0. Only unrotated and vertically reflected planes are split right
++ * (horizontal reflection would also need the halves swapped).
++ */
++static void mtk_crtc_split_plane(const struct mtk_plane_state *state,
++				 unsigned int half,
++				 struct mtk_plane_pending_state *left,
++				 struct mtk_plane_pending_state *right)
++{
++	const struct mtk_plane_pending_state *p = &state->pending;
++	unsigned int x0 = p->x, x1 = p->x + p->width, start, cpp;
++
++	*left = *p;
++	*right = *p;
++	if (!p->enable)
++		return;
++
++	cpp = state->base.fb ? state->base.fb->format->cpp[0] : 0;
++
++	if (x0 < half)
++		left->width = min(x1, half) - x0;
++	else
++		left->enable = false;
++
++	if (x1 > half) {
++		start = max(x0, half);
++		right->x = start - half;
++		right->width = x1 - start;
++		right->addr = p->addr + (dma_addr_t)(start - x0) * cpp;
++	} else {
++		right->enable = false;
++	}
++}
++
++static void mtk_crtc_layer_config(struct mtk_crtc *mtk_crtc,
++				  struct drm_plane *plane,
++				  struct mtk_plane_state *state,
++				  struct cmdq_pkt *cmdq_handle)
++{
++	struct drm_crtc *crtc = &mtk_crtc->base;
++	struct mtk_plane_pending_state left, right;
++	struct mtk_plane_state half_state;
++	struct mtk_ddp_comp *comp;
++	unsigned int local_layer;
++
++	comp = mtk_ddp_comp_for_plane(crtc, plane, &local_layer);
++	if (!comp)
++		return;
++
++	if (!mtk_crtc->dual_comp_nr) {
++		mtk_ddp_comp_layer_config(comp, local_layer, state, cmdq_handle);
++		return;
++	}
++
++	mtk_crtc_split_plane(state, crtc->state->adjusted_mode.hdisplay / 2,
++			     &left, &right);
++	half_state = *state;
++	half_state.pending = left;
++	mtk_ddp_comp_layer_config(comp, local_layer, &half_state, cmdq_handle);
++	half_state.pending = right;
++	mtk_ddp_comp_layer_config(mtk_crtc->dual_comp[0], local_layer,
++				  &half_state, cmdq_handle);
++}
++
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+ static void ddp_cmdq_cb(struct mbox_client *cl, void *mssg)
+ {
+@@ -359,7 +447,7 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 	struct drm_device *dev = mtk_crtc->base.dev;
+ 	unsigned int width, height, vrefresh, bpc = MTK_MAX_BPC;
+ 	int ret;
+-	int i;
++	int i, j;
+ 
+ 	if (WARN_ON(!crtc->state))
+ 		return -EINVAL;
+@@ -417,6 +505,16 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 	if (!mtk_ddp_comp_add(mtk_crtc->ddp_comp[i], mtk_crtc->mutex))
+ 		mtk_mutex_add_comp(mtk_crtc->mutex, mtk_crtc->ddp_comp[i]->id);
+ 
++	for (j = 0; j < mtk_crtc->dual_comp_nr; j++) {
++		struct mtk_ddp_comp *next = j + 1 < mtk_crtc->dual_comp_nr ?
++			mtk_crtc->dual_comp[j + 1] :
++			mtk_crtc->ddp_comp[mtk_crtc->dual_join];
++
++		mtk_mmsys_ddp_connect(mtk_crtc->mmsys_dev,
++				      mtk_crtc->dual_comp[j]->id, next->id);
++		mtk_mutex_add_comp(mtk_crtc->mutex, mtk_crtc->dual_comp[j]->id);
++	}
++
+ 	mtk_crtc->cmd_dsi = NULL;
+ 	if (mtk_ddp_comp_get_type(mtk_crtc->ddp_comp[i]->id) == MTK_DSI &&
+ 	    mtk_dsi_is_cmd_mode(mtk_crtc->ddp_comp[i]->dev))
+@@ -429,8 +527,13 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 	} else
+ 		mtk_mutex_enable(mtk_crtc->mutex);
+ 
++	if (mtk_crtc->dual_comp_nr)
++		mtk_dsc_set_dual_input(mtk_crtc->ddp_comp[mtk_crtc->dual_join]->dev,
++				       true);
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 		struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[i];
++		bool half = mtk_crtc->dual_comp_nr && i < mtk_crtc->dual_join;
+ 
+ 		/*
+ 		 * Only a second OVL takes the first one's output as background;
+@@ -442,7 +545,17 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 		else if (i == 1)
+ 			mtk_ddp_comp_bgclr_in_on(comp);
+ 
+-		mtk_ddp_comp_config(comp, width, height, vrefresh, bpc, NULL);
++		mtk_ddp_comp_config(comp, half ? width / 2 : width, height,
++				    vrefresh, bpc, NULL);
++		mtk_ddp_comp_start(comp);
++	}
++
++	for (j = 0; j < mtk_crtc->dual_comp_nr; j++) {
++		struct mtk_ddp_comp *comp = mtk_crtc->dual_comp[j];
++
++		if (j == 0)
++			mtk_ddp_comp_bgclr_in_off(comp);
++		mtk_ddp_comp_config(comp, width / 2, height, vrefresh, bpc, NULL);
+ 		mtk_ddp_comp_start(comp);
+ 	}
+ 
+@@ -450,17 +563,12 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 	for (i = 0; i < mtk_crtc->layer_nr; i++) {
+ 		struct drm_plane *plane = &mtk_crtc->planes[i];
+ 		struct mtk_plane_state *plane_state;
+-		struct mtk_ddp_comp *comp;
+-		unsigned int local_layer;
+ 
+ 		plane_state = to_mtk_plane_state(plane->state);
+ 
+ 		/* should not enable layer before crtc enabled */
+ 		plane_state->pending.enable = false;
+-		comp = mtk_ddp_comp_for_plane(crtc, plane, &local_layer);
+-		if (comp)
+-			mtk_ddp_comp_layer_config(comp, local_layer,
+-						  plane_state, NULL);
++		mtk_crtc_layer_config(mtk_crtc, plane, plane_state, NULL);
+ 	}
+ 
+ 	return 0;
+@@ -488,6 +596,17 @@ static void mtk_crtc_ddp_hw_fini(struct mtk_crtc *mtk_crtc)
+ 			mtk_ddp_comp_bgclr_in_off(mtk_crtc->ddp_comp[i]);
+ 	}
+ 
++	for (i = 0; i < mtk_crtc->dual_comp_nr; i++) {
++		struct mtk_ddp_comp *next = i + 1 < mtk_crtc->dual_comp_nr ?
++			mtk_crtc->dual_comp[i + 1] :
++			mtk_crtc->ddp_comp[mtk_crtc->dual_join];
++
++		mtk_ddp_comp_stop(mtk_crtc->dual_comp[i]);
++		mtk_mutex_remove_comp(mtk_crtc->mutex, mtk_crtc->dual_comp[i]->id);
++		mtk_mmsys_ddp_disconnect(mtk_crtc->mmsys_dev,
++					 mtk_crtc->dual_comp[i]->id, next->id);
++	}
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
+ 		if (!mtk_ddp_comp_remove(mtk_crtc->ddp_comp[i], mtk_crtc->mutex))
+ 			mtk_mutex_remove_comp(mtk_crtc->mutex,
+@@ -525,7 +644,6 @@ static void mtk_crtc_ddp_config(struct drm_crtc *crtc,
+ 	struct mtk_crtc_state *state = to_mtk_crtc_state(mtk_crtc->base.state);
+ 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
+ 	unsigned int i;
+-	unsigned int local_layer;
+ 
+ 	/*
+ 	 * TODO: instead of updating the registers here, we should prepare
+@@ -533,8 +651,16 @@ static void mtk_crtc_ddp_config(struct drm_crtc *crtc,
+ 	 * queue update module registers on vblank.
+ 	 */
+ 	if (state->pending_config) {
+-		mtk_ddp_comp_config(comp, state->pending_width,
+-				    state->pending_height,
++		unsigned int w = state->pending_width;
++
++		if (mtk_crtc->dual_comp_nr) {
++			w /= 2;
++			mtk_ddp_comp_config(mtk_crtc->dual_comp[0], w,
++					    state->pending_height,
++					    state->pending_vrefresh, 0,
++					    cmdq_handle);
++		}
++		mtk_ddp_comp_config(comp, w, state->pending_height,
+ 				    state->pending_vrefresh, 0,
+ 				    cmdq_handle);
+ 
+@@ -552,12 +678,8 @@ static void mtk_crtc_ddp_config(struct drm_crtc *crtc,
+ 			if (!plane_state->pending.config)
+ 				continue;
+ 
+-			comp = mtk_ddp_comp_for_plane(crtc, plane, &local_layer);
+-
+-			if (comp)
+-				mtk_ddp_comp_layer_config(comp, local_layer,
+-							  plane_state,
+-							  cmdq_handle);
++			mtk_crtc_layer_config(mtk_crtc, plane, plane_state,
++					      cmdq_handle);
+ 			if (!cmdq_handle)
+ 				plane_state->pending.config = false;
+ 		}
+@@ -576,12 +698,8 @@ static void mtk_crtc_ddp_config(struct drm_crtc *crtc,
+ 			if (!plane_state->pending.async_config)
+ 				continue;
+ 
+-			comp = mtk_ddp_comp_for_plane(crtc, plane, &local_layer);
+-
+-			if (comp)
+-				mtk_ddp_comp_layer_config(comp, local_layer,
+-							  plane_state,
+-							  cmdq_handle);
++			mtk_crtc_layer_config(mtk_crtc, plane, plane_state,
++					      cmdq_handle);
+ 			if (!cmdq_handle)
+ 				plane_state->pending.async_config = false;
+ 		}
+@@ -849,11 +967,20 @@ static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
+ 		DRM_DEV_ERROR(comp->dev, "Failed to enable power domain: %d\n", ret);
+ 		return;
+ 	}
++	if (mtk_crtc->dual_comp_nr) {
++		ret = mtk_ddp_comp_power_on(mtk_crtc->dual_comp[0]);
++		if (ret < 0) {
++			mtk_ddp_comp_power_off(comp);
++			return;
++		}
++	}
+ 
+ 	mtk_crtc_update_output(crtc, state);
+ 
+ 	ret = mtk_crtc_ddp_hw_init(mtk_crtc);
+ 	if (ret) {
++		if (mtk_crtc->dual_comp_nr)
++			mtk_ddp_comp_power_off(mtk_crtc->dual_comp[0]);
+ 		mtk_ddp_comp_power_off(comp);
+ 		return;
+ 	}
+@@ -898,6 +1025,8 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
+ 
+ 	drm_crtc_vblank_off(crtc);
+ 	mtk_crtc_ddp_hw_fini(mtk_crtc);
++	if (mtk_crtc->dual_comp_nr)
++		mtk_ddp_comp_power_off(mtk_crtc->dual_comp[0]);
+ 	mtk_ddp_comp_power_off(comp);
+ 
+ 	mtk_crtc->enabled = false;
+@@ -934,11 +1063,16 @@ static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+ 	int i;
+ 
+-	if (crtc->state->color_mgmt_changed)
++	if (crtc->state->color_mgmt_changed) {
+ 		for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 			mtk_ddp_gamma_set(mtk_crtc->ddp_comp[i], crtc->state);
+ 			mtk_ddp_ctm_set(mtk_crtc->ddp_comp[i], crtc->state);
+ 		}
++		for (i = 0; i < mtk_crtc->dual_comp_nr; i++) {
++			mtk_ddp_gamma_set(mtk_crtc->dual_comp[i], crtc->state);
++			mtk_ddp_ctm_set(mtk_crtc->dual_comp[i], crtc->state);
++		}
++	}
+ 	mtk_crtc_update_config(mtk_crtc, !!mtk_crtc->event);
+ }
+ 
+@@ -1061,6 +1195,44 @@ struct device *mtk_crtc_dma_dev_get(struct drm_crtc *crtc)
+ 	return mtk_crtc->dma_dev;
+ }
+ 
++/* second pipe of the main path; without all of its blocks run single pipe */
++static int mtk_crtc_init_dual(struct device *dev, struct mtk_drm_private *priv,
++			      struct mtk_crtc *mtk_crtc)
++{
++	const struct mtk_mmsys_driver_data *data = priv->data;
++	unsigned int i;
++
++	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
++		if (mtk_crtc->ddp_comp[i]->id == data->dual_join)
++			break;
++	if (i == mtk_crtc->ddp_comp_nr)
++		return 0;
++	mtk_crtc->dual_join = i;
++
++	for (i = 0; i < data->dual_len; i++) {
++		if (!priv->comp_node[data->dual_path[i]] ||
++		    !priv->ddp_comp[data->dual_path[i]].dev) {
++			dev_info(dev, "pipe 1 component %d missing: single pipe\n",
++				 data->dual_path[i]);
++			return 0;
++		}
++	}
++
++	mtk_crtc->dual_comp = devm_kcalloc(dev, data->dual_len,
++					   sizeof(*mtk_crtc->dual_comp),
++					   GFP_KERNEL);
++	if (!mtk_crtc->dual_comp)
++		return -ENOMEM;
++
++	for (i = 0; i < data->dual_len; i++)
++		mtk_crtc->dual_comp[i] = &priv->ddp_comp[data->dual_path[i]];
++	mtk_crtc->dual_comp_nr = data->dual_len;
++	dev_info(dev, "dual pipe: %u blocks join at %d\n", data->dual_len,
++		 data->dual_join);
++
++	return 0;
++}
++
+ int mtk_crtc_create(struct drm_device *drm_dev, const unsigned int *path,
+ 		    unsigned int path_len, int priv_data_index,
+ 		    const struct mtk_drm_route *conn_routes,
+@@ -1148,6 +1320,12 @@ int mtk_crtc_create(struct drm_device *drm_dev, const unsigned int *path,
+ 						&mtk_crtc->base);
+ 	}
+ 
++	if (path == priv->data->main_path && priv->data->dual_path) {
++		ret = mtk_crtc_init_dual(dev, priv, mtk_crtc);
++		if (ret)
++			return ret;
++	}
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++)
+ 		num_comp_planes += mtk_crtc_num_comp_planes(mtk_crtc, i);
+ 
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+index 8a2e57e1c..e6d987e67 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+@@ -44,6 +44,7 @@
+ #define DISP_REG_DSC_CON			0x0000
+ #define DSC_EN					BIT(0)
+ #define DSC_DUAL_INOUT				BIT(2)
++#define DSC_IN_SRC_SEL				BIT(3)
+ #define DSC_BYPASS				BIT(4)
+ #define DSC_UFOE_SEL				BIT(16)
+ #define DSC_EMPTY_FLAG_SEL			GENMASK(15, 14)
+@@ -87,6 +88,8 @@ struct mtk_ddp_comp_dev {
+ 	struct clk *clk;
+ 	void __iomem *regs;
+ 	struct cmdq_client_reg cmdq_reg;
++	/* DSC: two pipes feed one half each (DSC_CON IN_SRC_SEL) */
++	bool dsc_dual_in;
+ };
+ 
+ void mtk_ddp_write(struct cmdq_pkt *cmdq_pkt, unsigned int value,
+@@ -234,7 +237,8 @@ static void mtk_dsc_encoder_config(struct mtk_ddp_comp_dev *priv,
+ 	unsigned int pad = (chunk + 2) / 3 * 3 - chunk;
+ 	int i;
+ 
+-	writel(DSC_UFOE_SEL | DSC_EMPTY_FLAG_ALWAYS_HIGH, regs + DISP_REG_DSC_CON);
++	writel(DSC_UFOE_SEL | DSC_EMPTY_FLAG_ALWAYS_HIGH |
++	       (priv->dsc_dual_in ? DSC_IN_SRC_SEL : 0), regs + DISP_REG_DSC_CON);
+ 	writel((pic_group_width - 1) << 16 | w, regs + DISP_REG_DSC_PIC_W);
+ 	writel((pic_height_ext * sh - 1) << 16 | (h - 1), regs + DISP_REG_DSC_PIC_H);
+ 	writel((slice_group_width - 1) << 16 | sw, regs + DISP_REG_DSC_SLICE_W);
+@@ -272,6 +276,14 @@ static void mtk_dsc_encoder_config(struct mtk_ddp_comp_dev *priv,
+ 	writel(0x800002c2, regs + DISP_REG_DSC_OBUF);	/* BSP: FHD+ out buffer */
+ }
+ 
++/* the crtc drives the encoder with two pipes, left and right half */
++void mtk_dsc_set_dual_input(struct device *dev, bool dual)
++{
++	struct mtk_ddp_comp_dev *priv = dev_get_drvdata(dev);
++
++	priv->dsc_dual_in = dual;
++}
++
+ static void mtk_dsc_config(struct device *dev, unsigned int w,
+ 			   unsigned int h, unsigned int vrefresh,
+ 			   unsigned int bpc, struct cmdq_pkt *cmdq_pkt)
+@@ -550,9 +562,11 @@ static const struct mtk_ddp_comp_match mtk_ddp_matches[DDP_COMPONENT_DRM_ID_MAX]
+ 	[DDP_COMPONENT_AAL1]		= { MTK_DISP_AAL,		1, &ddp_aal },
+ 	[DDP_COMPONENT_BLS]		= { MTK_DISP_BLS,		0, NULL },
+ 	[DDP_COMPONENT_CCORR]		= { MTK_DISP_CCORR,		0, &ddp_ccorr },
++	[DDP_COMPONENT_CCORR1]		= { MTK_DISP_CCORR,		1, &ddp_ccorr },
+ 	[DDP_COMPONENT_COLOR0]		= { MTK_DISP_COLOR,		0, &ddp_color },
+ 	[DDP_COMPONENT_COLOR1]		= { MTK_DISP_COLOR,		1, &ddp_color },
+ 	[DDP_COMPONENT_DITHER0]		= { MTK_DISP_DITHER,		0, &ddp_dither },
++	[DDP_COMPONENT_DITHER1]		= { MTK_DISP_DITHER,		1, &ddp_dither },
+ 	[DDP_COMPONENT_DP_INTF0]	= { MTK_DP_INTF,		0, &ddp_dpi },
+ 	[DDP_COMPONENT_DP_INTF1]	= { MTK_DP_INTF,		1, &ddp_dpi },
+ 	[DDP_COMPONENT_DPI0]		= { MTK_DPI,			0, &ddp_dpi },
+@@ -565,6 +579,7 @@ static const struct mtk_ddp_comp_match mtk_ddp_matches[DDP_COMPONENT_DRM_ID_MAX]
+ 	[DDP_COMPONENT_DSI2]		= { MTK_DSI,			2, &ddp_dsi },
+ 	[DDP_COMPONENT_DSI3]		= { MTK_DSI,			3, &ddp_dsi },
+ 	[DDP_COMPONENT_GAMMA]		= { MTK_DISP_GAMMA,		0, &ddp_gamma },
++	[DDP_COMPONENT_GAMMA1]		= { MTK_DISP_GAMMA,		1, &ddp_gamma },
+ 	[DDP_COMPONENT_MERGE0]		= { MTK_DISP_MERGE,		0, &ddp_merge },
+ 	[DDP_COMPONENT_MERGE1]		= { MTK_DISP_MERGE,		1, &ddp_merge },
+ 	[DDP_COMPONENT_MERGE2]		= { MTK_DISP_MERGE,		2, &ddp_merge },
+@@ -579,6 +594,7 @@ static const struct mtk_ddp_comp_match mtk_ddp_matches[DDP_COMPONENT_DRM_ID_MAX]
+ 	[DDP_COMPONENT_OVL_2L1]		= { MTK_DISP_OVL_2L,		1, &ddp_ovl },
+ 	[DDP_COMPONENT_OVL_2L2]		= { MTK_DISP_OVL_2L,		2, &ddp_ovl },
+ 	[DDP_COMPONENT_POSTMASK0]	= { MTK_DISP_POSTMASK,		0, &ddp_postmask },
++	[DDP_COMPONENT_POSTMASK1]	= { MTK_DISP_POSTMASK,		1, &ddp_postmask },
+ 	[DDP_COMPONENT_PWM0]		= { MTK_DISP_PWM,		0, NULL },
+ 	[DDP_COMPONENT_PWM1]		= { MTK_DISP_PWM,		1, NULL },
+ 	[DDP_COMPONENT_PWM2]		= { MTK_DISP_PWM,		2, NULL },
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_drv.h b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+index 341c69c51..4be684e4c 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+@@ -179,6 +179,7 @@ void mtk_padding_stop(struct device *dev);
+ /* panel DSC parameters seen by the DSI host, for the DSC component */
+ struct drm_dsc_config;
+ const struct drm_dsc_config *mtk_dsi_get_dsc(void);
++void mtk_dsc_set_dual_input(struct device *dev, bool dual);
+ struct mtk_mutex;
+ bool mtk_dsi_is_cmd_mode(struct device *dev);
+ void mtk_dsi_cmd_set_te_cb(struct device *dev, void (*cb)(void *data),
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index 3f0566aa5..6157ab318 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -210,6 +210,18 @@ static const unsigned int mt6885_mtk_ddp_main[] = {
+ 	DDP_COMPONENT_DSI0,
+ };
+ 
++/* 120 Hz needs both pipes: the right half joins at DSC_WRAP0 */
++static const unsigned int mt6885_mtk_ddp_dual[] = {
++	DDP_COMPONENT_OVL1,
++	DDP_COMPONENT_RDMA1,
++	DDP_COMPONENT_COLOR1,
++	DDP_COMPONENT_CCORR1,
++	DDP_COMPONENT_AAL1,
++	DDP_COMPONENT_GAMMA1,
++	DDP_COMPONENT_POSTMASK1,
++	DDP_COMPONENT_DITHER1,
++};
++
+ static const unsigned int mt8192_mtk_ddp_main[] = {
+ 	DDP_COMPONENT_OVL0,
+ 	DDP_COMPONENT_OVL_2L0,
+@@ -320,6 +332,9 @@ static const struct mtk_mmsys_driver_data mt8188_vdosys0_driver_data = {
+ static const struct mtk_mmsys_driver_data mt6885_mmsys_driver_data = {
+ 	.main_path = mt6885_mtk_ddp_main,
+ 	.main_len = ARRAY_SIZE(mt6885_mtk_ddp_main),
++	.dual_path = mt6885_mtk_ddp_dual,
++	.dual_len = ARRAY_SIZE(mt6885_mtk_ddp_dual),
++	.dual_join = DDP_COMPONENT_DSC0,
+ 	.mmsys_dev_num = 1,
+ };
+ 
+@@ -476,6 +491,11 @@ static bool mtk_drm_find_mmsys_comp(struct mtk_drm_private *private, int comp_id
+ 			if (drv_data->third_path[i] == comp_id)
+ 				return true;
+ 
++	if (drv_data->dual_path)
++		for (i = 0; i < drv_data->dual_len; i++)
++			if (drv_data->dual_path[i] == comp_id)
++				return true;
++
+ 	if (drv_data->num_conn_routes)
+ 		for (i = 0; i < drv_data->num_conn_routes; i++)
+ 			if (drv_data->conn_routes[i].route_ddp == comp_id)
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.h b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+index d48da019a..d1d437e82 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+@@ -42,6 +42,14 @@ struct mtk_mmsys_driver_data {
+ 	unsigned int third_len;
+ 	const struct mtk_drm_route *conn_routes;
+ 	unsigned int num_conn_routes;
++	/*
++	 * Second pipe of the main path: drives the right half of the screen
++	 * and joins the main path at dual_join (both pipes then run at half
++	 * the width up to there).
++	 */
++	const unsigned int *dual_path;
++	unsigned int dual_len;
++	unsigned int dual_join;
+ 
+ 	bool shadow_register;
+ 	unsigned int mmsys_id;
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 4206404cb..c1aa0eb42 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -989,6 +989,10 @@ mtk_dsi_bridge_mode_valid(struct drm_bridge *bridge,
+ 	if (bpp < 0)
+ 		return MODE_ERROR;
+ 
++	/* the link carries the compressed stream */
++	if (dsi->dsc)
++		bpp = dsi->dsc->bits_per_pixel >> 4;
++
+ 	if (mode->clock * bpp / dsi->lanes > 1500000)
+ 		return MODE_CLOCK_HIGH;
+ 
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+index e2ed519e9..9eefee660 100644
+--- a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+@@ -4,6 +4,10 @@
+  * lanes at 820 Mbps, DSC 1.1 (2 slices of 540x8, 8 bpc -> 8 bpp), TE.
+  * Vendor driver: panel-j10-38-08-0a-dsc-cmd.c (Xiaomi kernel); the init
+  * sequence, including its pre-encoded PPS (DCS 0x9E), is taken verbatim.
++ *
++ * A bridge rather than a drm_panel: the panel refreshes at 60 or 120 Hz
++ * (DCS 0x60) and needs to know the mode. Between the two modes it stays
++ * powered: a refresh change only restarts the DSI link and resends 0x60.
+  */
+ 
+ #include <linux/backlight.h>
+@@ -14,27 +18,32 @@
+ #include <linux/regulator/consumer.h>
+ 
+ #include <drm/display/drm_dsc.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_state_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_connector.h>
+ #include <drm/drm_mipi_dsi.h>
+ #include <drm/drm_modes.h>
+-#include <drm/drm_panel.h>
+-#include <drm/drm_probe_helper.h>
+ 
+ #include <video/mipi_display.h>
+ 
+ #define J10_MAX_BRIGHTNESS	2047
+ 
+ struct j10_panel {
+-	struct drm_panel panel;
++	struct drm_bridge bridge;
+ 	struct mipi_dsi_device *dsi;
++	struct backlight_device *backlight;
+ 	struct regulator *vci;
+ 	struct gpio_desc *reset_gpio;
+ 	struct gpio_desc *bias_gpio;
+ 	struct drm_dsc_config dsc;
++	bool powered;
++	bool high_refresh;
+ };
+ 
+-static inline struct j10_panel *to_j10_panel(struct drm_panel *panel)
++static inline struct j10_panel *to_j10_panel(struct drm_bridge *bridge)
+ {
+-	return container_of(panel, struct j10_panel, panel);
++	return container_of(bridge, struct j10_panel, bridge);
+ }
+ 
+ static void j10_reset(struct j10_panel *ctx)
+@@ -46,6 +55,14 @@ static void j10_reset(struct j10_panel *ctx)
+ 	usleep_range(10000, 11000);
+ }
+ 
++/* frequency select (DCS 0x60): 0x10 = 120 Hz, 0x00 = 60 Hz */
++static void j10_set_refresh(struct mipi_dsi_multi_context *dsi_ctx, bool high)
++{
++	const u8 cmd[] = { 0x60, high ? 0x10 : 0x00, 0x00 };
++
++	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, cmd, sizeof(cmd));
++}
++
+ static int j10_on(struct j10_panel *ctx)
+ {
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+@@ -126,8 +143,7 @@ static int j10_on(struct j10_panel *ctx)
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+ 	mipi_dsi_msleep(&dsi_ctx, 80);
+ 
+-	/* 60 Hz (0x10 0x00 = 120 Hz) */
+-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x00, 0x00);
++	j10_set_refresh(&dsi_ctx, ctx->high_refresh);
+ 
+ 	/* dimming */
+ 	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+@@ -173,9 +189,8 @@ static int j10_on(struct j10_panel *ctx)
+ 	return dsi_ctx.accum_err;
+ }
+ 
+-static int j10_prepare(struct drm_panel *panel)
++static int j10_power_on(struct j10_panel *ctx)
+ {
+-	struct j10_panel *ctx = to_j10_panel(panel);
+ 	int ret;
+ 
+ 	ret = regulator_enable(ctx->vci);
+@@ -186,17 +201,18 @@ static int j10_prepare(struct drm_panel *panel)
+ 
+ 	ret = j10_on(ctx);
+ 	if (ret < 0) {
+-		dev_err(panel->dev, "panel init failed: %d\n", ret);
++		dev_err(&ctx->dsi->dev, "panel init failed: %d\n", ret);
+ 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+ 		gpiod_set_value_cansleep(ctx->bias_gpio, 0);
+ 		regulator_disable(ctx->vci);
++		return ret;
+ 	}
+-	return ret;
++	ctx->powered = true;
++	return 0;
+ }
+ 
+-static int j10_unprepare(struct drm_panel *panel)
++static void j10_power_off(struct j10_panel *ctx)
+ {
+-	struct j10_panel *ctx = to_j10_panel(panel);
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+ 
+ 	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+@@ -210,35 +226,149 @@ static int j10_unprepare(struct drm_panel *panel)
+ 	gpiod_set_value_cansleep(ctx->bias_gpio, 0);
+ 	regulator_disable(ctx->vci);
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+-	return 0;
++	ctx->powered = false;
+ }
+ 
+-/* 60 Hz; clock gives exactly 60 Hz with the vendor porches */
+-static const struct drm_display_mode j10_mode = {
+-	.clock = (1080 + 40 + 10 + 20) * (2400 + 20 + 2 + 8) * 60 / 1000,
+-	.hdisplay = 1080,
+-	.hsync_start = 1080 + 40,
+-	.hsync_end = 1080 + 40 + 10,
+-	.htotal = 1080 + 40 + 10 + 20,
+-	.vdisplay = 2400,
+-	.vsync_start = 2400 + 20,
+-	.vsync_end = 2400 + 20 + 2,
+-	.vtotal = 2400 + 20 + 2 + 8,
+-	.width_mm = 70,
+-	.height_mm = 155,
+-	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++/*
++ * Modes from the vendor driver (same porches, doubled clock); the clocks
++ * match the panel's measured TE (60.87 Hz) so vblank timing is right.
++ */
++#define J10_HTOTAL	(1080 + 40 + 10 + 20)
++#define J10_VTOTAL	(2400 + 20 + 2 + 8)
++#define J10_MODE(khz)							\
++	.clock = (khz),							\
++	.hdisplay = 1080,						\
++	.hsync_start = 1080 + 40,					\
++	.hsync_end = 1080 + 40 + 10,					\
++	.htotal = J10_HTOTAL,						\
++	.vdisplay = 2400,						\
++	.vsync_start = 2400 + 20,					\
++	.vsync_end = 2400 + 20 + 2,					\
++	.vtotal = J10_VTOTAL,						\
++	.width_mm = 70,							\
++	.height_mm = 155
++
++static const struct drm_display_mode j10_modes[] = {
++	{ J10_MODE(J10_HTOTAL * J10_VTOTAL / 1000 * 12174 / 100),
++	  .type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED },
++	{ J10_MODE(J10_HTOTAL * J10_VTOTAL / 1000 * 6087 / 100),
++	  .type = DRM_MODE_TYPE_DRIVER },
+ };
+ 
+-static int j10_get_modes(struct drm_panel *panel,
+-			 struct drm_connector *connector)
++/* the crtc keeps running through this commit: only the mode changes */
++static bool j10_crtc_stays_on(struct drm_bridge *bridge,
++			      struct drm_atomic_commit *state)
++{
++	struct drm_connector_state *conn_state;
++	struct drm_crtc_state *crtc_state;
++	struct drm_connector *connector;
++
++	connector = drm_atomic_get_new_connector_for_encoder(state,
++							     bridge->encoder);
++	if (!connector)
++		return false;
++	conn_state = drm_atomic_get_new_connector_state(state, connector);
++	if (!conn_state || !conn_state->crtc)
++		return false;
++	crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
++	return crtc_state && crtc_state->active;
++}
++
++static bool j10_high_refresh(struct drm_bridge *bridge,
++			     struct drm_atomic_commit *state)
++{
++	struct drm_connector_state *conn_state;
++	struct drm_crtc_state *crtc_state;
++	struct drm_connector *connector;
++
++	connector = drm_atomic_get_new_connector_for_encoder(state,
++							     bridge->encoder);
++	if (!connector)
++		return false;
++	conn_state = drm_atomic_get_new_connector_state(state, connector);
++	crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
++	return drm_mode_vrefresh(&crtc_state->adjusted_mode) > 90;
++}
++
++static int j10_bridge_attach(struct drm_bridge *bridge,
++			     struct drm_encoder *encoder,
++			     enum drm_bridge_attach_flags flags)
++{
++	/* the connector is the DSI host's bridge connector */
++	if (!(flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR))
++		return -EINVAL;
++	return 0;
++}
++
++static void j10_bridge_pre_enable(struct drm_bridge *bridge,
++				  struct drm_atomic_commit *state)
+ {
+-	return drm_connector_helper_get_modes_fixed(connector, &j10_mode);
++	struct j10_panel *ctx = to_j10_panel(bridge);
++
++	ctx->high_refresh = j10_high_refresh(bridge, state);
++	if (!ctx->powered)
++		j10_power_on(ctx);
++}
++
++static void j10_bridge_enable(struct drm_bridge *bridge,
++			      struct drm_atomic_commit *state)
++{
++	struct j10_panel *ctx = to_j10_panel(bridge);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	if (!ctx->powered)
++		return;
++	/* also after a refresh change, where the panel stayed on */
++	j10_set_refresh(&dsi_ctx, ctx->high_refresh);
++	backlight_enable(ctx->backlight);
++}
++
++static void j10_bridge_disable(struct drm_bridge *bridge,
++			       struct drm_atomic_commit *state)
++{
++	struct j10_panel *ctx = to_j10_panel(bridge);
++
++	if (!j10_crtc_stays_on(bridge, state))
++		backlight_disable(ctx->backlight);
+ }
+ 
+-static const struct drm_panel_funcs j10_panel_funcs = {
+-	.prepare = j10_prepare,
+-	.unprepare = j10_unprepare,
+-	.get_modes = j10_get_modes,
++static void j10_bridge_post_disable(struct drm_bridge *bridge,
++				    struct drm_atomic_commit *state)
++{
++	struct j10_panel *ctx = to_j10_panel(bridge);
++
++	if (ctx->powered && !j10_crtc_stays_on(bridge, state))
++		j10_power_off(ctx);
++}
++
++static int j10_bridge_get_modes(struct drm_bridge *bridge,
++				struct drm_connector *connector)
++{
++	struct drm_display_mode *mode;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(j10_modes); i++) {
++		mode = drm_mode_duplicate(connector->dev, &j10_modes[i]);
++		if (!mode)
++			return i;
++		drm_mode_set_name(mode);
++		drm_mode_probed_add(connector, mode);
++	}
++	connector->display_info.width_mm = j10_modes[0].width_mm;
++	connector->display_info.height_mm = j10_modes[0].height_mm;
++	return i;
++}
++
++static const struct drm_bridge_funcs j10_bridge_funcs = {
++	.attach = j10_bridge_attach,
++	.atomic_pre_enable = j10_bridge_pre_enable,
++	.atomic_enable = j10_bridge_enable,
++	.atomic_disable = j10_bridge_disable,
++	.atomic_post_disable = j10_bridge_post_disable,
++	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
++	.atomic_create_state = drm_atomic_helper_bridge_create_state,
++	.get_modes = j10_bridge_get_modes,
+ };
+ 
+ static int j10_bl_update_status(struct backlight_device *bl)
+@@ -268,8 +398,8 @@ static int j10_probe(struct mipi_dsi_device *dsi)
+ 	struct drm_dsc_config *dsc;
+ 	int ret;
+ 
+-	ctx = devm_drm_panel_alloc(dev, struct j10_panel, panel,
+-				   &j10_panel_funcs, DRM_MODE_CONNECTOR_DSI);
++	ctx = devm_drm_bridge_alloc(dev, struct j10_panel, bridge,
++				    &j10_bridge_funcs);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
+@@ -327,18 +457,23 @@ static int j10_probe(struct mipi_dsi_device *dsi)
+ 	dsi->hs_rate = 820000000;
+ 	dsi->mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS;
+ 
+-	ctx->panel.prepare_prev_first = true;
+-	ctx->panel.backlight = devm_backlight_device_register(dev, dev_name(dev),
+-							      dev, dsi,
+-							      &j10_bl_ops, &props);
+-	if (IS_ERR(ctx->panel.backlight))
+-		return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
++	ctx->backlight = devm_backlight_device_register(dev, dev_name(dev),
++							dev, dsi,
++							&j10_bl_ops, &props);
++	if (IS_ERR(ctx->backlight))
++		return dev_err_probe(dev, PTR_ERR(ctx->backlight),
+ 				     "backlight\n");
+ 
+-	drm_panel_add(&ctx->panel);
++	/* the DSI host is up before the panel (DCS needs it) */
++	ctx->bridge.pre_enable_prev_first = true;
++	ctx->bridge.of_node = dev->of_node;
++	ctx->bridge.type = DRM_MODE_CONNECTOR_DSI;
++	ctx->bridge.ops = DRM_BRIDGE_OP_MODES;
++	drm_bridge_add(&ctx->bridge);
++
+ 	ret = mipi_dsi_attach(dsi);
+ 	if (ret < 0) {
+-		drm_panel_remove(&ctx->panel);
++		drm_bridge_remove(&ctx->bridge);
+ 		return dev_err_probe(dev, ret, "mipi_dsi_attach\n");
+ 	}
+ 	return 0;
+@@ -349,7 +484,7 @@ static void j10_remove(struct mipi_dsi_device *dsi)
+ 	struct j10_panel *ctx = mipi_dsi_get_drvdata(dsi);
+ 
+ 	mipi_dsi_detach(dsi);
+-	drm_panel_remove(&ctx->panel);
++	drm_bridge_remove(&ctx->bridge);
+ }
+ 
+ static const struct of_device_id j10_of_match[] = {
+diff --git a/drivers/soc/mediatek/mt6885-mmsys.h b/drivers/soc/mediatek/mt6885-mmsys.h
+index a51322ebf..c6d052711 100644
+--- a/drivers/soc/mediatek/mt6885-mmsys.h
++++ b/drivers/soc/mediatek/mt6885-mmsys.h
+@@ -30,6 +30,20 @@
+ #define MT6885_DISP_DSI0_DSC_WRAP_SOUT_SEL	0xf80
+ #define MT6885_DISP_RDMA4_PQ0_MERGE0_SEL_IN	0xf88
+ #define MT6885_DISP_PQ0_SOUT_SEL		0xff8
++/* pipe 1 */
++#define MT6885_DISP_COLOR1_OUT_SEL_IN		0x65c
++#define MT6885_DISP_RDMA1_RSZ1_SEL_IN		0xf0c
++#define MT6885_DISP_RDMA5_PQ1_SEL_IN		0xf8c
++#define MT6885_DISP_OVL1_BLENDOUT_SOUT_SEL	0xfa8
++#define MT6885_DISP_TOVL1_OUT1_SEL_IN		0xfb4
++#define MT6885_DISP_TOVL1_OUT1_MOUT_EN		0xfbc
++#define MT6885_DISP_RDMA1_SEL_IN		0xfc4
++#define MT6885_DISP_RDMA1_SOUT_SEL		0xfcc
++#define MT6885_DISP_CCORR1_SOUT_SEL		0xfd4
++#define MT6885_DISP_AAL1_SEL_IN			0xfd8
++#define MT6885_DISP_RDMA1_RSZ1_SOUT_SEL		0xfdc
++#define MT6885_DISP_DITHER1_MOUT_EN		0xfe4
++#define MT6885_DISP_PQ1_SOUT_SEL		0xfe8
+ 
+ #define MT6885_OVL_CON_OVL0_BLENDOUT		BIT(0)
+ #define MT6885_OVL_CON_OVL0_2L_BGOUT		BIT(3)
+@@ -53,6 +67,21 @@
+ #define MT6885_DSI0_DSC_WRAP_SOUT_DSC_WRAP0	0x1
+ #define MT6885_DSC_WRAP_SOUT_DSI0		0x0
+ 
++#define MT6885_OVL_CON_OVL1_BLENDOUT		BIT(4)
++#define MT6885_OVL1_BLENDOUT_SOUT_TOVL1_OUT1	0x1
++#define MT6885_TOVL1_OUT1_SEL_IN_OVL1_BLENDOUT	0x1
++#define MT6885_TOVL1_OUT1_MOUT_RDMA1		BIT(0)
++#define MT6885_RDMA1_SEL_IN_TOVL1_OUT1		0x0
++#define MT6885_RDMA1_SOUT_RDMA1_RSZ1		0x0
++#define MT6885_RDMA1_RSZ1_SEL_IN_RDMA1		0x0
++#define MT6885_RDMA1_RSZ1_SOUT_COLOR1		0x1
++#define MT6885_COLOR1_OUT_SEL_IN_COLOR1		0x0
++#define MT6885_CCORR1_SOUT_AAL1			0x1
++#define MT6885_AAL1_SEL_IN_CCORR1		0x1
++#define MT6885_DITHER1_MOUT_PQ1_SOUT		BIT(2)
++#define MT6885_PQ1_SOUT_RDMA5_PQ1_SEL		0x1
++#define MT6885_RDMA5_PQ1_SEL_IN_PQ1		0x1
++
+ #define MT6885_SEL_MASK				GENMASK(3, 0)
+ 
+ /* BSP smi_reg.h MMSYS_SW0_RST_B */
+@@ -124,6 +153,53 @@ static const struct mtk_mmsys_routes mmsys_mt6885_routing_table[] = {
+ 	MMSYS_ROUTE(DSC, 0, DSI, 0,
+ 		    MT6885_DSI0_SEL_IN, MT6885_SEL_MASK,
+ 		    MT6885_DSI0_SEL_IN_DSC_WRAP),
++	/*
++	 * pipe 1 (right half): OVL1 -> RDMA1 -> COLOR1 -> CCORR1 -> AAL1 ->
++	 * GAMMA1 -> POSTMASK1 -> DITHER1 -> PQ1_SOUT -> RDMA5_PQ1_SEL ->
++	 * DSC_WRAP0 second input (BSP mtk_ddp_insert_dsc_prim_MT6885, dual)
++	 */
++	MMSYS_ROUTE(OVL, 1, RDMA, 1,
++		    MT6885_MMSYS_OVL_CON, MT6885_OVL_CON_OVL1_BLENDOUT,
++		    MT6885_OVL_CON_OVL1_BLENDOUT),
++	MMSYS_ROUTE(OVL, 1, RDMA, 1,
++		    MT6885_DISP_OVL1_BLENDOUT_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_OVL1_BLENDOUT_SOUT_TOVL1_OUT1),
++	MMSYS_ROUTE(OVL, 1, RDMA, 1,
++		    MT6885_DISP_TOVL1_OUT1_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_TOVL1_OUT1_SEL_IN_OVL1_BLENDOUT),
++	MMSYS_ROUTE(OVL, 1, RDMA, 1,
++		    MT6885_DISP_TOVL1_OUT1_MOUT_EN, MT6885_TOVL1_OUT1_MOUT_RDMA1,
++		    MT6885_TOVL1_OUT1_MOUT_RDMA1),
++	MMSYS_ROUTE(OVL, 1, RDMA, 1,
++		    MT6885_DISP_RDMA1_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_RDMA1_SEL_IN_TOVL1_OUT1),
++	MMSYS_ROUTE(RDMA, 1, COLOR, 1,
++		    MT6885_DISP_RDMA1_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_RDMA1_SOUT_RDMA1_RSZ1),
++	MMSYS_ROUTE(RDMA, 1, COLOR, 1,
++		    MT6885_DISP_RDMA1_RSZ1_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_RDMA1_RSZ1_SEL_IN_RDMA1),
++	MMSYS_ROUTE(RDMA, 1, COLOR, 1,
++		    MT6885_DISP_RDMA1_RSZ1_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_RDMA1_RSZ1_SOUT_COLOR1),
++	MMSYS_ROUTE(COLOR, 1, CCORR, 1,
++		    MT6885_DISP_COLOR1_OUT_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_COLOR1_OUT_SEL_IN_COLOR1),
++	MMSYS_ROUTE(CCORR, 1, AAL, 1,
++		    MT6885_DISP_CCORR1_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_CCORR1_SOUT_AAL1),
++	MMSYS_ROUTE(CCORR, 1, AAL, 1,
++		    MT6885_DISP_AAL1_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_AAL1_SEL_IN_CCORR1),
++	MMSYS_ROUTE(DITHER, 1, DSC, 0,
++		    MT6885_DISP_DITHER1_MOUT_EN, GENMASK(3, 0),
++		    MT6885_DITHER1_MOUT_PQ1_SOUT),
++	MMSYS_ROUTE(DITHER, 1, DSC, 0,
++		    MT6885_DISP_PQ1_SOUT_SEL, MT6885_SEL_MASK,
++		    MT6885_PQ1_SOUT_RDMA5_PQ1_SEL),
++	MMSYS_ROUTE(DITHER, 1, DSC, 0,
++		    MT6885_DISP_RDMA5_PQ1_SEL_IN, MT6885_SEL_MASK,
++		    MT6885_RDMA5_PQ1_SEL_IN_PQ1),
+ };
+ 
+ #endif /* __SOC_MEDIATEK_MT6885_MMSYS_H */
+diff --git a/drivers/soc/mediatek/mtk-mutex.c b/drivers/soc/mediatek/mtk-mutex.c
+index b52f0da2a..86694cd66 100644
+--- a/drivers/soc/mediatek/mtk-mutex.c
++++ b/drivers/soc/mediatek/mtk-mutex.c
+@@ -571,8 +571,11 @@ static const u8 mt6885_mutex_mod[DDP_COMPONENT_ID_MAX] = {
+ 	[DDP_COMPONENT_RDMA1] = 14,
+ 	[DDP_COMPONENT_WDMA1] = 15,
+ 	[DDP_COMPONENT_COLOR1] = 16,
++	[DDP_COMPONENT_CCORR1] = 17,
+ 	[DDP_COMPONENT_AAL1] = 18,
++	[DDP_COMPONENT_GAMMA1] = 19,
+ 	[DDP_COMPONENT_DITHER1] = 20,
++	[DDP_COMPONENT_POSTMASK1] = 26,
+ 	[DDP_COMPONENT_POSTMASK0] = 25,
+ 	[DDP_COMPONENT_MERGE0] = 27,
+ 	[DDP_COMPONENT_MERGE1] = 28,
+diff --git a/include/linux/soc/mediatek/mtk-mmsys.h b/include/linux/soc/mediatek/mtk-mmsys.h
+index 4885b065b..a0f15dca1 100644
+--- a/include/linux/soc/mediatek/mtk-mmsys.h
++++ b/include/linux/soc/mediatek/mtk-mmsys.h
+@@ -81,6 +81,10 @@ enum mtk_ddp_comp_id {
+ 	DDP_COMPONENT_UFOE,
+ 	DDP_COMPONENT_WDMA0,
+ 	DDP_COMPONENT_WDMA1,
++	/* second instances, MT6885 dual pipe */
++	DDP_COMPONENT_CCORR1,
++	DDP_COMPONENT_GAMMA1,
++	DDP_COMPONENT_POSTMASK1,
+ 	DDP_COMPONENT_ID_MAX,
+ };
+ 

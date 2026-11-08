@@ -1,0 +1,2 @@
+# AW8697 vibrator: saved F0 calibration (cezanne-haptics-trim)
+ACTION=="bind", SUBSYSTEM=="i2c", DRIVER=="aw8697", RUN+="/usr/local/bin/cezanne-haptics-trim %p"

@@ -1,0 +1,538 @@
+diff --git a/drivers/gpu/drm/display/drm_bridge_connector.c b/drivers/gpu/drm/display/drm_bridge_connector.c
+index 8b54069fa..2a5168424 100644
+--- a/drivers/gpu/drm/display/drm_bridge_connector.c
++++ b/drivers/gpu/drm/display/drm_bridge_connector.c
+@@ -407,9 +407,28 @@ static int drm_bridge_connector_atomic_check(struct drm_connector *connector,
+ 	struct drm_bridge_connector *bridge_connector =
+ 		to_drm_bridge_connector(connector);
+ 
++	struct drm_connector_state *old_state, *new_state;
++	struct drm_crtc_state *crtc_state;
++
+ 	if (bridge_connector->bridge_hdmi)
+ 		return drm_atomic_helper_connector_hdmi_check(connector, state);
+ 
++	/*
++	 * Other sinks with HDR (e.g. a DSI panel whose display pipeline does
++	 * the PQ conversion): metadata or colorspace changes need the bridges
++	 * re-enabled, like the HDMI helper does.
++	 */
++	old_state = drm_atomic_get_old_connector_state(state, connector);
++	new_state = drm_atomic_get_new_connector_state(state, connector);
++	if (!new_state->crtc)
++		return 0;
++	if (old_state->colorspace == new_state->colorspace &&
++	    drm_connector_atomic_hdr_metadata_equal(old_state, new_state))
++		return 0;
++
++	crtc_state = drm_atomic_get_new_crtc_state(state, new_state->crtc);
++	if (crtc_state)
++		crtc_state->mode_changed = true;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 3b6d504b7..b58e00a24 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -17,6 +17,7 @@
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_framebuffer.h>
++#include <linux/hdmi.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
+@@ -25,6 +26,7 @@
+ #include "mtk_ddp_comp.h"
+ #include "mtk_disp_drv.h"
+ #include "mtk_drm_drv.h"
++#include "mtk_hdr_tables.h"
+ #include "mtk_plane.h"
+ 
+ /*
+@@ -75,6 +77,13 @@ struct mtk_crtc {
+ 	struct mtk_ddp_comp		**dual_comp;
+ 	unsigned int			dual_comp_nr;
+ 	unsigned int			dual_join;
++	/*
++	 * HDR: while the connector carries PQ metadata the colour blocks get
++	 * the driver's PQ -> panel LUT and BT.2020 -> P3 matrix instead of
++	 * userspace's (identity ones when it has none, so leaving HDR resets).
++	 */
++	bool				hdr_pq;
++	struct drm_property_blob	*hdr_lut, *hdr_ctm, *id_lut, *id_ctm;
+ 	struct mtk_mutex		*mutex;
+ 	unsigned int			ddp_comp_nr;
+ 	unsigned int			num_conn_routes;
+@@ -1061,22 +1070,76 @@ static void mtk_crtc_atomic_begin(struct drm_crtc *crtc,
+ 	}
+ }
+ 
+-static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
+-				  struct drm_atomic_commit *state)
++/* PQ output requested on the connector driven by this crtc in this commit */
++static bool mtk_crtc_hdr_pq(struct drm_crtc *crtc, struct drm_atomic_commit *state,
++			    bool *found)
+ {
+-	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
++	struct drm_connector_state *conn_state;
++	const struct hdr_output_metadata *md;
++	struct drm_connector *connector;
++	int i;
++
++	*found = false;
++	for_each_new_connector_in_state(state, connector, conn_state, i) {
++		if (conn_state->crtc != crtc)
++			continue;
++		*found = true;
++		if (!conn_state->hdr_output_metadata)
++			return false;
++		md = conn_state->hdr_output_metadata->data;
++		return md->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084;
++	}
++	return false;
++}
++
++static void mtk_crtc_color_set(struct mtk_crtc *mtk_crtc,
++			       const struct drm_crtc_state *crtc_state)
++{
++	struct drm_crtc_state st = *crtc_state;
+ 	int i;
+ 
+-	if (crtc->state->color_mgmt_changed) {
+-		for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+-			mtk_ddp_gamma_set(mtk_crtc->ddp_comp[i], crtc->state);
+-			mtk_ddp_ctm_set(mtk_crtc->ddp_comp[i], crtc->state);
++	if (mtk_crtc->hdr_lut) {
++		if (mtk_crtc->hdr_pq) {
++			st.gamma_lut = mtk_crtc->hdr_lut;
++			st.ctm = mtk_crtc->hdr_ctm;
++		} else {
++			if (!st.gamma_lut)
++				st.gamma_lut = mtk_crtc->id_lut;
++			if (!st.ctm)
++				st.ctm = mtk_crtc->id_ctm;
+ 		}
+-		for (i = 0; i < mtk_crtc->dual_comp_nr; i++) {
+-			mtk_ddp_gamma_set(mtk_crtc->dual_comp[i], crtc->state);
+-			mtk_ddp_ctm_set(mtk_crtc->dual_comp[i], crtc->state);
++	}
++
++	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
++		mtk_ddp_gamma_set(mtk_crtc->ddp_comp[i], &st);
++		mtk_ddp_ctm_set(mtk_crtc->ddp_comp[i], &st);
++	}
++	for (i = 0; i < mtk_crtc->dual_comp_nr; i++) {
++		mtk_ddp_gamma_set(mtk_crtc->dual_comp[i], &st);
++		mtk_ddp_ctm_set(mtk_crtc->dual_comp[i], &st);
++	}
++}
++
++static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
++				  struct drm_atomic_commit *state)
++{
++	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
++	bool color_changed = crtc->state->color_mgmt_changed;
++	bool found, pq;
++
++	if (mtk_crtc->hdr_lut) {
++		pq = mtk_crtc_hdr_pq(crtc, state, &found);
++		if (found && pq != mtk_crtc->hdr_pq) {
++			mtk_crtc->hdr_pq = pq;
++			color_changed = true;
+ 		}
++		/* blocks were reset by a modeset: program them again */
++		if (drm_atomic_crtc_needs_modeset(crtc->state))
++			color_changed = true;
+ 	}
++
++	if (color_changed)
++		mtk_crtc_color_set(mtk_crtc, crtc->state);
+ 	mtk_crtc_update_config(mtk_crtc, !!mtk_crtc->event);
+ }
+ 
+@@ -1199,6 +1262,48 @@ struct device *mtk_crtc_dma_dev_get(struct drm_crtc *crtc)
+ 	return mtk_crtc->dma_dev;
+ }
+ 
++static struct drm_property_blob *mtk_crtc_lut_blob(struct drm_device *drm,
++						   const u16 *table, unsigned int n)
++{
++	struct drm_property_blob *blob;
++	struct drm_color_lut *lut;
++	unsigned int i;
++
++	lut = kcalloc(n, sizeof(*lut), GFP_KERNEL);
++	if (!lut)
++		return ERR_PTR(-ENOMEM);
++	for (i = 0; i < n; i++) {
++		u16 v = table ? table[i] : DIV_ROUND_CLOSEST(i * 0xffff, n - 1);
++
++		lut[i].red = lut[i].green = lut[i].blue = v;
++	}
++	blob = drm_property_create_blob(drm, n * sizeof(*lut), lut);
++	kfree(lut);
++	return blob;
++}
++
++static int mtk_crtc_init_hdr(struct drm_device *drm, struct mtk_crtc *mtk_crtc,
++			     unsigned int lut_size)
++{
++	struct drm_color_ctm ctm = { };
++	unsigned int i;
++
++	mtk_crtc->hdr_lut = mtk_crtc_lut_blob(drm, mt6885_hdr_pq_lut, lut_size);
++	mtk_crtc->id_lut = mtk_crtc_lut_blob(drm, NULL, lut_size);
++	if (IS_ERR(mtk_crtc->hdr_lut) || IS_ERR(mtk_crtc->id_lut))
++		return -ENOMEM;
++
++	memcpy(ctm.matrix, mt6885_hdr_bt2020_to_p3, sizeof(ctm.matrix));
++	mtk_crtc->hdr_ctm = drm_property_create_blob(drm, sizeof(ctm), &ctm);
++	memset(&ctm, 0, sizeof(ctm));
++	for (i = 0; i < 3; i++)
++		ctm.matrix[i * 4] = 1ULL << 32;
++	mtk_crtc->id_ctm = drm_property_create_blob(drm, sizeof(ctm), &ctm);
++	if (IS_ERR(mtk_crtc->hdr_ctm) || IS_ERR(mtk_crtc->id_ctm))
++		return -ENOMEM;
++	return 0;
++}
++
+ /* second pipe of the main path; without all of its blocks run single pipe */
+ static int mtk_crtc_init_dual(struct device *dev, struct mtk_drm_private *priv,
+ 			      struct mtk_crtc *mtk_crtc)
+@@ -1358,6 +1463,13 @@ int mtk_crtc_create(struct drm_device *drm_dev, const unsigned int *path,
+ 	if (gamma_lut_size)
+ 		drm_mode_crtc_set_gamma_size(&mtk_crtc->base, gamma_lut_size);
+ 	drm_crtc_enable_color_mgmt(&mtk_crtc->base, 0, has_ctm, gamma_lut_size);
++
++	if (priv->data->hdr && path == priv->data->main_path && has_ctm &&
++	    gamma_lut_size == ARRAY_SIZE(mt6885_hdr_pq_lut)) {
++		ret = mtk_crtc_init_hdr(drm_dev, mtk_crtc, gamma_lut_size);
++		if (ret)
++			return ret;
++	}
+ 	mutex_init(&mtk_crtc->hw_lock);
+ 	spin_lock_init(&mtk_crtc->config_lock);
+ 
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index 6157ab318..393b04c78 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -335,6 +335,7 @@ static const struct mtk_mmsys_driver_data mt6885_mmsys_driver_data = {
+ 	.dual_path = mt6885_mtk_ddp_dual,
+ 	.dual_len = ARRAY_SIZE(mt6885_mtk_ddp_dual),
+ 	.dual_join = DDP_COMPONENT_DSC0,
++	.hdr = true,
+ 	.mmsys_dev_num = 1,
+ };
+ 
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.h b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+index d1d437e82..ecef1f7a5 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.h
+@@ -50,6 +50,8 @@ struct mtk_mmsys_driver_data {
+ 	const unsigned int *dual_path;
+ 	unsigned int dual_len;
+ 	unsigned int dual_join;
++	/* HDR: PQ / BT.2020 converted for the panel by GAMMA + CCORR */
++	bool hdr;
+ 
+ 	bool shadow_register;
+ 	unsigned int mmsys_id;
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 295050310..9f4a13eca 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -212,6 +212,8 @@ struct mtk_dsi_driver_data {
+ 	bool support_per_frame_lp;
+ 	/* mmsys register whose bit 0 is set on each command-mode frame (BSP) */
+ 	u32 mmsys_cmd_trig_off;
++	/* the pipeline converts PQ / BT.2020 for the panel (see mtk_crtc) */
++	bool hdr;
+ };
+ 
+ struct mtk_dsi {
+@@ -1079,6 +1081,17 @@ static int mtk_dsi_encoder_init(struct drm_device *drm, struct mtk_dsi *dsi)
+ 		goto err_cleanup_encoder;
+ 	}
+ 
++	/* what userspace (mutter) needs to offer HDR on a panel with an HDR EDID */
++	if (dsi->driver_data->hdr) {
++		ret = drm_mode_create_hdmi_colorspace_property(dsi->connector,
++						BIT(DRM_MODE_COLORIMETRY_BT2020_RGB));
++		if (!ret)
++			ret = drm_connector_attach_colorspace_property(dsi->connector);
++		if (ret)
++			drm_warn(drm, "no Colorspace property: %d\n", ret);
++		drm_connector_attach_hdr_output_metadata_property(dsi->connector);
++	}
++
+ 	return 0;
+ 
+ err_cleanup_encoder:
+@@ -1544,6 +1557,7 @@ static const struct mtk_dsi_driver_data mt6885_dsi_driver_data = {
+ 	.has_shadow_ctl = true,
+ 	.has_size_ctl = true,
+ 	.mmsys_cmd_trig_off = 0xf0,
++	.hdr = true,
+ };
+ 
+ static const struct mtk_dsi_driver_data mt8183_dsi_driver_data = {
+diff --git a/drivers/gpu/drm/mediatek/mtk_hdr_tables.h b/drivers/gpu/drm/mediatek/mtk_hdr_tables.h
+new file mode 100644
+index 000000000..a759ab526
+--- /dev/null
++++ b/drivers/gpu/drm/mediatek/mtk_hdr_tables.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * HDR (PQ / BT.2020) conversion for the MT6885 cezanne panel, generated by
++ * mainline/display/tools/gen-j10-edid.py --hdr: applied by the crtc when the
++ * connector carries PQ HDR_OUTPUT_METADATA (CCORR: gamut, GAMMA: EOTF).
++ */
++#ifndef __MTK_HDR_TABLES_H
++#define __MTK_HDR_TABLES_H
++
++/* PQ (ST 2084) -> panel (gamma 2.2, 800 nits at HBM peak), 16 bit */
++static const u16 mt6885_hdr_pq_lut[512] = {
++	0x0000, 0x0036, 0x005d, 0x0080, 0x00a2, 0x00c3, 0x00e4, 0x0104,
++	0x0124, 0x0144, 0x0164, 0x0184, 0x01a4, 0x01c4, 0x01e4, 0x0205,
++	0x0226, 0x0246, 0x0268, 0x0289, 0x02ab, 0x02cc, 0x02ef, 0x0311,
++	0x0334, 0x0357, 0x037a, 0x039d, 0x03c1, 0x03e5, 0x040a, 0x042f,
++	0x0454, 0x0479, 0x049f, 0x04c5, 0x04ec, 0x0512, 0x0539, 0x0561,
++	0x0589, 0x05b1, 0x05d9, 0x0602, 0x062b, 0x0655, 0x067f, 0x06a9,
++	0x06d4, 0x06ff, 0x072a, 0x0756, 0x0782, 0x07af, 0x07dc, 0x0809,
++	0x0837, 0x0865, 0x0894, 0x08c3, 0x08f2, 0x0922, 0x0952, 0x0983,
++	0x09b4, 0x09e5, 0x0a17, 0x0a49, 0x0a7c, 0x0aaf, 0x0ae3, 0x0b17,
++	0x0b4b, 0x0b80, 0x0bb6, 0x0beb, 0x0c22, 0x0c58, 0x0c90, 0x0cc7,
++	0x0cff, 0x0d38, 0x0d71, 0x0dab, 0x0de5, 0x0e1f, 0x0e5a, 0x0e96,
++	0x0ed1, 0x0f0e, 0x0f4b, 0x0f88, 0x0fc6, 0x1005, 0x1044, 0x1083,
++	0x10c3, 0x1104, 0x1145, 0x1187, 0x11c9, 0x120b, 0x124f, 0x1292,
++	0x12d7, 0x131b, 0x1361, 0x13a7, 0x13ed, 0x1435, 0x147c, 0x14c4,
++	0x150d, 0x1557, 0x15a1, 0x15eb, 0x1636, 0x1682, 0x16cf, 0x171c,
++	0x1769, 0x17b8, 0x1806, 0x1856, 0x18a6, 0x18f7, 0x1948, 0x199a,
++	0x19ed, 0x1a40, 0x1a94, 0x1ae9, 0x1b3e, 0x1b94, 0x1beb, 0x1c42,
++	0x1c9a, 0x1cf3, 0x1d4c, 0x1da6, 0x1e01, 0x1e5c, 0x1eb8, 0x1f15,
++	0x1f73, 0x1fd1, 0x2031, 0x2090, 0x20f1, 0x2152, 0x21b4, 0x2217,
++	0x227b, 0x22df, 0x2344, 0x23aa, 0x2411, 0x2479, 0x24e1, 0x254a,
++	0x25b4, 0x261f, 0x268a, 0x26f7, 0x2764, 0x27d2, 0x2841, 0x28b1,
++	0x2921, 0x2993, 0x2a05, 0x2a78, 0x2aec, 0x2b61, 0x2bd7, 0x2c4e,
++	0x2cc6, 0x2d3e, 0x2db8, 0x2e32, 0x2ead, 0x2f2a, 0x2fa7, 0x3025,
++	0x30a4, 0x3125, 0x31a6, 0x3228, 0x32ab, 0x332f, 0x33b4, 0x343a,
++	0x34c1, 0x3549, 0x35d3, 0x365d, 0x36e8, 0x3774, 0x3802, 0x3890,
++	0x3920, 0x39b0, 0x3a42, 0x3ad5, 0x3b69, 0x3bfe, 0x3c94, 0x3d2b,
++	0x3dc4, 0x3e5d, 0x3ef8, 0x3f94, 0x4031, 0x40d0, 0x416f, 0x4210,
++	0x42b2, 0x4355, 0x43f9, 0x449f, 0x4546, 0x45ee, 0x4697, 0x4742,
++	0x47ee, 0x489b, 0x494a, 0x49fa, 0x4aab, 0x4b5d, 0x4c11, 0x4cc7,
++	0x4d7d, 0x4e35, 0x4eef, 0x4fa9, 0x5066, 0x5123, 0x51e2, 0x52a3,
++	0x5365, 0x5428, 0x54ed, 0x55b3, 0x567b, 0x5745, 0x5810, 0x58dc,
++	0x59aa, 0x5a7a, 0x5b4b, 0x5c1e, 0x5cf2, 0x5dc8, 0x5e9f, 0x5f78,
++	0x6053, 0x6130, 0x620e, 0x62ee, 0x63cf, 0x64b2, 0x6597, 0x667e,
++	0x6766, 0x6850, 0x693c, 0x6a2a, 0x6b1a, 0x6c0b, 0x6cfe, 0x6df3,
++	0x6eea, 0x6fe3, 0x70de, 0x71da, 0x72d9, 0x73d9, 0x74db, 0x75e0,
++	0x76e6, 0x77ee, 0x78f9, 0x7a05, 0x7b13, 0x7c24, 0x7d36, 0x7e4b,
++	0x7f62, 0x807a, 0x8195, 0x82b3, 0x83d2, 0x84f3, 0x8617, 0x873d,
++	0x8865, 0x8990, 0x8abd, 0x8bec, 0x8d1d, 0x8e51, 0x8f87, 0x90c0,
++	0x91fa, 0x9338, 0x9477, 0x95ba, 0x96fe, 0x9845, 0x998f, 0x9adb,
++	0x9c2a, 0x9d7b, 0x9ecf, 0xa026, 0xa17f, 0xa2db, 0xa43a, 0xa59b,
++	0xa6ff, 0xa866, 0xa9cf, 0xab3c, 0xacab, 0xae1d, 0xaf92, 0xb10a,
++	0xb284, 0xb402, 0xb582, 0xb706, 0xb88d, 0xba16, 0xbba3, 0xbd33,
++	0xbec6, 0xc05c, 0xc1f5, 0xc392, 0xc531, 0xc6d4, 0xc87a, 0xca24,
++	0xcbd1, 0xcd81, 0xcf35, 0xd0ec, 0xd2a6, 0xd464, 0xd625, 0xd7ea,
++	0xd9b3, 0xdb7f, 0xdd4f, 0xdf22, 0xe0fa, 0xe2d4, 0xe4b3, 0xe695,
++	0xe87c, 0xea66, 0xec54, 0xee46, 0xf03c, 0xf235, 0xf433, 0xf635,
++	0xf83b, 0xfa45, 0xfc54, 0xfe66, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++	0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
++};
++/* BT.2020 -> DCI-P3 (D65), linear-light matrix, S31.32 sign-magnitude */
++static const u64 mt6885_hdr_bt2020_to_p3[9] = {
++	0x0000000157f4be8eULL /* +1.34358 */, 0x80000000483ced49ULL /* -0.28218 */, 0x800000000fb7d146ULL /* -0.06140 */,
++	0x8000000010b75578ULL /* -0.06530 */, 0x000000011366d63cULL /* +1.07579 */, 0x8000000002af80c4ULL /* -0.01049 */,
++	0x0000000000b8edbcULL /* +0.00282 */, 0x800000000504682dULL /* -0.01960 */, 0x00000001044b7a71ULL /* +1.01678 */,
++};
++
++#endif
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+index 5398e2689..dffb45d6c 100644
+--- a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
++++ b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+@@ -22,6 +22,8 @@
+ #include <drm/drm_atomic_state_helper.h>
+ #include <drm/drm_bridge.h>
+ #include <drm/drm_connector.h>
++#include <drm/drm_edid.h>
++#include <linux/hdmi.h>
+ #include <drm/drm_mipi_dsi.h>
+ #include <drm/drm_modes.h>
+ 
+@@ -40,6 +42,9 @@ struct j10_panel {
+ 	struct drm_dsc_config dsc;
+ 	bool powered;
+ 	bool high_refresh;
++	/* HDR (PQ) output: high brightness mode at full level, the pipeline
++	 * maps the content luminance onto it */
++	bool hdr;
+ };
+ 
+ static inline struct j10_panel *to_j10_panel(struct drm_bridge *bridge)
+@@ -241,7 +246,8 @@ static void j10_power_off(struct j10_panel *ctx)
+ 
+ /*
+  * Modes from the vendor driver (same porches, doubled clock); the clocks
+- * match the panel's measured TE (60.87 Hz) so vblank timing is right.
++ * match the panel's measured TE (60.87 Hz) so vblank timing is right, in the
++ * EDID's 10 kHz steps (its timing descriptors are the modes userspace sees).
+  */
+ #define J10_HTOTAL	(1080 + 40 + 10 + 20)
+ #define J10_VTOTAL	(2400 + 20 + 2 + 8)
+@@ -259,12 +265,49 @@ static void j10_power_off(struct j10_panel *ctx)
+ 	.height_mm = 155
+ 
+ static const struct drm_display_mode j10_modes[] = {
+-	{ J10_MODE(J10_HTOTAL * J10_VTOTAL / 1000 * 12174 / 100),
++	{ J10_MODE(340140),
+ 	  .type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED },
+-	{ J10_MODE(J10_HTOTAL * J10_VTOTAL / 1000 * 6087 / 100),
++	{ J10_MODE(170070),
+ 	  .type = DRM_MODE_TYPE_DRIVER },
+ };
+ 
++/*
++ * The panel has no EDID; this one (mainline/display/tools/gen-j10-edid.py)
++ * gives userspace its name, size, P3 primaries, both modes and the HDR
++ * capability (BT.2020 + PQ, 800 nits HBM peak, 500 nits frame average):
++ * the display pipeline converts PQ to the panel's response.
++ */
++static const u8 j10_edid[] = {
++	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x61, 0xa9, 0x30, 0x0a,
++	0x00, 0x00, 0x00, 0x00, 0x01, 0x1e, 0x01, 0x04, 0xa0, 0x07, 0x10, 0x78,
++	0x02, 0x0f, 0x91, 0xae, 0x52, 0x43, 0xb0, 0x26, 0x0f, 0x50, 0x54, 0x00,
++	0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0xde, 0x84, 0x38, 0x46, 0x40, 0x60,
++	0x1e, 0x90, 0x28, 0x0a, 0x42, 0x04, 0x46, 0x9b, 0x00, 0x00, 0x00, 0x18,
++	0x6f, 0x42, 0x38, 0x46, 0x40, 0x60, 0x1e, 0x90, 0x28, 0x0a, 0x42, 0x04,
++	0x46, 0x9b, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x4b,
++	0x33, 0x30, 0x20, 0x55, 0x6c, 0x74, 0x72, 0x61, 0x0a, 0x20, 0x20, 0x20,
++	0x00, 0x00, 0x00, 0xfe, 0x00, 0x6a, 0x31, 0x30, 0x20, 0x33, 0x38, 0x20,
++	0x30, 0x38, 0x20, 0x30, 0x61, 0x0a, 0x01, 0x90, 0x02, 0x03, 0x0f, 0x00,
++	0xe3, 0x05, 0x80, 0x00, 0xe6, 0x06, 0x05, 0x01, 0x80, 0x6a, 0x14, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x94,
++};
++
++static const struct drm_edid *j10_bridge_edid_read(struct drm_bridge *bridge,
++						   struct drm_connector *connector)
++{
++	return drm_edid_alloc(j10_edid, sizeof(j10_edid));
++}
++
+ /* the crtc keeps running through this commit: only the mode changes */
+ static bool j10_crtc_stays_on(struct drm_bridge *bridge,
+ 			      struct drm_atomic_commit *state)
+@@ -284,6 +327,23 @@ static bool j10_crtc_stays_on(struct drm_bridge *bridge,
+ 	return crtc_state && crtc_state->active;
+ }
+ 
++static bool j10_hdr_pq(struct drm_bridge *bridge, struct drm_atomic_commit *state)
++{
++	struct drm_connector_state *conn_state;
++	struct drm_connector *connector;
++	const struct hdr_output_metadata *md;
++
++	connector = drm_atomic_get_new_connector_for_encoder(state,
++							     bridge->encoder);
++	if (!connector)
++		return false;
++	conn_state = drm_atomic_get_new_connector_state(state, connector);
++	if (!conn_state || !conn_state->hdr_output_metadata)
++		return false;
++	md = conn_state->hdr_output_metadata->data;
++	return md->hdmi_metadata_type1.eotf == HDMI_EOTF_SMPTE_ST2084;
++}
++
+ static bool j10_high_refresh(struct drm_bridge *bridge,
+ 			     struct drm_atomic_commit *state)
+ {
+@@ -316,6 +376,7 @@ static void j10_bridge_pre_enable(struct drm_bridge *bridge,
+ 	struct j10_panel *ctx = to_j10_panel(bridge);
+ 
+ 	ctx->high_refresh = j10_high_refresh(bridge, state);
++	ctx->hdr = j10_hdr_pq(bridge, state);
+ 	if (!ctx->powered)
+ 		j10_power_on(ctx);
+ }
+@@ -330,7 +391,18 @@ static void j10_bridge_enable(struct drm_bridge *bridge,
+ 		return;
+ 	/* also after a refresh change, where the panel stayed on */
+ 	j10_set_refresh(&dsi_ctx, ctx->high_refresh);
+-	backlight_enable(ctx->backlight);
++	if (ctx->hdr) {
++		/* BSP panel_hbm_set_cmdq(): HBM on, level 0x7ff */
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
++					     0xe0, 0x00);
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
++					     J10_MAX_BRIGHTNESS >> 8,
++					     J10_MAX_BRIGHTNESS & 0xff);
++	} else {
++		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
++					     0x20, 0x00);
++		backlight_enable(ctx->backlight);
++	}
+ }
+ 
+ static void j10_bridge_disable(struct drm_bridge *bridge,
+@@ -379,14 +451,20 @@ static const struct drm_bridge_funcs j10_bridge_funcs = {
+ 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
+ 	.atomic_create_state = drm_atomic_helper_bridge_create_state,
+ 	.get_modes = j10_bridge_get_modes,
++	.edid_read = j10_bridge_edid_read,
+ };
+ 
+ static int j10_bl_update_status(struct backlight_device *bl)
+ {
+ 	struct mipi_dsi_device *dsi = bl_get_data(bl);
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(dsi);
+ 	u16 brightness = backlight_get_brightness(bl);
+ 	int ret;
+ 
++	/* HDR: the panel stays at peak, the compositor scales the content */
++	if (ctx && ctx->hdr)
++		return 0;
++
+ 	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+ 	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+ 	return ret < 0 ? ret : 0;
+@@ -478,7 +556,7 @@ static int j10_probe(struct mipi_dsi_device *dsi)
+ 	ctx->bridge.pre_enable_prev_first = true;
+ 	ctx->bridge.of_node = dev->of_node;
+ 	ctx->bridge.type = DRM_MODE_CONNECTOR_DSI;
+-	ctx->bridge.ops = DRM_BRIDGE_OP_MODES;
++	ctx->bridge.ops = DRM_BRIDGE_OP_MODES | DRM_BRIDGE_OP_EDID;
+ 	drm_bridge_add(&ctx->bridge);
+ 
+ 	ret = mipi_dsi_attach(dsi);

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Bluetooth bring-up for the MediaTek CONNSYS BT (BTIF + bt_drv_6885 in BlueZ
+# mode, see NOTES.md). Runs after cezanne-wifi (conninfra loaded, RF pre-cal
+# done):
+#  1. load the driver: registers hci0, unconfigured (placeholder address)
+#     until setup (power on + FW download) is done
+#  2. set the public address from MIUI's nvdata (APCFG/APRDEB/BT_Addr, first
+#     6 bytes); the kernel programs it with the vendor command on power-on
+set -e
+modprobe bt_drv_6885
+# hci0 shows up in mgmt as unconfigured once the kernel finished setup (FW download)
+for i in $(seq 100); do
+	btmgmt config 2>/dev/null | grep -q "missing options: public-address" && break
+	sleep 0.1
+done
+
+P=$(mktemp -d)
+mount -o ro /dev/disk/by-partlabel/nvdata "$P"
+ADDR=$(od -An -tx1 -N6 "$P/APCFG/APRDEB/BT_Addr" | tr -s ' ' | sed 's/^ //; s/ /:/g' | tr a-f A-F)
+umount "$P"; rmdir "$P"
+btmgmt --index 0 public-addr "$ADDR"

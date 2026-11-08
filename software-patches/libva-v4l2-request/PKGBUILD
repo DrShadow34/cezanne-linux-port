@@ -1,0 +1,25 @@
+# cezanne-va: the port's VA-API driver (fork of Bootlin's libva-v4l2-request):
+# H.264 / HEVC / VP8 / VP9 / AV1 decoding on the vcodec V4L2 decoders and
+# H.264 encoding on cezanne-venc (NOTES "vcodec", "VENC"). libva picks the
+# driver by the render node's DRM driver name, so panfrost_drv_video.so links
+# to it. Built from this directory (src/, meson.build); old/ is reference only.
+pkgname=cezanne-va
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="VA-API driver for the Redmi K30 Ultra (MT6885) V4L2 video decoders and encoder"
+arch=(aarch64)
+url="https://localhost/arch-port"
+license=(LGPL-2.1-or-later MIT)
+depends=(glibc libva libdrm)
+makedepends=(meson)
+
+build() {
+  arch-meson "$startdir" build
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+  ln -s cezanne_drv_video.so "$pkgdir/usr/lib/dri/panfrost_drv_video.so"
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" "$startdir"/COPYING*
+}

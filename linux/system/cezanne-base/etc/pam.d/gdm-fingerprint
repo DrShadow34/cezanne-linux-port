@@ -1,0 +1,24 @@
+#%PAM-1.0
+
+auth       required                    pam_shells.so
+auth       requisite                   pam_nologin.so
+auth       requisite                   pam_faillock.so      preauth
+# cezanne: keep the fingerprint spot live while the lock screen is up (default 30 s)
+auth       required                    pam_fprintd.so max-tries=5 timeout=600
+# cezanne: a fingerprint unlock cancels the lock screen's parallel password
+# conversation, which system-auth's faillock counts as a failure: 3 unlocks
+# in 15 min locked the account out (fingerprint too). Reset it on success.
+auth       required                    pam_faillock.so      authsucc
+auth       optional                    pam_permit.so
+auth       required                    pam_env.so
+auth       [success=ok default=1]      pam_gdm.so
+-auth      optional                    pam_gnome_keyring.so
+-auth      optional                    pam_oo7.so
+
+account    include                     system-local-login
+
+password   required                    pam_deny.so
+
+session    include                     system-local-login
+-session   optional                    pam_gnome_keyring.so auto_start
+-session   optional                    pam_oo7.so auto_start

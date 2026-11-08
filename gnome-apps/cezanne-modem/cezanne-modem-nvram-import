@@ -1,0 +1,28 @@
+#!/bin/sh
+# cezanne-modem-nvram-import [ROOT]: copy the modem's NVRAM (IMEI,
+# calibration, settings) from the stock partitions into ROOT
+# (/var/lib/cezanne-modem). The partitions are only read: each is copied to
+# a file first, so its journal is replayed on the copy, not on the device.
+set -eu
+ROOT=${1:-/var/lib/cezanne-modem}
+PART=/dev/disk/by-partlabel
+[ -e "$ROOT/mnt/vendor/nvdata/md" ] && { echo "$ROOT already has NVRAM"; exit 1; }
+TMP=$(mktemp -d)
+trap 'umount "$TMP/m" 2>/dev/null || true; rm -rf "${TMP:?}"' EXIT
+mkdir -p "$TMP/m"
+for p in nvdata:nvdata nvcfg:nvcfg protect1:protect_f protect2:protect_s; do
+	part=${p%%:*} dir=${p##*:}
+	dd if="$PART/$part" of="$TMP/img" bs=1M status=none
+	e2fsck -fy "$TMP/img" >/dev/null 2>&1 || [ $? -le 2 ]
+	mount -o loop,ro "$TMP/img" "$TMP/m"
+	mkdir -p "$ROOT/mnt/vendor/$dir"
+	cp -a "$TMP/m/." "$ROOT/mnt/vendor/$dir/"
+	umount "$TMP/m"
+	rm -f "$TMP/img"
+done
+rm -rf "$ROOT"/mnt/vendor/*/lost+found
+mkdir -p "$ROOT/data/vendor/mdlpm" "$ROOT/data/vendor_de/md/cacerts/tls" \
+	"$ROOT/data/vendor_de/md/cacerts/ikev2"
+chown -R root:root "$ROOT"
+chmod 700 "$ROOT"
+echo "NVRAM copied to $ROOT"

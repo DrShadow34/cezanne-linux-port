@@ -1,0 +1,34 @@
+mt6885: keep the MDP power domain on
+
+The video decoder keeps MDP powered at runtime anyway (its core's bus is
+the MDP SMI, permanent runtime-PM reference). With 0050 MDP powered off
+and on in every system suspend, and the phone hung twice in ~60 AOD
+suspends (watchdog reset, no log); with MDP left on (A/B: boot-49) it
+didn't. 300+ quick rtcwake cycles never reproduced it. Keep MDP on until
+that is understood (the 0050 gate fixes stay: a power cycle at all would
+otherwise leave the MDPSYS SMI gates stuck gated and break the decoder).
+
+diff --git a/drivers/pmdomain/mediatek/mt6885-pm-domains.h b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+index 00dc0ef02..140309287 100644
+--- a/drivers/pmdomain/mediatek/mt6885-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+@@ -422,6 +422,11 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 	 * MDP and ADSP: lk leaves both on, and either blocks every SPM
+ 	 * low-power constraint. Not default-off, so genpd turns them off at
+ 	 * late init when unused (needs no pd_ignore_unused).
++	 *
++	 * MDP stays on though: the video decoder keeps it powered at runtime
++	 * (its core's bus is the MDP SMI), and powering it off in every system
++	 * suspend hung the phone now and then (2 in ~60 AOD suspends, never
++	 * with MDP left on, 2026-10-30; cause not found).
+ 	 */
+ 	[MT6885_POWER_DOMAIN_MDP] = {
+ 		.name = "mdp",
+@@ -454,6 +459,7 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 				    MT6885_TOP_AXI_PROT_EN_VDNR_SET, MT6885_TOP_AXI_PROT_EN_VDNR_CLR,
+ 				    MT6885_TOP_AXI_PROT_EN_VDNR_STA1),
+ 		},
++		.caps = MTK_SCPD_ALWAYS_ON,
+ 	},
+ 	[MT6885_POWER_DOMAIN_ADSP] = {
+ 		.name = "adsp",

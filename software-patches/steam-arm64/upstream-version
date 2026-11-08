@@ -1,0 +1,17 @@
+#!/bin/bash
+# upstream-version: what the steam-arm64 package follows (cezanne-build,
+# type follow): Valve's arm64 Steam Runtime for the stable client, and the
+# steam launcher tarball (Valve lists no versions; Arch's x86 steam package
+# follows it, so its version is the launcher's). Not the client itself: it
+# updates itself in ~/.local/share/Steam, and update-sources.sh pins its
+# current manifest at every rebuild anyway (the bootstrap of a first start).
+set -eu
+rt=$(curl -sSf -m 60 https://repo.steampowered.com/steamrt3c/images/latest-steam-client-general-availability/VERSION.txt | head -1)
+launcher=$(curl -sSf -m 60 'https://archlinux.org/packages/search/json/?name=steam' | python3 -c '
+import json, sys
+for p in json.load(sys.stdin)["results"]:
+    if p["pkgname"] == "steam":
+        print(p["pkgver"])
+        break')
+[ -n "$rt" ] && [ -n "$launcher" ]
+echo "$rt $launcher"

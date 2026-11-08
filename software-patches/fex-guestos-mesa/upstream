@@ -1,0 +1,2 @@
+# the guest Mesa follows the host's: rebuilt when ALARM ships a new mesa
+PROBE=mesa

@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Power settings for the cezanne (Redmi K30 Ultra): what the phone does
+while it sleeps, with what each part costs, and the microphone's noise
+reduction (cezanne-voice).
+
+The settings (schema org.cezanne.power) are read live by the cezanne-aod
+shell extension, which runs the always-on clock and the phone's sleep. The
+costs are measured: mA at the battery while asleep, coulomb counter over
+10 min suspends (NOTES "Standby power"). The top bar adds up what the
+current settings cost in standby; below it the real use of the last locked
+periods, from cezanne-standby-log.
+"""
+import datetime
+import json
+import os
+import sys
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = 'org.cezanne.Power'
+SCHEMA = 'org.cezanne.power'
+BATTERY = '/sys/class/power_supply/battery'
+LOG = '/var/lib/cezanne-power/standby.json'
+# cezanne-voice: its RNNoise plugin follows this file ("0" = off, missing = on)
+NR_PLUGIN = '/usr/lib/ladspa/cezanne-rnnoise.so'
+NR_STATE = os.path.join(GLib.get_user_config_dir(), 'cezanne', 'noise-reduction')
+
+# mA at the battery while asleep, measured 2026-10-31 (boot-57)
+COST_BASE = 17		# SoC in its deepest mode, PMIC, memory, idle modem
+COST_AOD = 20		# the panel lit in its AOD mode (~18) + a wake a minute
+COST_WIFI = 0		# Wi-Fi connected (power save): same as radio off
+COST_BT = 1		# Bluetooth on and idle (a paired device: page scans)
+BAR_MAX = 60
+BAR_LEVELS = (('good', 25, '#33d17a'), ('fair', 45, '#f6d32d'), ('poor', BAR_MAX, '#e66100'))
+
+BRIGHTNESS = (('auto', 'Automatic'), ('low', 'Low'), ('high', 'High'))
+WIFI = (('connected', 0, 'Stay connected'),
+        ('off-after', 5, 'Off after 5 minutes'),
+        ('off-after', 15, 'Off after 15 minutes'),
+        ('off-after', 60, 'Off after 1 hour'),
+        ('off', 0, 'Off right away'))
+# not there yet: the touch controller's gesture mode, the sensor hub awake
+COMING = (('Double tap to wake', 'The touchscreen watches for a double tap'),
+          ('Fingerprint from the always-on clock',
+           'A finger on the sensor wakes and unlocks the phone'),
+          ('Pocket detection', 'Keeps the screen off in a pocket, raise to wake'))
+
+CSS = ''.join(f'levelbar block.{name} {{ background-color: {color}; }}\n'
+              for name, _limit, color in BAR_LEVELS) + '''
+.estimate { font-size: 28pt; font-weight: 300; }
+'''
+
+
+def read(path, fallback=''):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return fallback
+
+
+def read_int(path, fallback=0):
+    try:
+        return int(read(path))
+    except ValueError:
+        return fallback
+
+
+def duration(seconds):
+    h, m = divmod(round(seconds / 60), 60)
+    return f'{h} h {m} min' if h else f'{m} min'
+
+
+def battery_mah():
+    return read_int(f'{BATTERY}/charge_full', 4500000) / 1000
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, settings):
+        super().__init__(application=app, title='Power', default_width=540,
+                         default_height=1100)
+        self.maximize()	# a phone app
+        self.settings = settings
+        self.syncing = False
+
+        page = Adw.PreferencesPage()
+        page.add(self.summary_group())
+        page.add(self.lock_group())
+        page.add(self.standby_group())
+        if os.path.exists(NR_PLUGIN):
+            page.add(self.mic_group())
+        page.add(self.coming_group())
+        self.history = Adw.PreferencesGroup(
+            title='Measured standby',
+            description='Battery use while the phone was locked, from the '
+                        'battery\'s charge counter')
+        page.add(self.history)
+        self.history_rows = []
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        view.set_content(page)
+        self.set_content(view)
+
+        settings.connect('changed', lambda *_: self.sync())
+        self.sync()
+        self.load_history()
+        try:
+            self.log_monitor = Gio.File.new_for_path(LOG).monitor_file(
+                Gio.FileMonitorFlags.WATCH_MOVES, None)
+            self.log_monitor.connect('changed', lambda *_: self.load_history())
+        except GLib.Error:
+            self.log_monitor = None	# no logger installed
+        self.update_now()
+        self.now_id = GLib.timeout_add_seconds(2, self.update_now)
+        self.connect('close-request', self.on_close)
+
+    def on_close(self, *_):
+        GLib.source_remove(self.now_id)
+        return False
+
+    # -- the estimate and the live draw --------------------------------
+    def summary_group(self):
+        group = Adw.PreferencesGroup()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      margin_top=6, margin_bottom=6)
+        title = Gtk.Label(label='In standby with these settings', xalign=0)
+        title.add_css_class('dim-label')
+        row = Gtk.Box(spacing=12)
+        self.estimate = Gtk.Label(xalign=0)
+        self.estimate.add_css_class('estimate')
+        self.days = Gtk.Label(xalign=1, hexpand=True, valign=Gtk.Align.END,
+                              margin_bottom=8)
+        row.append(self.estimate)
+        row.append(self.days)
+        self.bar = Gtk.LevelBar(min_value=0, max_value=BAR_MAX)
+        for name in ('low', 'high', 'full'):
+            self.bar.remove_offset_value(name)
+        for name, limit, _color in BAR_LEVELS:
+            self.bar.add_offset_value(name, limit)
+        self.note = Gtk.Label(xalign=0, wrap=True)
+        self.note.add_css_class('caption')
+        self.note.add_css_class('dim-label')
+        self.now = Gtk.Label(xalign=0, margin_top=6)
+        self.last = Gtk.Label(xalign=0, wrap=True)
+        self.last.add_css_class('dim-label')
+        for w in (title, row, self.bar, self.note, self.now, self.last):
+            box.append(w)
+        card = Gtk.Box(margin_start=12, margin_end=12, margin_top=6, margin_bottom=6)
+        card.append(box)
+        box.set_hexpand(True)
+        frame = Gtk.Box()
+        frame.add_css_class('card')
+        frame.append(card)
+        group.add(frame)
+        return group
+
+    def standby_ma(self):
+        """steady state: what each hour of standby costs once it settled"""
+        ma = COST_BASE
+        if not self.settings.get_boolean('bluetooth-standby'):
+            ma += COST_BT
+        if self.settings.get_boolean('aod-enabled'):
+            ma += COST_AOD
+            if self.settings.get_string('wifi-standby') == 'connected':
+                ma += COST_WIFI
+        return ma
+
+    def update_estimate(self):
+        ma = self.standby_ma()
+        self.estimate.set_label(f'≈ {ma} mA')
+        days = battery_mah() / ma / 24
+        self.days.set_label(f'about {days:.0f} days on a full battery')
+        self.bar.set_value(min(ma, BAR_MAX))
+        notes = []
+        if COST_WIFI and self.settings.get_boolean('aod-enabled') and \
+                self.settings.get_string('wifi-standby') == 'off-after':
+            m = self.settings.get_uint('wifi-standby-minutes')
+            notes.append(f'+{COST_WIFI} mA for the first {duration(m * 60)} '
+                         'while Wi-Fi is still connected.')
+        notes.append('Without a SIM card in use; mobile network not measured yet.')
+        self.note.set_label(' '.join(notes))
+
+    def update_now(self):
+        ua = read_int(f'{BATTERY}/current_now')
+        status = read(f'{BATTERY}/status')
+        if ua > 0 or status in ('Charging', 'Full'):
+            self.now.set_label(f'Now: charging, {abs(ua) / 1000:.0f} mA into the battery')
+        else:
+            self.now.set_label(f'Now: {abs(ua) / 1000:.0f} mA with the screen on')
+        return GLib.SOURCE_CONTINUE
+
+    # -- settings rows ---------------------------------------------------
+    def lock_group(self):
+        group = Adw.PreferencesGroup(
+            title='Lock screen',
+            description='The panel stays lit for the clock and the phone '
+                        'wakes once a minute to move it. Without it the phone '
+                        'sleeps fully and Wi-Fi disconnects until the screen '
+                        'turns on')
+        self.aod = Adw.SwitchRow(title='Always-on clock',
+                                 subtitle=f'≈ {COST_AOD} mA')
+        self.settings.bind('aod-enabled', self.aod, 'active',
+                           Gio.SettingsBindFlags.DEFAULT)
+        group.add(self.aod)
+        self.brightness = Adw.ComboRow(
+            title='Clock brightness',
+            subtitle='Brighter costs more; not measured yet',
+            model=Gtk.StringList.new([label for _key, label in BRIGHTNESS]))
+        self.brightness.connect('notify::selected', self.on_brightness)
+        group.add(self.brightness)
+        return group
+
+    def standby_group(self):
+        group = Adw.PreferencesGroup(
+            title='While the phone sleeps',
+            description='Off: Wi-Fi reconnects a few seconds after the '
+                        'screen turns on; messages arrive then. Bluetooth '
+                        'turns back on with the screen')
+        self.wifi = Adw.ComboRow(
+            title='Wi-Fi',
+            model=Gtk.StringList.new([label for _m, _n, label in WIFI]))
+        self.wifi.connect('notify::selected', self.on_wifi)
+        group.add(self.wifi)
+        self.bt = Adw.SwitchRow(
+            title='Bluetooth off',
+            subtitle=f'Unless a device is connected; saves ≈ {COST_BT} mA')
+        self.settings.bind('bluetooth-standby', self.bt, 'active',
+                           Gio.SettingsBindFlags.DEFAULT)
+        group.add(self.bt)
+        return group
+
+    def mic_group(self):
+        group = Adw.PreferencesGroup(
+            title='Microphone',
+            description='RNNoise removes background noise from everything '
+                        'recorded with the microphone, and from phone calls '
+                        '(after the echo cancelling)')
+        self.nr = Adw.SwitchRow(
+            title='Noise reduction',
+            subtitle='Only while recording: ≈ 2 % of a big CPU core, '
+                     '11 % of a little one',
+            active=read(NR_STATE, '1')[:1] != '0')
+        self.nr.connect('notify::active', self.on_noise_reduction)
+        group.add(self.nr)
+        return group
+
+    def on_noise_reduction(self, row, _pspec):
+        try:
+            os.makedirs(os.path.dirname(NR_STATE), exist_ok=True)
+            with open(NR_STATE + '.new', 'w') as f:
+                f.write('1\n' if row.get_active() else '0\n')
+            os.replace(NR_STATE + '.new', NR_STATE)	# the plugin watches the directory
+        except OSError as e:
+            print(f'cezanne-power: {NR_STATE}: {e}', file=sys.stderr)
+
+    def coming_group(self):
+        group = Adw.PreferencesGroup(title='Waking')
+        for title, subtitle in COMING:
+            row = Adw.SwitchRow(title=title, subtitle=f'{subtitle}. Coming',
+                                sensitive=False)
+            group.add(row)
+        return group
+
+    def sync(self):
+        """settings -> rows (also when the shell changed them)"""
+        self.syncing = True
+        aod = self.settings.get_boolean('aod-enabled')
+        keys = [key for key, _label in BRIGHTNESS]
+        b = self.settings.get_string('aod-brightness')
+        self.brightness.set_selected(keys.index(b) if b in keys else 0)
+        self.brightness.set_sensitive(aod)
+        mode = self.settings.get_string('wifi-standby')
+        minutes = self.settings.get_uint('wifi-standby-minutes')
+        sel = 0
+        for i, (m, n, _label) in enumerate(WIFI):
+            if m == mode and (m != 'off-after' or n == minutes):
+                sel = i
+                break
+        else:
+            if mode == 'off-after':	# a value set elsewhere: the nearest
+                sel = min((i for i, w in enumerate(WIFI) if w[0] == 'off-after'),
+                          key=lambda i: abs(WIFI[i][1] - minutes))
+        self.wifi.set_selected(sel)
+        self.wifi.set_sensitive(aod)
+        if not aod:
+            self.wifi.set_subtitle('Off without the clock')
+        elif not COST_WIFI:
+            self.wifi.set_subtitle('No measurable cost')
+        elif mode == 'connected':
+            self.wifi.set_subtitle(f'≈ {COST_WIFI} mA')
+        else:
+            self.wifi.set_subtitle(f'≈ {COST_WIFI} mA until off')
+        self.syncing = False
+        self.update_estimate()
+
+    def on_brightness(self, row, _pspec):
+        if not self.syncing:
+            self.settings.set_string('aod-brightness', BRIGHTNESS[row.get_selected()][0])
+
+    def on_wifi(self, row, _pspec):
+        if self.syncing:
+            return
+        mode, minutes, _label = WIFI[row.get_selected()]
+        if minutes:
+            self.settings.set_uint('wifi-standby-minutes', minutes)
+        self.settings.set_string('wifi-standby', mode)
+
+    # -- measured periods ----------------------------------------------
+    def load_history(self):
+        try:
+            with open(LOG) as f:
+                log = json.load(f)
+        except (OSError, ValueError):
+            log = []
+        periods = [p for p in log if not p.get('plugged')][-8:][::-1]
+        for row in self.history_rows:
+            self.history.remove(row)
+        self.history_rows = []
+        if not periods:
+            self.last.set_label('No measured standby yet: lock the phone for a '
+                                'few minutes on battery.')
+            row = Adw.ActionRow(title='Nothing measured yet',
+                                subtitle='Periods on battery longer than 2 minutes '
+                                         'show up here')
+            self.history.add(row)
+            self.history_rows.append(row)
+            return
+        p = periods[0]
+        self.last.set_label(f'Last standby: {p["ma"]:.0f} mA over '
+                            f'{duration(p["seconds"])}, asleep '
+                            f'{100 * p["asleep"] / p["seconds"]:.0f} %')
+        for p in periods:
+            start = datetime.datetime.fromtimestamp(p['start'])
+            end = datetime.datetime.fromtimestamp(p['end'])
+            when = f'{start:%a %d %b, %H:%M}–{end:%H:%M}'
+            row = Adw.ActionRow(
+                title=f'{p["ma"]:.0f} mA · {duration(p["seconds"])}',
+                subtitle=f'{when} · asleep {100 * p["asleep"] / p["seconds"]:.0f} % '
+                         f'· {p["suspends"]} sleeps · {p["uah"] / 1000:.0f} mAh')
+            self.history.add(row)
+            self.history_rows.append(row)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        css = Gtk.CssProvider()
+        css.load_from_string(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        win = self.get_active_window()
+        if not win:
+            schema = Gio.SettingsSchemaSource.get_default().lookup(SCHEMA, True)
+            if not schema:
+                sys.exit(f'cezanne-power: schema {SCHEMA} not installed')
+            win = Window(self, Gio.Settings(settings_schema=schema))
+        win.present()
+
+
+if __name__ == '__main__':
+    sys.exit(App().run(sys.argv))

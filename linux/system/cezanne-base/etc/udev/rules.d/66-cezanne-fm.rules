@@ -1,0 +1,2 @@
+# MediaTek FM receiver (fmradio_drv): players in the audio group
+KERNEL=="fm", SUBSYSTEM=="fm", GROUP="audio", MODE="0660"

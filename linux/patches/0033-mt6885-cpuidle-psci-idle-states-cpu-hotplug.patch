@@ -1,0 +1,86 @@
+diff --git a/drivers/cpuidle/cpuidle-psci.c b/drivers/cpuidle/cpuidle-psci.c
+index b250d0dde..7978a3418 100644
+--- a/drivers/cpuidle/cpuidle-psci.c
++++ b/drivers/cpuidle/cpuidle-psci.c
+@@ -347,12 +347,16 @@ static void psci_cpu_deinit_idle(int cpu)
+ 	psci_cpuidle_use_syscore = false;
+ }
+ 
++static bool start_off;
++module_param(start_off, bool, 0444);
++MODULE_PARM_DESC(start_off, "Register the DT idle states disabled");
++
+ static int psci_idle_init_cpu(struct device *dev, int cpu)
+ {
+ 	struct cpuidle_driver *drv;
+ 	struct device_node *cpu_node;
+ 	const char *enable_method;
+-	int ret = 0;
++	int ret = 0, i;
+ 
+ 	cpu_node = of_cpu_device_node_get(cpu);
+ 	if (!cpu_node)
+@@ -409,6 +413,11 @@ static int psci_idle_init_cpu(struct device *dev, int cpu)
+ 		return ret;
+ 	}
+ 
++	/* bring-up: register the DT states disabled, enable them from sysfs */
++	if (start_off)
++		for (i = 1; i < drv->state_count; i++)
++			drv->states[i].flags |= CPUIDLE_FLAG_OFF;
++
+ 	ret = cpuidle_register(drv, NULL);
+ 	if (ret)
+ 		goto deinit;
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index 04e93d48d..f3ccf0347 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -9,4 +9,5 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
++obj-$(CONFIG_ARCH_MEDIATEK) += mt6885-cpuhp.o
+ obj-$(CONFIG_MTK_DSI_CMD_KICK) += mtk-dsi-cmd-kick.o
+diff --git a/drivers/soc/mediatek/mt6885-cpuhp.c b/drivers/soc/mediatek/mt6885-cpuhp.c
+new file mode 100644
+index 000000000..2da3e5b3d
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6885-cpuhp.c
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6885 CPU hotplug: after PSCI CPU_OFF, MediaTek's ATF still needs the
++ * boot side to power the core down through a SIP call, otherwise the next
++ * CPU_ON of that core never completes. From the 4.14 BSP's
++ * base/power/cpuhotplug (cpuhp_platform_cpuoff()); its cluster power-down
++ * call (0xc2000210) is not implemented by this ATF.
++ */
++#include <linux/arm-smccc.h>
++#include <linux/cpu.h>
++#include <linux/cpuhotplug.h>
++#include <linux/init.h>
++#include <linux/of.h>
++
++#define MTK_SIP_POWER_DOWN_CORE		0xc2000212
++
++static int mt6885_cpuhp_dead(unsigned int cpu)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(MTK_SIP_POWER_DOWN_CORE, cpu, 0, 0, 0, 0, 0, 0, &res);
++	return 0;
++}
++
++static int __init mt6885_cpuhp_init(void)
++{
++	int ret;
++
++	if (!of_machine_is_compatible("mediatek,mt6885"))
++		return 0;
++
++	ret = cpuhp_setup_state_nocalls(CPUHP_BP_PREPARE_DYN, "soc/mt6885:dead",
++					NULL, mt6885_cpuhp_dead);
++	return ret < 0 ? ret : 0;
++}
++early_initcall(mt6885_cpuhp_init);

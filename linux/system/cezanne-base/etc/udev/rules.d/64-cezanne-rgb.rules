@@ -1,0 +1,6 @@
+# Pop-up camera RGB lights (AW2015): rgb:status (notification light, left)
+# and rgb:indicator (right) for the video group (GNOME notification light
+# extension, RGB tools). Trigger attributes (hw_pattern, delay_on, ...) appear
+# when a trigger is set, announced by a "change" uevent.
+SUBSYSTEM=="leds", KERNEL=="rgb:*", ACTION=="add|change", \
+  RUN+="/bin/sh -c 'cd /sys%p && for f in brightness multi_intensity trigger hw_pattern pattern repeat delay_on delay_off; do [ -e $$f ] && chgrp video $$f && chmod g+w $$f; done; true'"

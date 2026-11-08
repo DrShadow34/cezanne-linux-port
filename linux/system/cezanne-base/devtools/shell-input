@@ -1,0 +1,6 @@
+#!/bin/sh
+# shell-input: run shell-input.js inside the phone's GNOME session (user arch).
+# Usage: shell-input key super+v  (see shell-input.js for the actions)
+exec runuser -u arch -- env XDG_RUNTIME_DIR=/run/user/1002 \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1002/bus \
+    gjs -m /usr/local/lib/cezanne/shell-input.js "$@"

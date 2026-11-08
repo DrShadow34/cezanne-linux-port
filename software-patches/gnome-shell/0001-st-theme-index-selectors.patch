@@ -1,0 +1,454 @@
+From: cezanne port
+Subject: [PATCH] st/theme: index the selectors of a stylesheet
+
+add_matched_properties() tested every selector of every stylesheet for
+each theme node (~1400 rules with the shell theme and an extension like
+dash-to-dock): most of the time St spent styling actors shown for the
+first time, e.g. the first open of a menu after a shell start. Selectors
+are now filed under what their rightmost simple selector requires of a
+node (id, else first class, else element type name), and a node is
+tested only against its candidates, in stylesheet order, with the same
+matching code: the cascade is unchanged. The index lives with the
+CRStyleSheet and is freed with it.
+---
+diff --git a/src/st/croco/cr-stylesheet.c b/src/st/croco/cr-stylesheet.c
+--- a/src/st/croco/cr-stylesheet.c
++++ b/src/st/croco/cr-stylesheet.c
+@@ -169,6 +169,8 @@
+ {
+         g_return_if_fail (a_this);
+ 
++        if (a_this->st_index && a_this->st_index_free)
++                a_this->st_index_free (a_this->st_index);
+         if (a_this->statements) {
+                 cr_statement_destroy (a_this->statements);
+                 a_this->statements = NULL;
+diff --git a/src/st/croco/cr-stylesheet.h b/src/st/croco/cr-stylesheet.h
+--- a/src/st/croco/cr-stylesheet.h
++++ b/src/st/croco/cr-stylesheet.h
+@@ -73,6 +73,12 @@
+ 	gpointer app_data ;
+ 
+ 	/**
++	 *St's selector index of this sheet (st-theme.c), freed with it
++	 */
++	gpointer st_index ;
++	GDestroyNotify st_index_free ;
++
++	/**
+ 	 *the reference count of this instance
+ 	 *Please, don't never ever modify it
+ 	 *directly. Use cr_stylesheet_ref()
+diff --git a/src/st/st-theme.c b/src/st/st-theme.c
+--- a/src/st/st-theme.c
++++ b/src/st/st-theme.c
+@@ -856,130 +856,301 @@
+   return CR_OK;
+ }
+ 
++/* Selector index of a stylesheet. Every selector of its rulesets is filed
++ * under what its rightmost simple selector requires of a node: its id, else
++ * its first class, else its element type name (matched against the node's
++ * type, its parent types and interfaces, as element_name_matches_type()
++ * does). Selectors requiring none of these and @import statements go into
++ * @other, tried for every node. A node is only tested against its
++ * candidates, in their order in the stylesheet, so the cascade is the same
++ * as testing every selector: with ~1400 rules (the shell theme plus
++ * extension stylesheets) matching was most of the time St spent styling
++ * actors shown for the first time.
++ */
++typedef struct
++{
++  CRStatement *stmt;
++  CRSelector  *sel;     /* NULL: the @import statement @stmt */
++  guint        seq;     /* position in the stylesheet */
++} SelectorEntry;
++
++typedef struct
++{
++  GHashTable *by_id;    /* const char * -> GArray of SelectorEntry */
++  GHashTable *by_class;
++  GHashTable *by_type;
++  GArray     *other;
++} SheetIndex;
++
+ static void
+-add_matched_properties (StTheme      *a_this,
+-                        CRStyleSheet *a_nodesheet,
+-                        StThemeNode  *a_node,
+-                        GPtrArray    *props)
++sheet_index_free (gpointer data)
++{
++  SheetIndex *index = data;
++
++  g_hash_table_destroy (index->by_id);
++  g_hash_table_destroy (index->by_class);
++  g_hash_table_destroy (index->by_type);
++  g_array_unref (index->other);
++  g_free (index);
++}
++
++static GHashTable *
++entry_table_new (void)
+ {
+-  CRStatement *cur_stmt = NULL;
+-  CRSelector *sel_list = NULL;
+-  CRSelector *cur_sel = NULL;
+-  gboolean matches = FALSE;
+-  enum CRStatus status = CR_OK;
+-
+-  /*
+-   *walk through the list of statements and,
+-   *get the selectors list inside the statements that
+-   *contain some, and try to match our style node in these
+-   *selectors lists.
+-   */
+-  for (cur_stmt = a_nodesheet->statements; cur_stmt; cur_stmt = cur_stmt->next)
+-    {
+-      /*
+-       *initialize the selector list in which we will
+-       *really perform the search.
+-       */
+-      sel_list = NULL;
+-
+-      /*
+-       *get the the damn selector list in
+-       *which we have to look
+-       */
+-      switch (cur_stmt->type)
++  /* the keys are the stylesheet's own strings, alive as long as it is */
++  return g_hash_table_new_full (g_str_hash, g_str_equal, NULL,
++                                (GDestroyNotify) g_array_unref);
++}
++
++static void
++entry_table_add (GHashTable          *table,
++                 const char          *key,
++                 const SelectorEntry *entry)
++{
++  GArray *entries = g_hash_table_lookup (table, key);
++
++  if (!entries)
++    {
++      entries = g_array_new (FALSE, FALSE, sizeof (SelectorEntry));
++      g_hash_table_insert (table, (gpointer) key, entries);
++    }
++  g_array_append_val (entries, *entry);
++}
++
++static const char *
++cr_string_str (CRString *string)
++{
++  return string && string->stryng ? string->stryng->str : NULL;
++}
++
++static void
++sheet_index_add_selector (SheetIndex          *index,
++                          CRSimpleSel         *simple_sel,
++                          const SelectorEntry *entry)
++{
++  CRSimpleSel *last;
++  CRAdditionalSel *add_sel;
++  const char *class_name = NULL;
++
++  for (last = simple_sel; last->next; last = last->next)
++    ;
++
++  for (add_sel = last->add_sel; add_sel; add_sel = add_sel->next)
++    {
++      if (add_sel->type == ID_ADD_SELECTOR && cr_string_str (add_sel->content.id_name))
+         {
+-        case RULESET_STMT:
+-          if (cur_stmt->kind.ruleset && cur_stmt->kind.ruleset->sel_list)
++          entry_table_add (index->by_id, cr_string_str (add_sel->content.id_name), entry);
++          return;
++        }
++      if (add_sel->type == CLASS_ADD_SELECTOR && !class_name)
++        class_name = cr_string_str (add_sel->content.class_name);
++    }
++
++  if (class_name)
++    entry_table_add (index->by_class, class_name, entry);
++  else if ((last->type_mask & TYPE_SELECTOR) &&
++           !(last->type_mask & UNIVERSAL_SELECTOR) &&
++           cr_string_str (last->name))
++    entry_table_add (index->by_type, cr_string_str (last->name), entry);
++  else
++    g_array_append_val (index->other, *entry);
++}
++
++static SheetIndex *
++sheet_get_index (CRStyleSheet *sheet)
++{
++  SheetIndex *index = sheet->st_index;
++  CRStatement *stmt;
++  guint seq = 0;
++
++  if (index)
++    return index;
++
++  index = g_new0 (SheetIndex, 1);
++  index->by_id = entry_table_new ();
++  index->by_class = entry_table_new ();
++  index->by_type = entry_table_new ();
++  index->other = g_array_new (FALSE, FALSE, sizeof (SelectorEntry));
++
++  for (stmt = sheet->statements; stmt; stmt = stmt->next)
++    {
++      if (stmt->type == AT_IMPORT_RULE_STMT)
++        {
++          SelectorEntry entry = { stmt, NULL, seq++ };
++
++          g_array_append_val (index->other, entry);
++        }
++      else if (stmt->type == RULESET_STMT &&
++               stmt->kind.ruleset && stmt->kind.ruleset->sel_list)
++        {
++          CRSelector *sel;
++
++          for (sel = stmt->kind.ruleset->sel_list; sel; sel = sel->next)
+             {
+-              sel_list = cur_stmt->kind.ruleset->sel_list;
++              SelectorEntry entry = { stmt, sel, seq++ };
++
++              if (sel->simple_sel)
++                sheet_index_add_selector (index, sel->simple_sel, &entry);
+             }
+-          break;
++        }
++    }
++
++  sheet->st_index = index;
++  sheet->st_index_free = sheet_index_free;
++  return index;
++}
+ 
+-        case AT_IMPORT_RULE_STMT:
+-          {
+-            CRAtImportRule *import_rule = cur_stmt->kind.import_rule;
+-
+-            if (import_rule->sheet == NULL)
+-              {
+-                CRStyleSheet *sheet = NULL;
+-                GFile *file = NULL;
+-
+-                if (import_rule->url->stryng && import_rule->url->stryng->str)
+-                  {
+-                    file = _st_theme_resolve_url (a_this,
+-                                                  a_nodesheet,
+-                                                  import_rule->url->stryng->str);
+-                    sheet = resolve_stylesheet (a_this, file, NULL);
+-                  }
+-
+-                if (sheet)
+-                  {
+-                    import_rule->sheet = sheet;
+-                  }
+-                else
+-                  {
+-                    /* Set a marker to avoid repeatedly trying to parse a non-existent or
+-                     * broken stylesheet
+-                     */
+-                    import_rule->sheet = (CRStyleSheet *) - 1;
+-                  }
+-
+-                if (file)
+-                  g_object_unref (file);
+-              }
+-
+-            if (import_rule->sheet != (CRStyleSheet *) - 1)
+-              {
+-                add_matched_properties (a_this, import_rule->sheet,
+-                                        a_node, props);
+-              }
+-          }
+-          break;
+-        case AT_MEDIA_RULE_STMT:
+-        case AT_RULE_STMT:
+-        case AT_PAGE_RULE_STMT:
+-        case AT_CHARSET_RULE_STMT:
+-        case AT_FONT_FACE_RULE_STMT:
+-        default:
+-          break;
++static void
++collect_entries (GArray     *candidates,
++                 GHashTable *table,
++                 const char *key)
++{
++  GArray *entries;
++
++  if (key && (entries = g_hash_table_lookup (table, key)))
++    g_array_append_vals (candidates, entries->data, entries->len);
++}
++
++static int
++compare_entries (gconstpointer a,
++                 gconstpointer b)
++{
++  const SelectorEntry *entry_a = a;
++  const SelectorEntry *entry_b = b;
++
++  return (entry_a->seq > entry_b->seq) - (entry_a->seq < entry_b->seq);
++}
++
++static void add_matched_properties (StTheme      *a_this,
++                                    CRStyleSheet *a_nodesheet,
++                                    StThemeNode  *a_node,
++                                    GPtrArray    *props);
++
++static void
++add_imported_properties (StTheme      *a_this,
++                         CRStyleSheet *a_nodesheet,
++                         CRStatement  *cur_stmt,
++                         StThemeNode  *a_node,
++                         GPtrArray    *props)
++{
++  CRAtImportRule *import_rule = cur_stmt->kind.import_rule;
++
++  if (import_rule->sheet == NULL)
++    {
++      CRStyleSheet *sheet = NULL;
++      GFile *file = NULL;
++
++      if (import_rule->url->stryng && import_rule->url->stryng->str)
++        {
++          file = _st_theme_resolve_url (a_this,
++                                        a_nodesheet,
++                                        import_rule->url->stryng->str);
++          sheet = resolve_stylesheet (a_this, file, NULL);
+         }
+ 
+-      if (!sel_list)
++      if (sheet)
++        {
++          import_rule->sheet = sheet;
++        }
++      else
++        {
++          /* Set a marker to avoid repeatedly trying to parse a non-existent or
++           * broken stylesheet
++           */
++          import_rule->sheet = (CRStyleSheet *) - 1;
++        }
++
++      if (file)
++        g_object_unref (file);
++    }
++
++  if (import_rule->sheet != (CRStyleSheet *) - 1)
++    {
++      add_matched_properties (a_this, import_rule->sheet,
++                              a_node, props);
++    }
++}
++
++static void
++add_matched_properties (StTheme      *a_this,
++                        CRStyleSheet *a_nodesheet,
++                        StThemeNode  *a_node,
++                        GPtrArray    *props)
++{
++  SheetIndex *index = sheet_get_index (a_nodesheet);
++  g_autoptr (GArray) candidates = g_array_new (FALSE, FALSE, sizeof (SelectorEntry));
++  GType type = st_theme_node_get_element_type (a_node);
++  GStrv classes;
++  guint i, last_seq = G_MAXUINT;
++
++  collect_entries (candidates, index->by_id, st_theme_node_get_element_id (a_node));
++  classes = st_theme_node_get_element_classes (a_node);
++  for (i = 0; classes && classes[i]; i++)
++    collect_entries (candidates, index->by_class, classes[i]);
++
++  if (type == G_TYPE_NONE)
++    {
++      collect_entries (candidates, index->by_type, "stage");
++    }
++  else
++    {
++      GType *ifaces;
++      guint n_ifaces;
++      GType t;
++
++      for (t = type; t; t = g_type_parent (t))
++        collect_entries (candidates, index->by_type, g_type_name (t));
++
++      ifaces = g_type_interfaces (type, &n_ifaces);
++      for (i = 0; i < n_ifaces; i++)
++        collect_entries (candidates, index->by_type, g_type_name (ifaces[i]));
++      g_free (ifaces);
++    }
++
++  g_array_append_vals (candidates, index->other->data, index->other->len);
++  g_array_sort (candidates, compare_entries);
++
++  for (i = 0; i < candidates->len; i++)
++    {
++      SelectorEntry *entry = &g_array_index (candidates, SelectorEntry, i);
++      CRStatement *cur_stmt = entry->stmt;
++      CRSelector *cur_sel = entry->sel;
++      gboolean matches = FALSE;
++      enum CRStatus status = CR_OK;
++
++      /* a class or interface listed twice */
++      if (entry->seq == last_seq)
+         continue;
++      last_seq = entry->seq;
+ 
+-      /*
+-       *now, we have a comma separated selector list to look in.
+-       *let's walk it and try to match the style node
+-       *on each item of the list.
+-       */
+-      for (cur_sel = sel_list; cur_sel; cur_sel = cur_sel->next)
++      if (!cur_sel)
+         {
+-          if (!cur_sel->simple_sel)
+-            continue;
++          add_imported_properties (a_this, a_nodesheet, cur_stmt, a_node, props);
++          continue;
++        }
+ 
+-          status = sel_matches_style_real (a_this, cur_sel->simple_sel, a_node, &matches, TRUE, TRUE);
++      status = sel_matches_style_real (a_this, cur_sel->simple_sel, a_node, &matches, TRUE, TRUE);
+ 
+-          if (status == CR_OK && matches)
+-            {
+-              CRDeclaration *cur_decl = NULL;
++      if (status == CR_OK && matches)
++        {
++          CRDeclaration *cur_decl = NULL;
+ 
+-              /* In order to sort the matching properties, we need to compute the
+-               * specificity of the selector that actually matched this
+-               * element. In a non-thread-safe fashion, we store it in the
+-               * ruleset. (Fixing this would mean cut-and-pasting
+-               * cr_simple_sel_compute_specificity(), and have no need for
+-               * thread-safety anyways.)
+-               *
+-               * Once we've sorted the properties, the specificity no longer
+-               * matters and it can be safely overridden.
+-               */
+-              cr_simple_sel_compute_specificity (cur_sel->simple_sel);
++          /* In order to sort the matching properties, we need to compute the
++           * specificity of the selector that actually matched this
++           * element. In a non-thread-safe fashion, we store it in the
++           * ruleset. (Fixing this would mean cut-and-pasting
++           * cr_simple_sel_compute_specificity(), and have no need for
++           * thread-safety anyways.)
++           *
++           * Once we've sorted the properties, the specificity no longer
++           * matters and it can be safely overridden.
++           */
++          cr_simple_sel_compute_specificity (cur_sel->simple_sel);
+ 
+-              cur_stmt->specificity = cur_sel->simple_sel->specificity;
++          cur_stmt->specificity = cur_sel->simple_sel->specificity;
+ 
+-              for (cur_decl = cur_stmt->kind.ruleset->decl_list; cur_decl; cur_decl = cur_decl->next)
+-                g_ptr_array_add (props, cur_decl);
+-            }
++          for (cur_decl = cur_stmt->kind.ruleset->decl_list; cur_decl; cur_decl = cur_decl->next)
++            g_ptr_array_add (props, cur_decl);
+         }
+     }
+ }

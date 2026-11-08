@@ -1,0 +1,111 @@
+ASoC: mt8192-mt6359: cezanne USB-C headset jack from the Type-C port mode
+
+diff --git a/sound/soc/mediatek/Kconfig b/sound/soc/mediatek/Kconfig
+index 224746e76..edb20527c 100644
+--- a/sound/soc/mediatek/Kconfig
++++ b/sound/soc/mediatek/Kconfig
+@@ -301,6 +301,7 @@ config SND_SOC_MT8192_MT6359_RT1015_RT5682
+ 	tristate "ASoC Audio driver for MT8192 with MT6359 RT1015 RT5682 codec"
+ 	depends on I2C && GPIOLIB
+ 	depends on SND_SOC_MT8192 && MTK_PMIC_WRAP
++	depends on TYPEC || !TYPEC
+ 	select SND_SOC_MT6359
+ 	select SND_SOC_RT1015
+ 	select SND_SOC_RT1015P
+diff --git a/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c b/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
+index cf6fdfdfb..e1785bbcd 100644
+--- a/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
++++ b/sound/soc/mediatek/mt8192/mt8192-mt6359-rt1015-rt5682.c
+@@ -12,6 +12,8 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/pm_runtime.h>
++#include <linux/usb/typec_altmode.h>
++#include <linux/usb/typec_mux.h>
+ #include <sound/jack.h>
+ #include <sound/pcm_params.h>
+ #include <sound/rt5682.h>
+@@ -1076,6 +1078,75 @@ static const struct snd_kcontrol_new mt6885_mt6359_cs35l41_controls[] = {
+ 	SOC_DAPM_PIN_SWITCH("Headset Mic"),
+ };
+ 
++/*
++ * USB-C analog headset: the TCPM port enters Audio Accessory Mode and the
++ * FSA4480 routes the adapter to the MT6359 headphone outputs and AIN1. The
++ * card is a second mode switch on the Type-C connector (DT "mode-switch")
++ * and reports the jack from the port mode. Mic / button detection (accdet)
++ * isn't there yet: an analog adapter reports as a full headset.
++ */
++struct mt6885_typec_jack {
++	struct snd_soc_jack *jack;
++	struct mutex lock;
++	bool audio;
++};
++
++static int mt6885_typec_jack_set(struct typec_mux_dev *mux,
++				 struct typec_mux_state *state)
++{
++	struct mt6885_typec_jack *tj = typec_mux_get_drvdata(mux);
++
++	mutex_lock(&tj->lock);
++	tj->audio = !state->alt && state->mode == TYPEC_MODE_AUDIO;
++	if (tj->jack)
++		snd_soc_jack_report(tj->jack, tj->audio ? SND_JACK_HEADSET : 0,
++				    SND_JACK_HEADSET);
++	mutex_unlock(&tj->lock);
++
++	return 0;
++}
++
++static void mt6885_typec_jack_unregister(void *data)
++{
++	typec_mux_unregister(data);
++}
++
++static int mt6885_mt6359_cs35l41_late_probe(struct snd_soc_card *card)
++{
++	struct mtk_soc_card_data *soc_card_data = snd_soc_card_get_drvdata(card);
++	struct snd_soc_jack *jack = &soc_card_data->card_data->jacks[MT8192_JACK_HEADSET];
++	struct typec_mux_desc desc = {};
++	struct mt6885_typec_jack *tj;
++	struct typec_mux_dev *mux;
++	int ret;
++
++	if (!device_property_present(card->dev, "mode-switch"))
++		return 0;
++
++	ret = snd_soc_card_jack_new_pins(card, "Headset Jack", SND_JACK_HEADSET,
++					 jack, mt8192_jack_pins,
++					 ARRAY_SIZE(mt8192_jack_pins));
++	if (ret)
++		return dev_err_probe(card->dev, ret, "Headset Jack creation failed\n");
++
++	tj = devm_kzalloc(card->dev, sizeof(*tj), GFP_KERNEL);
++	if (!tj)
++		return -ENOMEM;
++	mutex_init(&tj->lock);
++	tj->jack = jack;
++
++	desc.fwnode = dev_fwnode(card->dev);
++	desc.drvdata = tj;
++	desc.name = "cezanne-headset";
++	desc.set = mt6885_typec_jack_set;
++	mux = typec_mux_register(card->dev, &desc);
++	if (IS_ERR(mux))
++		return dev_err_probe(card->dev, PTR_ERR(mux),
++				     "Type-C jack switch registration failed\n");
++
++	return devm_add_action_or_reset(card->dev, mt6885_typec_jack_unregister, mux);
++}
++
+ /* routes come from the DT (audio-routing) */
+ static struct snd_soc_card mt6885_mt6359_cs35l41_card = {
+ 	.driver_name = DRIVER_NAME,
+@@ -1086,6 +1157,7 @@ static struct snd_soc_card mt6885_mt6359_cs35l41_card = {
+ 	.num_controls = ARRAY_SIZE(mt6885_mt6359_cs35l41_controls),
+ 	.dapm_widgets = mt6885_mt6359_cs35l41_widgets,
+ 	.num_dapm_widgets = ARRAY_SIZE(mt6885_mt6359_cs35l41_widgets),
++	.late_probe = mt6885_mt6359_cs35l41_late_probe,
+ };
+ 
+ static int mt8192_mt6359_card_set_be_link(struct device *dev,

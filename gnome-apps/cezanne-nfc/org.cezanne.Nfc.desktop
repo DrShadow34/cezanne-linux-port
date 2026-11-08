@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=NFC
+Comment=Read, save and write NFC tags
+Exec=cezanne-nfc
+Icon=org.cezanne.Nfc
+Terminal=false
+Type=Application
+Categories=Utility;
+Keywords=NFC;tag;card;NDEF;contactless;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

@@ -1,0 +1,26 @@
+diff --git a/drivers/clk/mediatek/clk-mtk.c b/drivers/clk/mediatek/clk-mtk.c
+index 3dfdd3a42..3de91c462 100644
+--- a/drivers/clk/mediatek/clk-mtk.c
++++ b/drivers/clk/mediatek/clk-mtk.c
+@@ -513,6 +513,7 @@ static int __mtk_clk_simple_probe(struct platform_device *pdev,
+ 	num_clks = mcd->num_clks + mcd->num_composite_clks;
+ 	num_clks += mcd->num_fixed_clks + mcd->num_factor_clks;
+ 	num_clks += mcd->num_mux_clks + mcd->num_divider_clks;
++	num_clks = max_t(int, num_clks, mcd->num_hws);
+ 
+ 	clk_data = mtk_alloc_clk_data(num_clks);
+ 	if (!clk_data) {
+diff --git a/drivers/clk/mediatek/clk-mtk.h b/drivers/clk/mediatek/clk-mtk.h
+index 5417b9264..26f510ddd 100644
+--- a/drivers/clk/mediatek/clk-mtk.h
++++ b/drivers/clk/mediatek/clk-mtk.h
+@@ -260,6 +260,9 @@ struct mtk_clk_desc {
+ 	unsigned int mfg_clk_idx;
+ 
+ 	bool need_runtime_pm;
++
++	/* size of the clk_hw table when IDs are sparse (vendor numbering) */
++	unsigned int num_hws;
+ };
+ 
+ int mtk_clk_pdev_probe(struct platform_device *pdev);

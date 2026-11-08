@@ -1,0 +1,53 @@
+# The patched v4l2codecs and va plugins (README.md here) as their own package:
+# built from the gst-plugins-bad release in the ALARM repos, installed to
+# /usr/lib/gstreamer-1.0-cezanne and found first through GST_PLUGIN_PATH
+# (GStreamer keeps the first plugin of a file name it scans), so Arch's
+# gst-plugins-bad stays as packaged. cezanne-build sets CZ_UPVER to that
+# release's version (type "track") and rebuilds when it changes.
+_upver=${CZ_UPVER:-1.28.8-1}
+_ver=${_upver%-*}
+_series=${_ver%.*}
+pkgname=gst-plugins-cezanne
+pkgver=$_ver
+pkgrel=2
+pkgdesc="GStreamer v4l2codecs and va plugins with the cezanne fixes (crop, MM21 pitch, RGB H.264 encode, encoder leak)"
+arch=(aarch64)
+url="https://gstreamer.freedesktop.org/"
+license=(LGPL-2.1-or-later)
+# plugins use the bad-libs codec base classes: same minor series only
+depends=("gst-plugins-bad-libs>=$_series" "gst-plugins-bad-libs<${_series%.*}.$(( ${_series#*.} + 1 ))"
+         gstreamer gst-plugins-base-libs libva libdrm libgudev)
+makedepends=(meson ninja glib2-devel)
+source=("https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-$_ver.tar.xz"
+        0001-v4l2codecs-videometa-visible-size.patch
+        0002-v4l2codecs-dma-drm-tiled-pitch.patch
+        0003-va-h264enc-rgb-input.patch
+        0004-va-encoder-free-pictures-of-imported-dmabufs.patch)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP)
+
+prepare() {
+  cd gst-plugins-bad-$_ver
+  local p
+  for p in "$srcdir"/0*.patch; do
+    patch -Np1 -i "$p"
+  done
+}
+
+build() {
+  meson setup gst-plugins-bad-$_ver build --prefix=/usr --buildtype=plain \
+    -D auto_features=disabled -D v4l2codecs=enabled -D va=enabled -D gpl=disabled \
+    -D introspection=disabled -D tests=disabled -D examples=disabled -D doc=disabled \
+    -D nls=disabled -D orc=disabled
+  ninja -C build sys/v4l2codecs/libgstv4l2codecs.so sys/va/libgstva.so
+}
+
+package() {
+  install -Dm644 -t "$pkgdir/usr/lib/gstreamer-1.0-cezanne" \
+    build/sys/v4l2codecs/libgstv4l2codecs.so build/sys/va/libgstva.so
+  # user sessions (systemd environment.d) and login shells
+  install -dm755 "$pkgdir/usr/lib/environment.d" "$pkgdir/etc/profile.d"
+  echo 'GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0-cezanne' \
+    > "$pkgdir/usr/lib/environment.d/50-gst-plugins-cezanne.conf"
+  echo 'export GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0-cezanne${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}' \
+    > "$pkgdir/etc/profile.d/gst-plugins-cezanne.sh"
+}

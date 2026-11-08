@@ -1,0 +1,283 @@
+From fb05d0bdcfc262b022e3d2aa2e7fb1008b6dc918 Mon Sep 17 00:00:00 2001
+From: arch-port <26345330+DrShadow34@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:30:16 +0100
+Subject: [PATCH] panvk: v9 texel buffer bounds checks for robustBufferAccess2
+
+Valhall texel buffers (uniform: txf on a buffer view, storage: buffer image
+access) are LEA_BUF addresses with converting loads / stores, unchecked.
+With buffer robustness (robust_modes ubo / ssbo) the texel address is
+checked against the view (coord * stride < size, 64-bit, no division):
+past it, reads load from zero-filled memory, so the format conversion
+fills in the missing components ((0, 0, 0, 1) without alpha, as
+robustness2 wants; a zero result from an OOB address would lose the 1),
+and writes / atomics go to an out-of-bounds address, where they are
+dropped. The zero memory is load_ro_sink_address_poly, a common sysval
+now: the device's zeroed null index buffer on v9 (poly's index buffer
+sink reads it too), PAN_SHADER_OOB_ADDRESS elsewhere.
+
+CTS robustness2 (1/20): 699 pass, 0 fail (texel buffers: 111 fail before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013fD3if93WntovhmD8fGa8C
+---
+ src/panfrost/compiler/bifrost/bifrost_nir.c   | 32 +++++++++++++------
+ src/panfrost/compiler/pan_nir.h               | 29 ++++++++++++++++-
+ src/panfrost/compiler/pan_nir_lower_tex.c     | 21 ++++++++----
+ src/panfrost/vulkan/panvk_shader.h            |  5 +++
+ .../vulkan/panvk_vX_cmd_push_constant.c       |  5 +++
+ src/panfrost/vulkan/panvk_vX_shader.c         |  2 +-
+ 6 files changed, 75 insertions(+), 19 deletions(-)
+
+diff --git a/src/panfrost/compiler/bifrost/bifrost_nir.c b/src/panfrost/compiler/bifrost/bifrost_nir.c
+index 85ebf2a..396cbe7 100644
+--- a/src/panfrost/compiler/bifrost/bifrost_nir.c
++++ b/src/panfrost/compiler/bifrost/bifrost_nir.c
+@@ -856,7 +856,8 @@ nir_shader_has_local_variables(const nir_shader *nir)
+    return false;
+ }
+ 
+-static bool pan_nir_lower_buf_image_access(nir_shader *nir, unsigned arch);
++static bool pan_nir_lower_buf_image_access(nir_shader *nir, unsigned arch,
++                                           bool robust);
+ static bool bi_should_idvs(nir_shader *nir, const struct pan_compile_inputs *inputs);
+ static bool bifrost_nir_lower_vs_atomics(nir_shader *nir);
+ 
+@@ -879,7 +880,9 @@ bifrost_postprocess_nir(nir_shader *nir,
+    if (gpu_arch < 9)
+       NIR_PASS(_, nir, pan_nir_lower_image_ms);
+ 
+-   NIR_PASS(_, nir, pan_nir_lower_buf_image_access, gpu_arch);
++   /* storage texel buffers: storage buffer robustness */
++   NIR_PASS(_, nir, pan_nir_lower_buf_image_access, gpu_arch,
++            inputs->robust_modes & nir_var_mem_ssbo);
+ 
+    /* We assume that UBO and SSBO were lowered, let's move things around. */
+    nir_move_options move_all = nir_move_const_undef | nir_move_load_ubo |
+@@ -960,7 +963,9 @@ bifrost_postprocess_nir(nir_shader *nir,
+                &info->vs.needs_extended_fifo);
+    }
+ 
+-   NIR_PASS(_, nir, pan_nir_lower_tex, gpu_id);
++   /* uniform texel buffers: uniform buffer robustness */
++   NIR_PASS(_, nir, pan_nir_lower_tex, gpu_id,
++            inputs->robust_modes & nir_var_mem_ubo);
+    NIR_PASS(_, nir, pan_nir_lower_image, gpu_id);
+ 
+    /* Our OpenCL compiler (src/panfrost/clc/pan_compile.c) has a very weird and
+@@ -1092,6 +1097,11 @@ bifrost_postprocess_nir(nir_shader *nir,
+    bi_optimize_loop(nir, gpu_id, false /* allow_copies */);
+ }
+ 
++struct lower_buf_image_ctx {
++   unsigned arch;
++   bool robust;
++};
++
+ static bool
+ lower_buf_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ {
+@@ -1107,24 +1117,25 @@ lower_buf_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    if (dim != GLSL_SAMPLER_DIM_BUF)
+       return false;
+ 
+-   unsigned *arch = data;
++   const struct lower_buf_image_ctx *ctx = data;
+    b->cursor = nir_before_instr(&intr->instr);
+ 
+    nir_def *res_handle = intr->src[0].ssa;
+    nir_def *buf_index = nir_channel(b, intr->src[1].ssa, 0);
+    nir_def *texel_addr, *icd;
+-   if (*arch >= 9) {
+-      texel_addr = nir_lea_buf_pan(b, res_handle, buf_index);
++   if (ctx->arch >= 9) {
++      texel_addr = pan_nir_va_buf_texel_address(
++         b, res_handle, buf_index, ctx->robust,
++         intr->intrinsic == nir_intrinsic_image_load);
+       icd = pan_nir_load_va_buf_cvt(b, res_handle);
+    } else {
+       nir_def *attr = nir_lea_attr_pan(b, res_handle, buf_index,
+                                        nir_imm_int(b, 0),
+                                        .src_type = 32,
+                                        .desc_set = BI_TABLE_ATTRIBUTE_1);
+-      texel_addr = nir_channels(b, attr, BITFIELD_MASK(2));
++      texel_addr = nir_pack_64_2x32(b, nir_channels(b, attr, BITFIELD_MASK(2)));
+       icd = nir_channel(b, attr, 2);
+    }
+-   texel_addr = nir_pack_64_2x32(b, texel_addr);
+ 
+    switch (intr->intrinsic) {
+    case nir_intrinsic_image_texel_address:
+@@ -1160,10 +1171,11 @@ lower_buf_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ }
+ 
+ static bool
+-pan_nir_lower_buf_image_access(nir_shader *shader, unsigned arch)
++pan_nir_lower_buf_image_access(nir_shader *shader, unsigned arch, bool robust)
+ {
++   struct lower_buf_image_ctx ctx = {arch, robust};
+    return nir_shader_intrinsics_pass(shader, lower_buf_image_access,
+-                                     nir_metadata_control_flow, &arch);
++                                     nir_metadata_control_flow, &ctx);
+ }
+ 
+ /* Decide if Index-Driven Vertex Shading should be used for a given shader */
+diff --git a/src/panfrost/compiler/pan_nir.h b/src/panfrost/compiler/pan_nir.h
+index aef31d9..0e473fd 100644
+--- a/src/panfrost/compiler/pan_nir.h
++++ b/src/panfrost/compiler/pan_nir.h
+@@ -94,6 +94,32 @@ pan_nir_load_va_buf_cvt(nir_builder *b, nir_def *handle)
+    return cvt;
+ }
+ 
++/* Valhall buffer views (texel buffers): the address of texel coord. Past
++ * the view when robust (robustBufferAccess2), reads go to zero-filled
++ * memory (load_ro_sink_address_poly, the driver's), whose conversion fills
++ * in the missing components ((0, 0, 0, 1) for formats without alpha), and
++ * writes / atomics to an out-of-bounds address, where they are dropped.
++ * size * stride in 64 bits: no division. */
++static inline nir_def *
++pan_nir_va_buf_texel_address(nir_builder *b, nir_def *handle, nir_def *coord,
++                             bool robust, bool read_only)
++{
++   nir_def *addr = nir_pack_64_2x32(b, nir_lea_buf_pan(b, handle, coord));
++
++   if (robust) {
++      nir_def *size = pan_nir_load_va_desc(b, 1, 32, handle, 1 * 4);
++      nir_def *stride = pan_nir_load_va_desc(b, 1, 32, handle, 4 * 4);
++      nir_def *in_bounds = nir_ult(b, nir_umul_2x32_64(b, coord, stride),
++                                   nir_u2u64(b, size));
++
++      addr = nir_bcsel(b, in_bounds, addr,
++                       read_only ? nir_load_ro_sink_address_poly(b)
++                                 : nir_imm_int64(b, PAN_SHADER_OOB_ADDRESS));
++   }
++
++   return addr;
++}
++
+ static inline nir_def *
+ pan_nir_load_va_buf_size_el(nir_builder *b, nir_def *handle)
+ {
+@@ -249,7 +275,8 @@ struct pan_va_tex_flags {
+ PRAGMA_DIAGNOSTIC_POP
+ static_assert(sizeof(struct pan_va_tex_flags) == 4, "Must fit in uint32_t");
+ 
+-bool pan_nir_lower_tex(nir_shader *nir, uint64_t gpu_id);
++bool pan_nir_lower_tex(nir_shader *nir, uint64_t gpu_id,
++                       bool robust_texel_buffers);
+ bool pan_nir_lower_image(nir_shader *nir, uint64_t gpu_id);
+ 
+ bool pan_nir_lower_mem_to_global(nir_shader *nir);
+diff --git a/src/panfrost/compiler/pan_nir_lower_tex.c b/src/panfrost/compiler/pan_nir_lower_tex.c
+index c349ec8..831fa84 100644
+--- a/src/panfrost/compiler/pan_nir_lower_tex.c
++++ b/src/panfrost/compiler/pan_nir_lower_tex.c
+@@ -702,15 +702,15 @@ bi_lower_tex_instr(nir_builder *b, nir_tex_instr *tex, void *cb_data)
+ }
+ 
+ static bool
+-va_lower_txf_buf(nir_builder *b, nir_tex_instr *tex, uint64_t gpu_id)
++va_lower_txf_buf(nir_builder *b, nir_tex_instr *tex, bool robust)
+ {
+    assert(tex->op == nir_texop_txf);
+ 
+    b->cursor = nir_before_instr(&tex->instr);
+    struct tex_srcs srcs = steal_tex_srcs(b, tex);
+ 
+-   nir_def *addr = nir_pack_64_2x32(b,
+-      nir_lea_buf_pan(b, srcs.tex_h, srcs.coord));
++   nir_def *addr =
++      pan_nir_va_buf_texel_address(b, srcs.tex_h, srcs.coord, robust, true);
+    nir_def *cvt = pan_nir_load_va_buf_cvt(b, srcs.tex_h);
+    nir_def *val = nir_load_global_cvt_pan(b, tex->def.num_components,
+                                           tex->def.bit_size, addr, cvt,
+@@ -1074,10 +1074,16 @@ va_lower_tex_query(nir_builder *b, nir_tex_instr *tex, uint64_t gpu_id)
+    return true;
+ }
+ 
++struct va_lower_tex_ctx {
++   uint64_t gpu_id;
++   bool robust_texel_buffers;
++};
++
+ static bool
+ va_lower_tex_instr(nir_builder *b, nir_tex_instr *tex, void *cb_data)
+ {
+-   uint64_t gpu_id = *(uint64_t *)cb_data;
++   const struct va_lower_tex_ctx *ctx = cb_data;
++   uint64_t gpu_id = ctx->gpu_id;
+ 
+    switch (tex->op) {
+    case nir_texop_tex:
+@@ -1088,7 +1094,7 @@ va_lower_tex_instr(nir_builder *b, nir_tex_instr *tex, void *cb_data)
+    case nir_texop_txf_ms:
+    case nir_texop_tg4:
+       if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+-         return va_lower_txf_buf(b, tex, gpu_id);
++         return va_lower_txf_buf(b, tex, ctx->robust_texel_buffers);
+       else
+          return va_lower_tex(b, tex, gpu_id);
+ 
+@@ -1107,11 +1113,12 @@ va_lower_tex_instr(nir_builder *b, nir_tex_instr *tex, void *cb_data)
+ }
+ 
+ bool
+-pan_nir_lower_tex(nir_shader *nir, uint64_t gpu_id)
++pan_nir_lower_tex(nir_shader *nir, uint64_t gpu_id, bool robust_texel_buffers)
+ {
+    if (pan_arch(gpu_id) >= 9) {
++      struct va_lower_tex_ctx ctx = {gpu_id, robust_texel_buffers};
+       return nir_shader_tex_pass(nir, va_lower_tex_instr,
+-                                 nir_metadata_none, &gpu_id);
++                                 nir_metadata_none, &ctx);
+    } else if (pan_arch(gpu_id) >= 6) {
+       return nir_shader_tex_pass(nir, bi_lower_tex_instr,
+                                  nir_metadata_control_flow,
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index cff45b4..cb7569b 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -115,6 +115,11 @@ struct panvk_common_sysvals_inner {
+ 
+    /* Address of the printf buffer */
+    aligned_u64 printf_buffer_address;
++
++   /* Zero-filled memory (load_ro_sink_address_poly): out-of-bounds texel
++    * buffer reads load from it, so the format conversion fills in missing
++    * components as for any texel (robustBufferAccess2) */
++   aligned_u64 zero_buffer;
+ } __attribute__((aligned(FAU_WORD_SIZE)));
+ 
+ struct panvk_common_sysvals {
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+index 3e1db95..1e90085 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+@@ -30,6 +30,11 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
+ 
+    struct panvk_common_sysvals_inner common_inner = {
+       .printf_buffer_address = dev->printf.bo->addr.dev,
++#if PAN_ARCH == 9
++      .zero_buffer = dev->null_index_buffer->addr.dev,
++#else
++      .zero_buffer = PAN_SHADER_OOB_ADDRESS,
++#endif
+    };
+    uint64_t *common = (uint64_t *)&common_inner;
+ 
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 10e422c..5719a40 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -221,7 +221,7 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
+    }
+ 
+    case nir_intrinsic_load_ro_sink_address_poly:
+-      val = nir_imm_int64(b, PAN_SHADER_OOB_ADDRESS);
++      val = load_sysval(b, common, bit_size, zero_buffer);
+       break;
+ 
+ #if PAN_ARCH == 9
+-- 
+2.56.0
+

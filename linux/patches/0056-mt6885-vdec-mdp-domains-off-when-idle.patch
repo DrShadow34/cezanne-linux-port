@@ -1,0 +1,55 @@
+mt6885: VDEC, VDEC2 and MDP power domains off when idle (reverts 0052)
+
+The decoder powers its subsystem down when idle now (cezanne-vdec runtime
+PM; a power cycle no longer darkens the block since 0050's MDPSYS SMI
+gate fix), so genpd may turn VDEC / VDEC2 / MDP off. They were the last
+blockers of the SPM's dram / syspll / bus26m constraints.
+
+(Regenerated 2026-11-02 against the tree the earlier patches produce: an unexported
+intermediate change had set VDEC / VDEC2 to ALWAYS_ON; this now goes straight from 0046's
+KEEP_DEFAULT_OFF to no caps.)
+
+diff --git a/drivers/pmdomain/mediatek/mt6885-pm-domains.h b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+index 140309287..b668f1dfa 100644
+--- a/drivers/pmdomain/mediatek/mt6885-pm-domains.h
++++ b/drivers/pmdomain/mediatek/mt6885-pm-domains.h
+@@ -356,7 +356,6 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 				    MT6885_TOP_AXI_PROT_EN_MM_SET, MT6885_TOP_AXI_PROT_EN_MM_CLR,
+ 				    MT6885_TOP_AXI_PROT_EN_MM_STA1),
+ 		},
+-		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
+ 	[MT6885_POWER_DOMAIN_VDEC2] = {
+ 		.name = "vdec2",
+@@ -374,7 +373,6 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 				    MT6885_TOP_AXI_PROT_EN_MM_2_SET, MT6885_TOP_AXI_PROT_EN_MM_2_CLR,
+ 				    MT6885_TOP_AXI_PROT_EN_MM_2_STA1),
+ 		},
+-		.caps = MTK_SCPD_KEEP_DEFAULT_OFF,
+ 	},
+ 	[MT6885_POWER_DOMAIN_VENC] = {
+ 		.name = "venc",
+@@ -423,10 +421,11 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 	 * low-power constraint. Not default-off, so genpd turns them off at
+ 	 * late init when unused (needs no pd_ignore_unused).
+ 	 *
+-	 * MDP stays on though: the video decoder keeps it powered at runtime
+-	 * (its core's bus is the MDP SMI), and powering it off in every system
+-	 * suspend hung the phone now and then (2 in ~60 AOD suspends, never
+-	 * with MDP left on, 2026-10-30; cause not found).
++	 * MDP is also the video decoder's bus (its core sits on the MDP SMI):
++	 * on while it decodes, off when it is idle (cezanne-vdec runtime PM,
++	 * 2026-10-31). Before that the decoder held it on and genpd cycled it
++	 * in every system suspend; the phone hung 2 times in ~60 AOD suspends
++	 * then (patch 0052 kept it on), and rarely later with MDP always on.
+ 	 */
+ 	[MT6885_POWER_DOMAIN_MDP] = {
+ 		.name = "mdp",
+@@ -459,7 +458,6 @@ static const struct scpsys_domain_data scpsys_domain_data_mt6885[] = {
+ 				    MT6885_TOP_AXI_PROT_EN_VDNR_SET, MT6885_TOP_AXI_PROT_EN_VDNR_CLR,
+ 				    MT6885_TOP_AXI_PROT_EN_VDNR_STA1),
+ 		},
+-		.caps = MTK_SCPD_ALWAYS_ON,
+ 	},
+ 	[MT6885_POWER_DOMAIN_ADSP] = {
+ 		.name = "adsp",

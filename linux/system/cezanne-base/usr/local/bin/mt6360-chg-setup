@@ -1,0 +1,126 @@
+#!/bin/sh
+# MT6360 charger limits for the cezanne battery.
+# - input limit: USB PD contract (TCPM; 9 V: up to 2 A input, 3 A charge), else
+#   a QC charger at 9 V (xmusb350 + cezanne-dcharge: the same), else the
+#   BC1.2 port type (xmusb350's when it answers: the MT6360 reports SDP for
+#   dedicated chargers) or the Type-C / PD 5 V current
+# - USB gadget off (D+ pull-up) on dedicated chargers, as the vendor kernel:
+#   it would disturb the QC D+ / D- levels
+# - charge voltage / current: vendor software JEITA bands on the battery
+#   temperature (vendor DT, 2 C hysteresis back towards normal); re-run on
+#   every battery change uevent (~30 s). The gauge itself stops charging
+#   (charge_behaviour inhibit-charge: VBUS still powers the system) outside
+#   0..50 C and at the charge limit (charge_control_end_threshold); this
+#   script leaves charge_behaviour alone.
+# lk leaves 4.35 V / 500 mA.
+d=
+[ -n "$1" ] && d=/sys/class/power_supply/$1
+[ -n "$d" ] && [ -d "$d" ] || d=$(ls -d /sys/class/power_supply/mt6360-chg* 2>/dev/null | head -1)
+[ -d "$d" ] || exit 0
+
+# xmusb350 charger type (none while unplugged: the chip runs from VBUS)
+qc=$(cat /sys/class/power_supply/xmusb350/qc_type 2>/dev/null || echo none)
+case $qc in
+dcp|hvdcp|ocp|float|qc*) dedicated=1 ;;
+*) dedicated= ;;
+esac
+udc=$(ls -d /sys/class/udc/* 2>/dev/null | head -1)
+if [ -n "$udc" ]; then
+	if [ -n "$dedicated" ] && [ ! -e /run/cezanne-udc-off ]; then
+		echo disconnect > "$udc/soft_connect" && touch /run/cezanne-udc-off
+	elif [ -z "$dedicated" ] && [ -e /run/cezanne-udc-off ]; then
+		echo connect > "$udc/soft_connect"; rm -f /run/cezanne-udc-off
+	fi
+fi
+
+# direct charging (cezanne-dcharge) owns the chargers while it runs
+pid=$(cat /run/cezanne-dcharge 2>/dev/null)
+[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && exit 0
+# test knob: the charger in force sleep, the battery carries the whole load
+# while plugged in (power measurements with the gauge's charge counter)
+if [ -e /run/cezanne-chg-hiz ]; then
+	echo 0 > "$d/online"
+	exit 0
+fi
+echo 1 > "$d/online"
+
+ichg=2000000
+pd_mv=0
+pd_ma=0
+for p in /sys/class/power_supply/tcpm-source-psy-*; do
+	[ "$(cat "$p/online" 2>/dev/null)" = 1 ] || continue
+	pd_mv=$(( $(cat "$p/voltage_now") / 1000 ))
+	pd_ma=$(( $(cat "$p/current_max") / 1000 ))
+done
+
+vbus_mv=$(( $(cat /sys/class/power_supply/bq25970/voltage_now 2>/dev/null || echo 0) / 1000 ))
+
+if [ "$pd_mv" -ge 8500 ]; then
+	aicr=$(( pd_ma < 2000 ? pd_ma : 2000 ))000
+	ichg=3000000
+elif [ -n "$dedicated" ] && [ "$(cat /sys/class/power_supply/xmusb350/qc_voltage 2>/dev/null || echo 0)" -ge 8500 ] &&
+     [ "$vbus_mv" -ge 7000 ]; then
+	# QC 2.0 / 3.0 / 3+ at 9 V (18 W class; VBUS sags ~0.5 V at 2 A)
+	aicr=2000000
+	ichg=3000000
+else
+	usb_type=$(cat "$d/usb_type")
+	case $qc in
+	dcp|hvdcp|ocp|qc*) usb_type="[DCP]" ;;	# vendor: OCP = DCP
+	float) usb_type="[FLOAT]" ;;
+	cdp) usb_type="[CDP]" ;;
+	esac
+	case "$usb_type" in
+	*"[DCP]"*) aicr=2000000 ;;
+	*"[CDP]"*) aicr=1500000 ;;
+	*"[FLOAT]"*) aicr=1000000 ;;
+	*) aicr=500000 ;;
+	esac
+	# 5 V PD / Type-C current (e.g. 3 A) above the BC1.2 guess
+	[ "$pd_ma" -gt 0 ] && [ "${pd_ma}000" -gt "$aicr" ] && aicr=$(( pd_ma < 3000 ? pd_ma : 3000 ))000
+fi
+
+# JEITA band from the battery temperature (0.1 C); hysteresis: leaving a
+# warm/cold band needs 2 C (1 C below 15 C) back towards normal
+t=$(cat /sys/class/power_supply/battery/temp 2>/dev/null || echo 250)
+state=/run/mt6360-jeita
+prev=$(cat "$state" 2>/dev/null || echo normal)
+band=normal
+if [ "$t" -ge 480 ] || { [ "$prev" = hot ] && [ "$t" -ge 460 ]; }; then
+	band=hot
+elif [ "$t" -lt 0 ] || { [ "$prev" = freezing ] && [ "$t" -lt 10 ]; }; then
+	band=freezing
+elif [ "$t" -lt 50 ] || { [ "$prev" = cold ] && [ "$t" -lt 60 ]; }; then
+	band=cold
+elif [ "$t" -lt 100 ] || { [ "$prev" = chilly ] && [ "$t" -lt 110 ]; }; then
+	band=chilly
+elif [ "$t" -lt 150 ] || { [ "$prev" = cool ] && [ "$t" -lt 170 ]; }; then
+	band=cool
+fi
+echo $band > "$state"
+
+cv=4450000
+case $band in
+hot)      cv=4100000; fcc=2200000 ;;	# 48..60 C
+cool)     fcc=3520000 ;;		# 10..15 C
+chilly)   fcc=2200000 ;;		# 5..10 C
+cold)     fcc=900000 ;;			# 0..5 C
+freezing) fcc=440000 ;;			# < 0 C
+*)        fcc=6000000 ;;
+esac
+[ "$fcc" -lt "$ichg" ] && ichg=$fcc
+
+# input cap in uA (tests: drain on a charger; /run, so gone after a reboot);
+# keep it >= ~100 mA: power banks switch their output off without a load
+cap=$(cat /run/cezanne-aicr-max 2>/dev/null)
+[ -n "$cap" ] && [ "$aicr" -gt "$cap" ] && aicr=$cap
+
+echo $cv > "$d/constant_charge_voltage"
+echo $ichg > "$d/constant_charge_current"
+echo $aicr > "$d/input_current_limit"
+key="pd ${pd_mv}mV/${pd_ma}mA qc $qc ${vbus_mv}mV T $t $band -> aicr $aicr ichg $ichg cv $cv"
+# log changes only (runs every battery uevent)
+if [ "$(cat /run/mt6360-chg-last 2>/dev/null)" != "$key" ]; then
+	echo "$key" > /run/mt6360-chg-last
+	logger -t mt6360-chg-setup "$key"
+fi

@@ -1,0 +1,41 @@
+#!/bin/bash
+# Valve's native aarch64 Steam client (steam-arm64 package). The client
+# lives in ~/.local/share/Steam and updates itself there; the package's copy
+# (/usr/lib/steam-arm64/bootstrap) only seeds it on the first start.
+set -u
+lib=/usr/lib/steam-arm64
+root="${XDG_DATA_HOME:-$HOME/.local/share}/Steam"
+
+if [ ! -x "$root/steamrtarm64/steam" ]; then
+	echo "steam: installing the client into $root" >&2
+	mkdir -p -- "$root"
+	cp -a --no-target-directory -- "$lib/bootstrap" "$root"
+fi
+
+# the paths the client and its tools look things up by
+mkdir -p -- "$HOME/.steam" "$root/package"
+ln -sfn -- "$root" "$HOME/.steam/root"
+ln -sfn -- "$root" "$HOME/.steam/steam"
+ln -sfn -- "$root/linuxarm64" "$HOME/.steam/sdkarm64"
+# x86 games under FEX load the x86 steamclient.so from here (Steam API)
+ln -sfn -- "$root/linux64" "$HOME/.steam/sdk64"
+ln -sfn -- "$root/linux32" "$HOME/.steam/sdk32"
+ln -sfn -- "$root/steamrtarm64" "$HOME/.steam/bin64"	# overlay preload path
+
+# steam-runtime-launcher-service and friends, called by name; gtk2 for
+# steamui.so (from Valve's runtime: Arch Linux ARM has none)
+export PATH="$lib/runtime/bin:$PATH"
+export LD_LIBRARY_PATH="$lib/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+unset STEAM_RUNTIME
+
+# Proton: Direct3D through DXVK (Proton's default) on PanVK, which has what
+# DXVK requires on the Mali-G77 since mainline/mesa-g77 0004-0014. Per game,
+# PROTON_USE_WINED3D=1 %command% goes to WineD3D on panfrost OpenGL (3.1).
+
+# exit 42: the client updated itself and asks to be started again
+while :; do
+	"$root/steamrtarm64/steam" "$@"
+	status=$?
+	[ "$status" -eq 42 ] || exit "$status"
+	echo "steam: restarting after an update" >&2
+done

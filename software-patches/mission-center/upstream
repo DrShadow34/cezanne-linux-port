@@ -1,0 +1,6 @@
+# Arch's mission-center (x86_64 [extra]; Arch Linux ARM has 0.6.2): version
+# and PKGBUILD from Arch, so new releases are built when Arch has them.
+# SUFFIX 3: above our former own 1.2.0-1.2.
+UPSTREAM=mission-center
+FROM=arch
+SUFFIX=3

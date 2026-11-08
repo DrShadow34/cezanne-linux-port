@@ -1,0 +1,12 @@
+{
+  "uuid": "cezanne-show-taps@arch-port",
+  "name": "Cezanne Show Taps",
+  "description": "Shows a spot under every finger touching the screen, like Android's \"Show taps\" developer option.",
+  "shell-version": [
+    "51"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

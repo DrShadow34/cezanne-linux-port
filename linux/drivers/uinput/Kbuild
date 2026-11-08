@@ -1,0 +1,4 @@
+# drivers/input/misc/uinput.c as a module for the running kernel (built
+# before CONFIG_INPUT_UINPUT=m was in the fragment): test input injection
+obj-m := uinput.o
+# copied from drivers/input/misc (include path of input-compat.h adjusted)

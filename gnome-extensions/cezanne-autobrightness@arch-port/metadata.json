@@ -1,0 +1,7 @@
+{
+  "uuid": "cezanne-autobrightness@arch-port",
+  "name": "Cezanne Auto Brightness",
+  "description": "Phone-style automatic brightness: log-lux curve, slider as a multiplicative offset, fast brighten / slow dim.",
+  "shell-version": ["51"],
+  "session-modes": ["user", "unlock-dialog"]
+}

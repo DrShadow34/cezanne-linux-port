@@ -1,0 +1,21 @@
+# cezanne-boost: touch boost for the cezanne port (this directory is the
+# source). While the screen is touched gnome-shell gets a high uclamp.min,
+# so EAS runs it on the A77 cores at a high clock; needs a kernel with
+# CONFIG_UCLAMP_TASK (mainline/kernel-fragment.config).
+pkgname=cezanne-boost
+pkgver=0.1
+pkgrel=1
+pkgdesc="Touch boost: utilization clamp for the shell while the screen is touched"
+arch=(aarch64 x86_64)
+license=(MIT)
+depends=(glibc)
+source=(Makefile cezanne-boost.c cezanne-boost.service)
+sha256sums=(SKIP SKIP SKIP)
+
+build() {
+  make -C "$srcdir"
+}
+
+package() {
+  make -C "$srcdir" DESTDIR="$pkgdir" install
+}

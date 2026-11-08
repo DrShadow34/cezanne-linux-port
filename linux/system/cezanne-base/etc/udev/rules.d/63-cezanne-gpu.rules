@@ -1,0 +1,3 @@
+# Panfrost per-client GPU time in fdinfo (drm-engine-*), used by MangoHud and
+# gputop for the GPU load figure.
+ACTION=="add|bind", SUBSYSTEM=="platform", DRIVER=="panfrost", ATTR{profiling}="1"

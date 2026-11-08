@@ -1,0 +1,31 @@
+From: arch-port
+Subject: [PATCH] xwayland: 20:9 modes in the emulated mode list
+
+Phones are 20:9 (2400x1080, 1600x720 ...). The emulated XRandR modes
+were 4:3, 16:10 and 16:9 only, so a game asked for a lower resolution got
+the wrong shape (black bars). Wine / Proton add the host modes to its
+own list, so the same modes reach Windows games too.
+---
+--- a/hw/xwayland/xwayland-output.c
++++ b/hw/xwayland/xwayland-output.c
+@@ -339,6 +339,20 @@
+     {  864,  486 },
+     {  720,  400 },
+     {  640,  350 },
++    /* 20:9 (2.22): phone screens (2400x1080, 1600x720); games that pick a
++     * lower resolution keep the screen's shape instead of black bars */
++    { 3200, 1440 },
++    { 2400, 1080 },
++    { 2160,  972 },
++    { 2000,  900 },
++    { 1920,  864 },
++    { 1800,  810 },
++    { 1600,  720 },
++    { 1440,  648 },
++    { 1280,  576 },
++    { 1200,  540 },
++    {  960,  432 },
++    {  800,  360 },
+ };
+ 
+ /* Build an array with RRModes the first mode is the actual output mode, the

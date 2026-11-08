@@ -1,0 +1,9 @@
+#!/bin/sh
+# screenshot of the scanout (kmsgrab) -> /tmp/scr.png; 10-bit planes for the
+# shell, 8-bit when a fullscreen client (a game) is scanned out directly
+rm -f /tmp/scr.png
+for fmt in x2rgb10le bgr0; do
+	ffmpeg -loglevel quiet -y -device /dev/dri/card0 -f kmsgrab -i - -frames:v 1 -update 1 -vf "hwdownload,format=$fmt,scale=540:-1" /tmp/scr.png && exit 0
+done
+echo "scr: no supported scanout format" >&2
+exit 1

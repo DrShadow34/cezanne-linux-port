@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.cezanne-nfc" path="/org/gnome/shell/extensions/cezanne-nfc/">
+    <key name="enabled" type="b">
+      <default>true</default>
+      <summary>NFC on</summary>
+      <description>Read tags while the session is unlocked.</description>
+    </key>
+  </schema>
+</schemalist>

@@ -1,0 +1,24 @@
+#!/bin/sh
+# cezanne-flash-boot: write /usr/lib/cezanne/boot.img (linux-cezanne) to the
+# boot slot; the slot's previous contents go to /var/lib/cezanne/boot-prev.img.
+# A boot image that does not come up: Volume Up + Power -> rescue system, then
+#   dd if=/var/lib/cezanne/boot-prev.img of=/dev/disk/by-partlabel/boot
+set -eu
+IMG=${1:-/usr/lib/cezanne/boot.img}
+PREV=/var/lib/cezanne/boot-prev.img
+DEV=$(readlink -f /dev/disk/by-partlabel/boot)
+[ -b "$DEV" ] || { echo "cezanne-flash-boot: no boot partition" >&2; exit 1; }
+[ "$(stat -c %s "$IMG")" -eq "$(blockdev --getsize64 "$DEV")" ] ||
+	{ echo "cezanne-flash-boot: $IMG is not the size of $DEV" >&2; exit 1; }
+[ "$(head -c 8 "$IMG")" = "ANDROID!" ] ||
+	{ echo "cezanne-flash-boot: $IMG is not a boot image" >&2; exit 1; }
+if cmp -s "$IMG" "$DEV"; then
+	echo "cezanne-flash-boot: boot slot already holds this image"
+	exit 0
+fi
+mkdir -p "${PREV%/*}"
+dd if="$DEV" of="$PREV.new" bs=4M status=none && mv "$PREV.new" "$PREV"
+dd if="$IMG" of="$DEV" bs=4M conv=fsync status=none
+sync
+cmp "$IMG" "$DEV"
+echo "cezanne-flash-boot: boot slot updated (previous image in $PREV); reboot for the new kernel"

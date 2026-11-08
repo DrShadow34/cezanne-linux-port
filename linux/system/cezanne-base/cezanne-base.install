@@ -1,0 +1,29 @@
+_refresh() {
+  systemctl daemon-reload 2>/dev/null || true
+  udevadm control --reload 2>/dev/null || true
+  dconf update 2>/dev/null || true
+  systemd-tmpfiles --create cezanne-aod.conf 2>/dev/null || true
+}
+
+post_install() {
+  _refresh
+  # the units this package ships, enabled as their [Install] says
+  systemctl preset $(sed -n 's/^enable //p' /usr/lib/systemd/system-preset/80-cezanne-base.preset) 2>/dev/null || true
+  # Plymouth theme and settings (plymouthd.conf belongs to plymouth)
+  plymouth-set-default-theme arch-spinner 2>/dev/null || true
+  local c=/etc/plymouth/plymouthd.conf
+  if [ -f "$c" ]; then
+    grep -q '^ShowDelay=' "$c" || sed -i '/^\[Daemon\]/a ShowDelay=0' "$c"
+    grep -q '^DeviceScale=' "$c" || sed -i '/^\[Daemon\]/a DeviceScale=1' "$c"
+  fi
+}
+
+post_upgrade() {
+  _refresh
+}
+
+post_remove() {
+  systemctl daemon-reload 2>/dev/null || true
+  udevadm control --reload 2>/dev/null || true
+  dconf update 2>/dev/null || true
+}

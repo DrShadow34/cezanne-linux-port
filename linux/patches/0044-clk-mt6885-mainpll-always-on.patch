@@ -1,0 +1,23 @@
+From: arch-port
+Subject: [PATCH] clk: mediatek: mt6885: keep mainpll always on (PLL_AO)
+
+The bus runs from mainpll. Early in boot nothing holds a reference on it yet,
+so the first consumer that enables and then disables a clock below it (the SPI
+controller probe: spi_sel -> mainpll_d5_d4 -> mainpll) powered it off and the
+SoC hung. Mainline MT8192 marks it PLL_AO as well.
+
+diff --git a/drivers/clk/mediatek/clk-mt6885.c b/drivers/clk/mediatek/clk-mt6885.c
+index f757418d4..698eb2bfb 100644
+--- a/drivers/clk/mediatek/clk-mt6885.c
++++ b/drivers/clk/mediatek/clk-mt6885.c
+@@ -176,8 +176,9 @@ static DEFINE_SPINLOCK(mt6885_clk_lock);
+ 
+ /* register layout identical to mainline MT8192 (+ APUPLL instead of USBPLL) */
+ static const struct mtk_pll_data plls[] = {
++	/* PLL_AO: the bus runs from it; a consumer's enable/disable early in boot would power it off */
+ 	PLL(APMIXED_MAINPLL, "mainpll", 0x0340, 0x034c, 0xff000000,
+-	    HAVE_RST_BAR, BIT(23), 22, 0x0344, 24, 0, 0, 0, 0x0344, 0),
++	    HAVE_RST_BAR | PLL_AO, BIT(23), 22, 0x0344, 24, 0, 0, 0, 0x0344, 0),
+ 	PLL(APMIXED_UNIVPLL, "univpll", 0x0308, 0x0314, 0xff000000,
+ 	    HAVE_RST_BAR, BIT(23), 22, 0x030c, 24, 0, 0, 0, 0x030c, 0),
+ 	PLL(APMIXED_MSDCPLL, "msdcpll", 0x0350, 0x035c, 0x00000000,

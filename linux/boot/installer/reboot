@@ -1,0 +1,4 @@
+#!/usr/bin/bash
+# installer reboot: no init system here
+sync
+echo b > /proc/sysrq-trigger

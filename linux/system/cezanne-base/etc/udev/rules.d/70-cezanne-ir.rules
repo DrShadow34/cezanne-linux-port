@@ -1,0 +1,3 @@
+# IR blaster (gpio-ir-tx on GPIO135): /dev/lirc0 for the logged-in user, so
+# remote-control apps and ir-ctl work without root
+SUBSYSTEM=="lirc", TAG+="uaccess"

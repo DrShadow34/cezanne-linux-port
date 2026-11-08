@@ -1,0 +1,518 @@
+diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
+index d7293977f..c5c318be6 100644
+--- a/drivers/soc/mediatek/Kconfig
++++ b/drivers/soc/mediatek/Kconfig
+@@ -89,4 +89,13 @@ config MTK_SOCINFO
+ 	  information about the SoC to the userspace including the
+ 	  manufacturer name, marketing name and soc name.
+ 
++config MTK_DSI_CMD_KICK
++	tristate "MediaTek bootloader DSI command-mode frame trigger"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on BACKLIGHT_CLASS_DEVICE
++	help
++	  Periodically triggers frames on a DSI command-mode panel whose
++	  display pipeline was configured by the bootloader, so that a
++	  simple-framebuffer console/simpledrm on top of it is refreshed.
++
+ endmenu
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index 0665573e3..04e93d48d 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -9,3 +9,4 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
++obj-$(CONFIG_MTK_DSI_CMD_KICK) += mtk-dsi-cmd-kick.o
+diff --git a/drivers/soc/mediatek/mtk-dsi-cmd-kick.c b/drivers/soc/mediatek/mtk-dsi-cmd-kick.c
+new file mode 100644
+index 000000000..a67cbe185
+--- /dev/null
++++ b/drivers/soc/mediatek/mtk-dsi-cmd-kick.c
+@@ -0,0 +1,456 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Frame trigger for a DSI command-mode panel whose display pipeline was set
++ * up by the bootloader (MediaTek lk) and is scanned out by simplefb/simpledrm.
++ *
++ * In command mode the panel only refreshes its GRAM when the DSI engine is
++ * started for one frame, so without a full DRM driver the bootloader frame
++ * stays on screen forever. This driver replays the per-frame trigger the
++ * MediaTek BSP issues from its CMDQ trigger loop (mtk_crtc_start_trig_loop):
++ * mutex enable, write_memory_start in the DSI command queue, DSI_START.
++ *
++ * simpledrm calls mtk_dsi_cmd_kick_begin()/end() around each framebuffer
++ * update, so a frame is only sent once the update is complete and the
++ * update never races with the engine fetching the previous frame.
++ *
++ * Between frames the DSI command queue is also used for panel DCS writes:
++ * brightness (backlight class device, DCS 0x51) and the 60/120 Hz frequency
++ * select of the cezanne panel (DCS 0x60, from the vendor panel driver).
++ */
++#include <linux/backlight.h>
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/soc/mediatek/mtk-dsi-cmd-kick.h>
++#include <video/mipi_display.h>
++
++#define DSI_START		0x000
++#define DSI_INTSTA		0x00c
++#define DSI_CMD_DONE		BIT(1)
++#define DSI_TE_RDY		BIT(2)
++#define DSI_BUSY		BIT(31)
++#define DSI_CMDQ_SIZE		0x060
++#define DSI_CMDQ0		0x200
++/* DCS long write, HS, cmd 0x2c (write_memory_start), as the BSP sends it */
++#define DSI_CMDQ_WMS		0x002c3909
++/* CMDQ entry config byte (mainline mtk_dsi.c) */
++#define DSI_CMDQ_SHORT		0
++#define DSI_CMDQ_LONG		2
++#define DSI_CMDQ_HSTX		BIT(3)
++#define MIPI_DCS_SHORT_WRITE	0x05
++#define MIPI_DCS_SHORT_WRITE_P	0x15
++#define MIPI_DCS_LONG_WRITE	0x39
++
++/* cezanne panel (j10 38 08 0a): DCS 0x60 frequency select, 0x51 11-bit brightness */
++#define PANEL_DCS_FREQ		0x60
++#define PANEL_DCS_BRIGHTNESS	0x51
++
++#define MUTEX_EN(n)		(0x20 + 0x20 * (n))
++
++#define MMSYS_TRIG		0x0f0	/* BSP: "TODO: avoid hardcode" */
++
++/*
++ * RDMA memory fetch thresholds (GMC ultra/pre-ultra, FIFO, SODI, DVFS, DRS).
++ * lk programs the BSP "golden settings" only on pipe 0's RDMA and leaves the
++ * second pipe at reset values, which underflows on every frame (the right
++ * half of the panel glitches under memory load).
++ */
++static const u16 rdma_golden_regs[] = {
++	0x030, 0x034, 0x038, 0x03c, 0x040, 0x0a8, 0x0ac,
++	0x0d0, 0x0d4, 0x0d8, 0x0dc, 0x0e8, 0x1a8,
++};
++
++/*
++ * lk leaves both RDMAs in video-mode FIFO behaviour: FIFO_UNDERFLOW_EN set and a
++ * 446-entry output-valid threshold, so a momentary fetch shortfall emits filler
++ * pixels (a full-width white line on the panel). For command mode the BSP
++ * golden setting stalls instead: threshold 0, underflow output off, and a
++ * 256-entry request issue threshold.
++ */
++#define RDMA_MEM_GMC_S2		0x03c
++#define RDMA_FIFO_CON		0x040
++#define RDMA_FIFO_SIZE_MASK	GENMASK(27, 16)
++
++static void rdma_cmd_mode_fifo(void __iomem *rdma)
++{
++	writel(readl(rdma + RDMA_FIFO_CON) & RDMA_FIFO_SIZE_MASK, rdma + RDMA_FIFO_CON);
++	writel(256, rdma + RDMA_MEM_GMC_S2);
++}
++
++/* OVL layer control: per-pixel alpha enable; the scanout buffer is XRGB */
++#define OVL_L_CON(n)		(0x30 + 0x20 * (n))
++#define OVL_L_ADDR(n)		(0xf40 + 0x20 * (n))
++#define OVL_CON_AEN		BIT(8)
++
++struct dsi_cmd_kick {
++	struct device *dev;
++	void __iomem *mutex;
++	void __iomem *dsi;
++	void __iomem *mmsys;
++	void __iomem *ovl[2];		/* both pipes, for scanout address flips */
++	u32 ovl_layer;
++	u32 half_width_bytes;
++	u32 mutex_id;
++	struct mutex lock;		/* DSI engine: frames vs. DCS commands */
++	struct backlight_device *bl;
++	u32 refresh_rate;
++	unsigned long frames;
++	unsigned long waits;
++	unsigned long timeouts;
++	unsigned long te_timeouts;
++};
++
++/* one panel per board; simpledrm has no handle to us */
++static struct dsi_cmd_kick *kick;
++
++static void dsi_wait_idle(struct dsi_cmd_kick *k)
++{
++	u32 val;
++
++	if (!(readl(k->dsi + DSI_INTSTA) & DSI_BUSY))
++		return;
++	k->waits++;
++	if (readl_poll_timeout(k->dsi + DSI_INTSTA, val, !(val & DSI_BUSY), 50, 50000))
++		k->timeouts++;
++}
++
++void mtk_dsi_cmd_kick_begin(bool wait_idle)
++{
++	struct dsi_cmd_kick *k = READ_ONCE(kick);
++
++	if (!k)
++		return;
++	/* held until mtk_dsi_cmd_kick_end() so DCS writes cannot interleave */
++	mutex_lock(&k->lock);
++	/* single buffer: the update must not overwrite what is being sent */
++	if (wait_idle)
++		dsi_wait_idle(k);
++}
++EXPORT_SYMBOL_GPL(mtk_dsi_cmd_kick_begin);
++
++void mtk_dsi_cmd_kick_end(phys_addr_t scanout)
++{
++	struct dsi_cmd_kick *k = READ_ONCE(kick);
++	u32 val;
++
++	if (!k)
++		return;
++	/* double buffering: the previous frame may still be going out */
++	dsi_wait_idle(k);
++	/*
++	 * Start the transfer right after the panel's TE (start of its vblank, every
++	 * ~16.4 ms here), as the BSP trigger loop does (wfe EVENT_TE). The ~7.5 ms
++	 * transfer then stays ahead of the panel's scan-out; triggering at a random
++	 * time lets the scan cross the write and shows a torn line. INTSTA bits are
++	 * write-0-to-clear; nothing else uses them.
++	 */
++	writel(0, k->dsi + DSI_INTSTA);
++	if (readl_poll_timeout(k->dsi + DSI_INTSTA, val, val & DSI_TE_RDY, 20, 25000))
++		k->te_timeouts++;
++	/*
++	 * Flip: each pipe reads its half of the buffer (pipe 1 from +width/2).
++	 * The OVL address registers are shadowed and latch at the frame start.
++	 */
++	if (scanout && k->ovl[0] && k->ovl[1]) {
++		writel(lower_32_bits(scanout), k->ovl[0] + OVL_L_ADDR(k->ovl_layer));
++		writel(lower_32_bits(scanout + k->half_width_bytes),
++		       k->ovl[1] + OVL_L_ADDR(k->ovl_layer));
++	}
++	/* writel orders the framebuffer writes before the trigger */
++	writel(1, k->mutex + MUTEX_EN(k->mutex_id));
++	writel(readl(k->mmsys + MMSYS_TRIG) | BIT(0), k->mmsys + MMSYS_TRIG);
++	writel(DSI_CMDQ_WMS, k->dsi + DSI_CMDQ0);
++	writel(1, k->dsi + DSI_CMDQ_SIZE);
++	writel(0, k->dsi + DSI_START);
++	writel(1, k->dsi + DSI_START);
++	k->frames++;
++	mutex_unlock(&k->lock);
++}
++EXPORT_SYMBOL_GPL(mtk_dsi_cmd_kick_end);
++
++/* one DCS write through the DSI command queue (packing as mainline mtk_dsi_cmdq) */
++static int dsi_dcs_write(struct dsi_cmd_kick *k, const u8 *data, size_t len)
++{
++	u32 cmdq[6] = { 0 }, val;
++	u8 *bytes = (u8 *)cmdq;
++	int i, words, off, ret;
++
++	if (!len || len > 16)
++		return -EINVAL;
++	if (len > 2) {
++		cmdq[0] = len << 16 | MIPI_DCS_LONG_WRITE << 8 | DSI_CMDQ_LONG | DSI_CMDQ_HSTX;
++		off = 4;
++		words = 1 + DIV_ROUND_UP(len, 4);
++	} else {
++		cmdq[0] = (len == 1 ? MIPI_DCS_SHORT_WRITE : MIPI_DCS_SHORT_WRITE_P) << 8 |
++			  DSI_CMDQ_SHORT | DSI_CMDQ_HSTX;
++		off = 2;
++		words = 1;
++	}
++	for (i = 0; i < len; i++)
++		bytes[off + i] = data[i];
++	for (i = 0; i < words; i++)
++		cpu_to_le32s(&cmdq[i]);
++
++	mutex_lock(&k->lock);
++	readl_poll_timeout(k->dsi + DSI_INTSTA, val, !(val & DSI_BUSY), 100, 50000);
++	for (i = 0; i < words; i++)
++		writel(cmdq[i], k->dsi + DSI_CMDQ0 + 4 * i);
++	writel(words, k->dsi + DSI_CMDQ_SIZE);
++	writel(0, k->dsi + DSI_INTSTA);
++	writel(0, k->dsi + DSI_START);
++	writel(1, k->dsi + DSI_START);
++	ret = readl_poll_timeout(k->dsi + DSI_INTSTA, val, val & DSI_CMD_DONE, 20, 20000);
++	mutex_unlock(&k->lock);
++	return ret;
++}
++
++static int dsi_set_refresh(struct dsi_cmd_kick *k, u32 hz)
++{
++	u8 cmd[] = { PANEL_DCS_FREQ, hz == 120 ? 0x10 : 0x00, 0x00 };
++	int ret;
++
++	if (hz != 60 && hz != 120)
++		return -EINVAL;
++	ret = dsi_dcs_write(k, cmd, sizeof(cmd));
++	if (!ret)
++		k->refresh_rate = hz;
++	return ret;
++}
++
++void mtk_dsi_cmd_kick_set_refresh(unsigned int hz)
++{
++	struct dsi_cmd_kick *k = READ_ONCE(kick);
++
++	if (!k || hz == READ_ONCE(k->refresh_rate))
++		return;
++	if (dsi_set_refresh(k, hz))
++		dev_warn_once(k->dev, "cannot switch the panel to %u Hz\n", hz);
++}
++EXPORT_SYMBOL_GPL(mtk_dsi_cmd_kick_set_refresh);
++
++static int dsi_bl_update_status(struct backlight_device *bl)
++{
++	struct dsi_cmd_kick *k = bl_get_data(bl);
++	unsigned int level = backlight_get_brightness(bl);
++	u8 cmd[] = { PANEL_DCS_BRIGHTNESS, (level >> 8) & 0x7, level & 0xff };
++
++	return dsi_dcs_write(k, cmd, sizeof(cmd));
++}
++
++static const struct backlight_ops dsi_bl_ops = {
++	.options = BL_CORE_SUSPENDRESUME,
++	.update_status = dsi_bl_update_status,
++};
++
++static ssize_t refresh_rate_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct dsi_cmd_kick *k = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", k->refresh_rate);
++}
++
++static ssize_t refresh_rate_store(struct device *dev, struct device_attribute *attr,
++				  const char *buf, size_t count)
++{
++	struct dsi_cmd_kick *k = dev_get_drvdata(dev);
++	u32 hz;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &hz);
++	if (!ret)
++		ret = dsi_set_refresh(k, hz);
++	return ret ?: count;
++}
++static DEVICE_ATTR_RW(refresh_rate);
++
++static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct dsi_cmd_kick *k = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "frames %lu waits %lu timeouts %lu te_timeouts %lu\n",
++			  k->frames, k->waits, k->timeouts, k->te_timeouts);
++}
++static DEVICE_ATTR_RO(stats);
++
++/* re-send the current framebuffer, e.g. to tell transfer glitches from bad content */
++static ssize_t resend_store(struct device *dev, struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	mtk_dsi_cmd_kick_begin(true);
++	mtk_dsi_cmd_kick_end(0);
++	return count;
++}
++static DEVICE_ATTR_WO(resend);
++
++static int dsi_cmd_kick_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct dsi_cmd_kick *k;
++	int i, n;
++	u32 val;
++
++	k = devm_kzalloc(dev, sizeof(*k), GFP_KERNEL);
++	if (!k)
++		return -ENOMEM;
++
++	k->mutex = devm_platform_ioremap_resource_byname(pdev, "mutex");
++	if (IS_ERR(k->mutex))
++		return PTR_ERR(k->mutex);
++	k->dsi = devm_platform_ioremap_resource_byname(pdev, "dsi");
++	if (IS_ERR(k->dsi))
++		return PTR_ERR(k->dsi);
++	k->mmsys = devm_platform_ioremap_resource_byname(pdev, "mmsys");
++	if (IS_ERR(k->mmsys))
++		return PTR_ERR(k->mmsys);
++	of_property_read_u32(dev->of_node, "mediatek,mutex-id", &k->mutex_id);
++
++	/* drop per-pixel alpha on the layer lk uses for its framebuffer */
++	n = of_property_count_u32_elems(dev->of_node, "mediatek,ovl-xrgb-layers");
++	for (i = 0; n > 0 && i < n; i++) {
++		struct resource *res;
++		void __iomem *ovl;
++		u32 layer;
++
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 3 + i);
++		if (!res || of_property_read_u32_index(dev->of_node,
++				"mediatek,ovl-xrgb-layers", i, &layer))
++			break;
++		ovl = devm_ioremap(dev, res->start, resource_size(res));
++		if (!ovl)
++			break;
++		writel(readl(ovl + OVL_L_CON(layer)) & ~OVL_CON_AEN, ovl + OVL_L_CON(layer));
++		if (i < 2) {
++			k->ovl[i] = ovl;
++			k->ovl_layer = layer;
++		}
++	}
++
++	/* pipe 1 RDMA gets the thresholds lk set up for pipe 0 */
++	{
++		struct resource *r0, *r1;
++		void __iomem *rdma0, *rdma1;
++
++		r0 = platform_get_resource_byname(pdev, IORESOURCE_MEM, "rdma0");
++		r1 = platform_get_resource_byname(pdev, IORESOURCE_MEM, "rdma1");
++		rdma0 = r0 ? ioremap(r0->start, resource_size(r0)) : NULL;
++		rdma1 = r1 ? ioremap(r1->start, resource_size(r1)) : NULL;
++		if (rdma0 && rdma1)
++			for (i = 0; i < ARRAY_SIZE(rdma_golden_regs); i++)
++				writel(readl(rdma0 + rdma_golden_regs[i]),
++				       rdma1 + rdma_golden_regs[i]);
++		if (rdma0)
++			rdma_cmd_mode_fifo(rdma0);
++		if (rdma1)
++			rdma_cmd_mode_fifo(rdma1);
++		if (rdma0)
++			iounmap(rdma0);
++		if (rdma1)
++			iounmap(rdma1);
++	}
++
++	k->dev = dev;
++	mutex_init(&k->lock);
++	/* pipe 1 scans from the middle of each line (dual pipe, lk layout) */
++	of_property_read_u32(dev->of_node, "mediatek,pipe1-offset", &k->half_width_bytes);
++	platform_set_drvdata(pdev, k);
++	device_create_file(dev, &dev_attr_stats);
++	device_create_file(dev, &dev_attr_resend);
++	device_create_file(dev, &dev_attr_refresh_rate);
++
++	k->refresh_rate = 60;
++	if (!of_property_read_u32(dev->of_node, "mediatek,refresh-rate", &val) && val != 60 &&
++	    dsi_set_refresh(k, val))
++		dev_warn(dev, "could not set %u Hz\n", val);
++
++	if (!of_property_read_u32(dev->of_node, "mediatek,max-brightness", &val)) {
++		struct backlight_properties props = {
++			.type = BACKLIGHT_RAW,
++			.max_brightness = val,
++			.brightness = val / 2,
++			.scale = BACKLIGHT_SCALE_NON_LINEAR,
++		};
++
++		of_property_read_u32(dev->of_node, "mediatek,default-brightness",
++				     &props.brightness);
++		k->bl = devm_backlight_device_register(dev, "panel0-backlight", dev, k,
++						       &dsi_bl_ops, &props);
++		if (IS_ERR(k->bl))
++			return PTR_ERR(k->bl);
++		backlight_update_status(k->bl);
++	}
++	WRITE_ONCE(kick, k);
++	dev_info(dev, "triggering command-mode frames on framebuffer updates\n");
++	return 0;
++}
++
++static void dsi_cmd_kick_remove(struct platform_device *pdev)
++{
++	WRITE_ONCE(kick, NULL);
++	device_remove_file(&pdev->dev, &dev_attr_refresh_rate);
++	device_remove_file(&pdev->dev, &dev_attr_resend);
++	device_remove_file(&pdev->dev, &dev_attr_stats);
++}
++
++/*
++ * Panel off across system sleep. The backlight core has already set the
++ * brightness to 0 (BL_CORE_SUSPENDRESUME); display off + sleep in also stop
++ * the AMOLED's scan and TE. Timings are the MIPI DCS minimums.
++ */
++static int dsi_cmd_kick_suspend(struct device *dev)
++{
++	struct dsi_cmd_kick *k = dev_get_drvdata(dev);
++	u8 cmd;
++
++	cmd = MIPI_DCS_SET_DISPLAY_OFF;
++	dsi_dcs_write(k, &cmd, 1);
++	msleep(20);
++	cmd = MIPI_DCS_ENTER_SLEEP_MODE;
++	dsi_dcs_write(k, &cmd, 1);
++	msleep(120);
++	return 0;
++}
++
++static int dsi_cmd_kick_resume(struct device *dev)
++{
++	struct dsi_cmd_kick *k = dev_get_drvdata(dev);
++	u8 cmd;
++
++	cmd = MIPI_DCS_EXIT_SLEEP_MODE;
++	dsi_dcs_write(k, &cmd, 1);
++	msleep(120);
++	if (k->refresh_rate)
++		dsi_set_refresh(k, k->refresh_rate);
++	cmd = MIPI_DCS_SET_DISPLAY_ON;
++	dsi_dcs_write(k, &cmd, 1);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(dsi_cmd_kick_pm, dsi_cmd_kick_suspend,
++				dsi_cmd_kick_resume);
++
++static const struct of_device_id dsi_cmd_kick_of_match[] = {
++	{ .compatible = "mediatek,lk-dsi-cmd-kick" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, dsi_cmd_kick_of_match);
++
++static struct platform_driver dsi_cmd_kick_driver = {
++	.probe = dsi_cmd_kick_probe,
++	.remove = dsi_cmd_kick_remove,
++	.driver = {
++		.name = "mtk-dsi-cmd-kick",
++		.of_match_table = dsi_cmd_kick_of_match,
++		.pm = pm_sleep_ptr(&dsi_cmd_kick_pm),
++	},
++};
++module_platform_driver(dsi_cmd_kick_driver);
++
++MODULE_DESCRIPTION("Frame trigger for bootloader-configured MediaTek DSI command-mode panels");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/soc/mediatek/mtk-dsi-cmd-kick.h b/include/linux/soc/mediatek/mtk-dsi-cmd-kick.h
+new file mode 100644
+index 000000000..5e10944d1
+--- /dev/null
++++ b/include/linux/soc/mediatek/mtk-dsi-cmd-kick.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __MTK_DSI_CMD_KICK_H
++#define __MTK_DSI_CMD_KICK_H
++
++#if IS_REACHABLE(CONFIG_MTK_DSI_CMD_KICK)
++#include <linux/types.h>
++
++/*
++ * Bracket a framebuffer update. begin(true) waits until the previous frame was
++ * sent (single buffer); end() sends the frame at the next panel TE, first
++ * pointing the display engine at @scanout when it is non-zero (double buffer).
++ */
++void mtk_dsi_cmd_kick_begin(bool wait_idle);
++void mtk_dsi_cmd_kick_end(phys_addr_t scanout);
++/* switch the panel to hz (60/120) if it is not running at that rate */
++void mtk_dsi_cmd_kick_set_refresh(unsigned int hz);
++#else
++static inline void mtk_dsi_cmd_kick_begin(bool wait_idle) { }
++static inline void mtk_dsi_cmd_kick_end(phys_addr_t scanout) { }
++static inline void mtk_dsi_cmd_kick_set_refresh(unsigned int hz) { }
++#endif
++
++#endif

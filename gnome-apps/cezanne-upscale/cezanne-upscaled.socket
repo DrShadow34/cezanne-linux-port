@@ -1,0 +1,11 @@
+[Unit]
+Description=AI upscaling on the APU (cezanne-upscaled)
+
+[Socket]
+ListenSequentialPacket=/run/cezanne-upscale.sock
+SocketUser=root
+SocketGroup=video
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

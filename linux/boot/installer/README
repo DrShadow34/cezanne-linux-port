@@ -1,0 +1,44 @@
+cezanne installer / rescue (recovery slot)
+
+A RAM-only ramdisk built from the running Arch system: bash, coreutils,
+util-linux, e2fsprogs, btrfs-progs, tar, zstd, iproute2, dnsmasq, OpenSSH
+(sshd with the installed system's host keys and root's authorized_keys, so
+scripts/arch-ssh.sh works unchanged). /init brings up the USB RNDIS network
+(phone 172.16.42.1) and sshd, clears the misc BCB, and does nothing else.
+
+Build (on the phone, then on the PC):
+  /root/installer-src/mkinstaller.sh /root/installer-rd     # files of this dir
+  tar -C /root/installer-rd -czf /root/installer-rd.tgz .
+  (PC) tar -C build/installer-rd -xzpf - --no-same-owner < installer-rd.tgz
+  (PC) KEEP_WDT=1 mainline/mkboot-mainline.sh build/installer-rd build/mainline/installer-N.img
+  dd the full 128 MiB image to the recovery partition, cmp to verify.
+
+Enter it: misc BCB "boot-recovery" (32-byte field) + reboot,
+  (printf boot-recovery; head -c 19 /dev/zero) | dd of=/dev/sdc2 bs=32 count=1 conv=notrunc,fsync
+or Volume Up + Power at boot. The init clears the BCB, so the next reset
+boots the boot slot again. Reboot from it: `reboot` (sync + sysrq b).
+
+Moving Arch from the loop image to the partition (done 2026-10-30):
+  mount -o ro -t f2fs /dev/sdc60 /mnt/ud; sha256sum of the image on the phone
+  (PC) arch-ssh.sh 'zstd -T0 -3 -q -c /mnt/ud/unencrypted/arch/rootfs.img' > rootfs.img.zst
+  (PC) zstd -dc rootfs.img.zst | sha256sum   == phone's hash
+  umount; blkdiscard /dev/sdc60
+  (PC) arch-ssh.sh 'zstd -dc | dd of=/dev/sdc60 bs=4M' < rootfs.img.zst
+  head -c <image size> /dev/sdc60 | sha256sum   == hash
+  e2fsck -f; resize2fs /dev/sdc60; e2fsck -f; tune2fs -L arch-root
+archboot (initramfs/mainline-arch/init) mounts an ext4 userdata as / directly
+and falls back to the f2fs + loop image layout.
+
+ext4 -> btrfs (done 2026-11-02; NOTES "Root on btrfs"), from the rescue
+system, with to-btrfs/m*.sh (run from the rescue system's /tmp):
+  e2fsck -f; mount -o ro; manifest of the tree (find listing: type, mode,
+  owner, size, links, mtime; sha256 of every file; getfattr -m - dump)
+  (PC) arch-ssh.sh 'tar --format=posix --xattrs --xattrs-include="*" --acls
+       --numeric-owner --sparse -cf - . | zstd -T0 -3' | (store on the PC)
+       (sha256 on both ends, entry count = manifest)
+  wipefs; mkfs.btrfs -L arch-root; subvolumes @ (set-default) + @home;
+  mount @ and @home with compress=zstd:3
+  (PC) (read back from the PC) | arch-ssh.sh 'zstd -dc | tar --xattrs --xattrs-include="*"
+       --acls --numeric-owner -xpf -'
+  same manifest of the new tree: identical; new /etc/fstab; reboot
+--numeric-owner matters: the rescue system knows only root / sshd / nobody.

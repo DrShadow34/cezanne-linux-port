@@ -1,0 +1,32 @@
+# Fingerprint on the Redmi K30 Ultra (cezanne): the Microtrust TEE's file /
+# RPMB service (teei_daemon, our replacement for MIUI's), the fingerprint
+# service cezanne-fpd (fprintd's D-Bus API on the Goodix TA, so pam_fprintd,
+# the lock screen and GNOME Settings work) and gfctl (TA test tool). The
+# kernel modules cezanne_teei and goodix_fp come from mainline/fingerprint
+# (copied to /lib/modules/<rel>/extra/fingerprint by hand, linux-cezanne
+# later); the TA files and the TEE's storage live in /var/lib/cezanne-tee.
+pkgname=cezanne-fp
+pkgver=1.0
+pkgrel=4
+pkgdesc="Fingerprint (TEE service + fprintd-compatible daemon) for the cezanne"
+arch=(aarch64)
+license=(GPL-2.0-only)
+depends=(glibc python python-gobject fprintd)
+optdepends=('gnome-shell: the FOD spot (cezanne-fod extension)')
+source=(teei_daemon.c gfctl.c cezanne-fpd cezanne-tee.service cezanne-fpd.service
+        60-cezanne-tee.conf)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP)
+
+build() {
+  cc $CFLAGS $LDFLAGS -Wall -o teei_daemon teei_daemon.c -lpthread
+  cc $CFLAGS $LDFLAGS -Wall -Wno-format-truncation -o gfctl gfctl.c
+}
+
+package() {
+  install -Dm755 teei_daemon "$pkgdir/usr/bin/teei_daemon"
+  install -Dm755 gfctl "$pkgdir/usr/bin/gfctl"
+  install -Dm755 cezanne-fpd "$pkgdir/usr/bin/cezanne-fpd"
+  install -Dm644 cezanne-tee.service "$pkgdir/usr/lib/systemd/system/cezanne-tee.service"
+  install -Dm644 cezanne-fpd.service "$pkgdir/usr/lib/systemd/system/cezanne-fpd.service"
+  install -Dm644 60-cezanne-tee.conf "$pkgdir/usr/lib/sysctl.d/60-cezanne-tee.conf"
+}

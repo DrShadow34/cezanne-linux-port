@@ -1,0 +1,155 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 170adc60d..295050310 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -259,6 +259,9 @@ struct mtk_dsi {
+ 	 */
+ 	u32 te_seq;
+ 	wait_queue_head_t te_wq;
++	/* frame armed for the next TE (sent from the interrupt), or NULL */
++	struct mtk_mutex *te_frame;
++	spinlock_t te_lock;
+ 	void (*te_cb)(void *data);
+ 	void *te_cb_data;
+ };
+@@ -721,6 +724,8 @@ static s32 mtk_dsi_wait_for_irq_done(struct mtk_dsi *dsi, u32 irq_flag,
+ 	return ret;
+ }
+ 
++static void mtk_dsi_cmd_trigger(struct mtk_dsi *dsi, struct mtk_mutex *mutex);
++
+ static irqreturn_t mtk_dsi_irq(int irq, void *dev_id)
+ {
+ 	struct mtk_dsi *dsi = dev_id;
+@@ -735,7 +740,17 @@ static irqreturn_t mtk_dsi_irq(int irq, void *dev_id)
+ 	 * its own. INTSTA bits are write-0-to-clear, 1s leave the others.
+ 	 */
+ 	if (dsi->cmd_mode && (status & TE_RDY_INT_FLAG)) {
++		struct mtk_mutex *frame;
++
+ 		writel(~(u32)TE_RDY_INT_FLAG, dsi->regs + DSI_INTSTA);
++
++		spin_lock(&dsi->te_lock);
++		frame = dsi->te_frame;
++		dsi->te_frame = NULL;
++		spin_unlock(&dsi->te_lock);
++		if (frame)
++			mtk_dsi_cmd_trigger(dsi, frame);
++
+ 		WRITE_ONCE(dsi->te_seq, dsi->te_seq + 1);
+ 		wake_up_all(&dsi->te_wq);
+ 		te_cb = READ_ONCE(dsi->te_cb);
+@@ -1208,19 +1223,10 @@ void mtk_dsi_cmd_frame_begin(struct device *dev)
+ 	mtk_dsi_wait_for_idle(dsi);
+ }
+ 
+-void mtk_dsi_cmd_frame_end(struct device *dev, struct mtk_mutex *mutex)
++/* start the armed frame: also called from the TE interrupt */
++static void mtk_dsi_cmd_trigger(struct mtk_dsi *dsi, struct mtk_mutex *mutex)
+ {
+-	struct mtk_dsi *dsi = dev_get_drvdata(dev);
+ 	u32 reg_cmdq_off = dsi->driver_data->reg_cmdq_off;
+-	u32 seq;
+-
+-	if (!dsi->enabled)
+-		goto out;
+-
+-	seq = READ_ONCE(dsi->te_seq);
+-	if (!wait_event_timeout(dsi->te_wq, READ_ONCE(dsi->te_seq) != seq,
+-				msecs_to_jiffies(25)))
+-		dev_warn_ratelimited(dev, "no TE from the panel\n");
+ 
+ 	mtk_mutex_enable(mutex);
+ 	if (dsi->mmsys && dsi->driver_data->mmsys_cmd_trig_off)
+@@ -1237,6 +1243,40 @@ void mtk_dsi_cmd_frame_end(struct device *dev, struct mtk_mutex *mutex)
+ 	       dsi->regs + reg_cmdq_off);
+ 	mtk_dsi_mask(dsi, DSI_CMDQ_SIZE, CMDQ_SIZE, 1);
+ 	mtk_dsi_start(dsi);
++}
++
++void mtk_dsi_cmd_frame_end(struct device *dev, struct mtk_mutex *mutex)
++{
++	struct mtk_dsi *dsi = dev_get_drvdata(dev);
++	unsigned long flags;
++	struct mtk_mutex *armed;
++
++	if (!dsi->enabled)
++		goto out;
++
++	/*
++	 * The panel scans its GRAM from the top right after TE (~30 lines of
++	 * blanking): starting the transfer from a woken-up thread could let
++	 * the scan pass the first lines (stale lines flashing at the top on
++	 * full redraws). Like the BSP (GCE waits for the TE event), the TE
++	 * interrupt starts the frame.
++	 */
++	spin_lock_irqsave(&dsi->te_lock, flags);
++	dsi->te_frame = mutex;
++	spin_unlock_irqrestore(&dsi->te_lock, flags);
++
++	if (wait_event_timeout(dsi->te_wq, !READ_ONCE(dsi->te_frame),
++			       msecs_to_jiffies(25)))
++		goto out;
++
++	spin_lock_irqsave(&dsi->te_lock, flags);
++	armed = dsi->te_frame;
++	dsi->te_frame = NULL;
++	spin_unlock_irqrestore(&dsi->te_lock, flags);
++	if (armed) {
++		dev_warn_ratelimited(dev, "no TE from the panel\n");
++		mtk_dsi_cmd_trigger(dsi, armed);
++	}
+ out:
+ 	mutex_unlock(&dsi->cmd_lock);
+ }
+@@ -1447,6 +1487,7 @@ static int mtk_dsi_probe(struct platform_device *pdev)
+ 
+ 	init_waitqueue_head(&dsi->irq_wait_queue);
+ 	init_waitqueue_head(&dsi->te_wq);
++	spin_lock_init(&dsi->te_lock);
+ 	ret = devm_mutex_init(dev, &dsi->cmd_lock);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/iommu/mtk_iommu.c b/drivers/iommu/mtk_iommu.c
+index b52e16b06..413c78f81 100644
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@ -1617,6 +1617,8 @@ static const struct mtk_iommu_plat_data mt6893_data = {
+ 	.m4u_plat     = M4U_MT8192,
+ 	.flags        = HAS_BCLK | OUT_ORDER_WR_EN | HAS_SUB_COMM_2BITS |
+ 			WR_THROT_EN | IOVA_34_EN | SHARE_PGTABLE | MTK_IOMMU_TYPE_MM,
++	/* SHARE_PGTABLE needs the list (NULL deref in probe without it) */
++	.hw_list      = &m4ulist,
+ 	.inv_sel_reg  = REG_MMU_INV_SEL_GEN2,
+ 	.banks_num    = 1,
+ 	.banks_enable = {true},
+diff --git a/drivers/memory/mtk-smi.c b/drivers/memory/mtk-smi.c
+index 35d6e399e..f2531d2e3 100644
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -294,14 +294,17 @@ static int mtk_smi_larb_config_port_gen2_general(struct device *dev)
+ 		writel(reg, larb->base + SMI_LARB_NONSEC_CON(i));
+ 	}
+ 
+-	/* no IOMMU: the ports come up translated after a power cycle */
+-	if (larb->mmu == &larb->no_mmu) {
+-		for (i = 0; i < 32; i++) {
+-			reg = readl_relaxed(larb->base + SMI_LARB_NONSEC_CON(i));
+-			if (reg & F_MMU_EN)
+-				writel(reg & ~F_MMU_EN,
+-				       larb->base + SMI_LARB_NONSEC_CON(i));
+-		}
++	/*
++	 * Ports no IOMMU user is attached to stay physical (bypass). Some
++	 * SoCs (MT6885) reset to MMU on, so after a power cycle of their
++	 * domain these have to be cleared, not just left alone.
++	 */
++	for (i = 0; i < 32; i++) {
++		if (*larb->mmu & BIT(i))
++			continue;
++		reg = readl_relaxed(larb->base + SMI_LARB_NONSEC_CON(i));
++		if (reg & F_MMU_EN)
++			writel(reg & ~F_MMU_EN, larb->base + SMI_LARB_NONSEC_CON(i));
+ 	}
+ 	return 0;
+ }

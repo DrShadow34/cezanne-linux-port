@@ -1,0 +1,12 @@
+[Unit]
+Description=Video decoder (cezanne-vdec, V4L2 stateless + VA-API)
+# late on purpose, see /etc/modprobe.d/cezanne-vdec.conf
+After=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/modprobe cezanne-vdec
+
+[Install]
+WantedBy=graphical.target

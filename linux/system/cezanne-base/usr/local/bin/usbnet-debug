@@ -1,0 +1,9 @@
+#!/bin/bash
+# bring-up aid: log USB network counters + controller interrupts every 5 s
+for i in $(seq 1 40); do
+    for IF in $(ls /sys/class/net | grep -E '^(usb|rndis)'); do
+        echo "$IF rx=$(cat /sys/class/net/$IF/statistics/rx_packets) tx=$(cat /sys/class/net/$IF/statistics/tx_packets) rxerr=$(cat /sys/class/net/$IF/statistics/rx_errors) txerr=$(cat /sys/class/net/$IF/statistics/tx_errors) addr=$(ip -4 -br addr show $IF | awk '{print $3}')"
+    done
+    grep -E "mtu3|usb|11201000" /proc/interrupts | tr -s ' ' | cut -c1-80
+    sleep 5
+done

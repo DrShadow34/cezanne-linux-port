@@ -1,0 +1,6 @@
+# Arch's mangohud (x86_64 [extra]; Arch Linux ARM has no package): the
+# version and PKGBUILD come from Arch, so new MangoHud releases are built
+# when Arch has them. SUFFIX 1 (0.8.4-1.1 replaced our own 0.8.4-2).
+UPSTREAM=mangohud
+FROM=arch
+SUFFIX=1

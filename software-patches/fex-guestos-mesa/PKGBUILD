@@ -1,0 +1,129 @@
+# x86 guest root for Valve's FEX compatibility tool (Steam app 3127680), with
+# Mesa for the Mali-G77. The tool runs x86 Linux games under FEX and takes
+# the x86 userland and graphics drivers from /usr/share/guestos/fex-mesa
+# (SteamOS on ARM ships one; fex-compat-tool: "OS provided fex + mesa
+# combined arch linux install", graphics_provider.json at its top). This is
+# FEX's own ArchLinux root image with its Mesa (no G77) replaced by ours: the
+# Mesa release of the host's mesa + the mainline/mesa-g77 patches (copied
+# here by cezanne-pkg sync; panfrost GL, PanVK v9 with what DXVK needs),
+# cross-built with clang / lld for x86_64 and i686 against the image itself
+# as sysroot, so the libraries match its glibc / libdrm. The other Vulkan
+# ICDs of the image go (only PanVK can drive the GPU).
+# cezanne-build type "track" (upstream: mesa): rebuilt with every new mesa in
+# the ALARM repos, so guest and host Mesa stay the same release.
+_upver=${CZ_UPVER:-1:26.2.6-1}
+_mesaver=${_upver#*:}
+_mesaver=${_mesaver%-*}
+_image=2026.08.11
+pkgname=fex-guestos-mesa
+pkgver=$_image.$_mesaver
+pkgrel=2
+pkgdesc="x86 guest root for FEX (Steam's x86 tool) with Mesa for the Mali-G77"
+arch=(aarch64)
+url="https://fex-emu.com/"
+license=(custom)
+makedepends=(squashfs-tools clang lld llvm meson ninja libclc spirv-llvm-translator libdrm
+             glslang python-mako python-packaging python-yaml wayland bison flex)
+options=(!strip !debug)
+source=("ArchLinux-$_image.sqsh::https://rootfs.fex-emu.gg/ArchLinux/${_image//./-}/ArchLinux.sqsh"
+        "https://archive.mesa3d.org/mesa-$_mesaver.tar.xz"
+        cross.ini.in)
+noextract=("ArchLinux-$_image.sqsh")
+sha256sums=('5d0c1a38590c68e5c2597c2c8a26d2f80170b1b738c857d63e1cdadada5f5f2a'
+            SKIP
+            SKIP)
+# the mesa-g77 patches, whatever their number
+_patches=($(cd "$startdir" && printf '%s\n' 00*.patch))
+source+=("${_patches[@]}")
+sha256sums+=($(printf 'SKIP\n%.0s' "${_patches[@]}"))
+
+# triple, Meson cpu family, cpu, library dir in the guest, -march
+_guests=(x86_64-pc-linux-gnu:x86_64:x86_64:lib:x86-64
+         i686-pc-linux-gnu:x86:i686:lib32:pentium4)
+
+prepare() {
+  # the image has read-only directories
+  [ ! -d rootfs ] || chmod -R u+w rootfs
+  rm -rf rootfs
+  unsquashfs -q -n -d rootfs "ArchLinux-$_image.sqsh"
+
+  cd mesa-$_mesaver
+  local p
+  for p in "${_patches[@]}"; do
+    patch -Np1 -i "$srcdir/$p"
+  done
+  cd ..
+
+  local g triple family cpu libdir march
+  for g in "${_guests[@]}"; do
+    IFS=: read -r triple family cpu libdir march <<< "$g"
+    sed -e "s|@TRIPLE@|$triple|g" -e "s|@SYSROOT@|$srcdir/rootfs|g" \
+        -e "s|@LIBDIR@|$libdir|g" -e "s|@FAMILY@|$family|g" -e "s|@CPU@|$cpu|g" \
+        -e "s|@MARCH@|$march|g" cross.ini.in > cross-$cpu.ini
+  done
+}
+
+build() {
+  # build-time compilers for the cross builds (OpenCL C -> NIR, panfrost
+  # precompiled kernels), native
+  meson setup mesa-$_mesaver build-native \
+    -D buildtype=release -D platforms= -D gallium-drivers=panfrost \
+    -D vulkan-drivers= -D glx=disabled -D egl=disabled -D gbm=disabled \
+    -D gles1=disabled -D gles2=disabled -D llvm=enabled -D shared-llvm=enabled \
+    -D build-tests=false -D valgrind=disabled -D libunwind=disabled
+  ninja -C build-native src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 \
+    src/panfrost/clc/panfrost_compile
+  export PATH="$srcdir/build-native/src/compiler/clc:$srcdir/build-native/src/compiler/spirv:$srcdir/build-native/src/panfrost/clc:$PATH"
+
+  # makepkg's flags are for the phone; the cross files carry the x86 ones
+  unset CFLAGS CXXFLAGS LDFLAGS
+  local g triple family cpu libdir march
+  for g in "${_guests[@]}"; do
+    IFS=: read -r triple family cpu libdir march <<< "$g"
+    meson setup mesa-$_mesaver build-$cpu --cross-file cross-$cpu.ini \
+      --prefix=/usr --libdir=$libdir --buildtype=release -D b_ndebug=true \
+      -D platforms=x11,wayland \
+      -D gallium-drivers=panfrost \
+      -D vulkan-drivers=panfrost \
+      -D vulkan-layers= \
+      -D egl=enabled -D gbm=enabled -D glx=dri -D glvnd=enabled \
+      -D gles1=enabled -D gles2=enabled \
+      -D llvm=disabled \
+      -D gallium-va=disabled -D gallium-rusticl=false -D teflon=false \
+      -D video-codecs= -D xlib-lease=disabled -D spirv-tools=disabled \
+      -D valgrind=disabled -D libunwind=disabled -D lmsensors=disabled \
+      -D microsoft-clc=disabled -D build-tests=false \
+      -D mesa-clc=system -D precomp-compiler=system
+    meson compile -C build-$cpu
+  done
+}
+
+package() {
+  local root="$pkgdir/usr/share/guestos/fex-mesa"
+  install -d "${root%/*}"
+  # moved, not copied (4.3 GB); unsquashfs ran as the builder: root owns it
+  mv rootfs "$root"
+  chown -R 0:0 "$root"
+
+  local g triple family cpu libdir march
+  for g in "${_guests[@]}"; do
+    IFS=: read -r triple family cpu libdir march <<< "$g"
+    meson install -C build-$cpu --destdir "$root" --no-rebuild
+  done
+
+  # PanVK only: the loader would try every other ICD of the image
+  find "$root/usr/share/vulkan/icd.d" -name '*.json' ! -name 'panfrost_icd.*' -delete
+
+  # the image's x86 MangoHud looks the panfrost GPU's sensor up by the name
+  # substring "gpu_thermal"; MediaTek's are gpu0_thermal / gpu1_thermal (the
+  # host MangoHud has a patch, apps/mangohud): "pu0_thermal", same length,
+  # is a substring of gpu0_thermal. One occurrence per library, or untouched.
+  local f
+  for f in "$root"/usr/lib{,32}/mangohud/libMangoHud{,_opengl}.so; do
+    [ -f "$f" ] && [ "$(LC_ALL=C grep -c -a gpu_thermal "$f")" = 1 ] &&
+      LC_ALL=C sed -i 's/gpu_thermal/pu0_thermal/' "$f"
+  done
+  test -f "$root/usr/share/vulkan/icd.d/panfrost_icd.x86_64.json"
+  test -f "$root/usr/share/vulkan/icd.d/panfrost_icd.i686.json"
+  test -f "$root/graphics_provider.json"
+}

@@ -1,0 +1,39 @@
+From: cezanne port
+Subject: [PATCH] v4l2codecs: describe the visible picture in the pooled buffers' VideoMeta
+
+The stateless decoders set the sink format to the coded size and take the
+capture format the driver reports (also the coded size, e.g. 1920x1088) as
+the layout of the pooled buffers, while the output caps carry the display
+size (1920x1080). The buffers' GstVideoMeta therefore says 1088 rows under
+1080-row caps; a downstream videoconvert (videoconvertscale) treats that as
+a size change and rescales the coded picture to the caps size instead of
+cropping it. The copy path already forces the visible size before copying
+for the same reason. Make the shared output-state helper fix the visible
+size in the VideoInfo the pool stamps on its buffers; strides, offsets and
+the allocation size stay the coded layout.
+
+Found on a MediaTek MT6885 MM21 decoder: every stream whose display size
+is not a multiple of the 16x32 tile came out resampled (1080p: 72 dB
+against a 1088->1080 bilinear scale of the decoded picture, 31 dB against
+the correct crop); streams whose display size equals the coded size were
+bit-exact.
+---
+ sys/v4l2codecs/gstv4l2decoder.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+--- a/sys/v4l2codecs/gstv4l2decoder.c
++++ b/sys/v4l2codecs/gstv4l2decoder.c
+@@ -754,6 +754,13 @@ gst_v4l2_decoder_set_output_state (GstVideoDecoder * decoder,
+ {
+   GstVideoCodecState *state;
+
++  /* The pooled buffers keep the driver's coded layout (strides, offsets,
++   * size), but their VideoMeta must describe the visible picture: with the
++   * coded height under display-size caps a downstream converter rescales
++   * the picture instead of cropping it. */
++  vinfo_drm->vinfo.width = width;
++  vinfo_drm->vinfo.height = height;
++
+   state =
+       gst_video_decoder_set_output_state (decoder,
+       vinfo_drm->vinfo.finfo->format, width, height, reference);

@@ -1,0 +1,378 @@
+From 86a872610e41fd1634e529b1e3e74decd0c6bf2f Mon Sep 17 00:00:00 2001
+From: cezanne <port@local>
+Date: Sun, 1 Nov 2026 04:40:23 +0100
+Subject: [PATCH 7/9] panvk: v9 clip and cull distances through a fragment
+ discard
+
+The v9 rasterizer has no clip / cull distances, DXVK requires both. The
+vertex shader writes them as ordinary varyings (they are not hardware
+varying slots, so they are generic ones), the fragment shader
+interpolates them and discards where an enabled one is negative. Which
+ones the vertex shader writes is a draw-time sysval (clip bits 0-7,
+cull 8-15), so separately compiled fragment shaders (pipeline
+libraries, shader objects) work too; with a linked vertex shader only
+its slots are read and nothing is added when it writes none.
+
+Cull distances are approximated per fragment: a primitive whose
+vertices are all negative is gone, a partly negative one is cut where
+the spec keeps it.
+
+The discard must not cost early ZS / forward pixel kill when no
+distances are written: such shaders also keep the early ZS table and
+FPK / discard flags without it, and the draw picks them when the bound
+vertex shader writes none.
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c |  21 ++-
+ src/panfrost/vulkan/panvk_shader.h            |  17 ++
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c       |   5 +
+ .../vulkan/panvk_vX_physical_device.c         |  14 +-
+ src/panfrost/vulkan/panvk_vX_shader.c         | 154 ++++++++++++++----
+ 5 files changed, 171 insertions(+), 40 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+index 1cac733..8588651 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+@@ -673,13 +673,27 @@ emit_draw_section(struct panvk_cmd_buffer *cmdbuf,
+                : PAN_EARLYZS_ZS_TILEBUF_NOT_READ;
+          bool oq = cmdbuf->state.gfx.occlusion_query.mode !=
+                    MALI_OCCLUSION_MODE_DISABLED;
++
++         /* the clip / cull distance discard cannot happen when the vertex
++          * shader writes no distances: as if the shader had none */
++         const struct panvk_shader_variant *vs_hw =
++            panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
++         const bool no_clip = fs->fs.clip_cull_discard &&
++                              !(vs_hw && vs_hw->vs.clip_cull_mask);
++         const struct pan_earlyzs_lut *lut =
++            no_clip ? &fs->fs.earlyzs_lut_no_clip : &fs->fs.earlyzs_lut;
++         const bool can_fpk =
++            no_clip ? fs->fs.can_fpk_no_clip : fs->info.fs.can_fpk;
++         const bool can_discard =
++            no_clip ? fs->fs.can_discard_no_clip : fs->info.fs.can_discard;
++
+          struct pan_earlyzs_state earlyzs =
+-            pan_earlyzs_get(fs->fs.earlyzs_lut, writes_z || writes_s || oq,
++            pan_earlyzs_get(*lut, writes_z || writes_s || oq,
+                             alpha_to_coverage, ds_test_always_passes(cmdbuf),
+                             zs_read);
+ 
+          cfg.flags_0.allow_forward_pixel_to_kill =
+-            fs->info.fs.can_fpk && !(rt_mask & ~rt_written) &&
++            can_fpk && !(rt_mask & ~rt_written) &&
+             !(rt_read & rt_written) && !alpha_to_coverage &&
+             !cmdbuf->state.gfx.cb.info.any_dest_read;
+          cfg.flags_0.allow_forward_pixel_to_be_killed =
+@@ -692,8 +706,7 @@ emit_draw_section(struct panvk_cmd_buffer *cmdbuf,
+              cmdbuf->state.gfx.cb.info.needs_shader) &&
+             dyns->ms.rasterization_samples > 1;
+          cfg.flags_0.shader_modifies_coverage =
+-            fs->info.fs.writes_coverage || fs->info.fs.can_discard ||
+-            alpha_to_coverage;
++            fs->info.fs.writes_coverage || can_discard || alpha_to_coverage;
+ 
+          cfg.shader.resources = fs_desc_state->res_table;
+          cfg.shader.shader = panvk_priv_mem_dev_addr(fs->spd);
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index 3fc6030..6817292 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -165,6 +165,11 @@ struct panvk_graphics_sysvals {
+ 
+    struct {
+       aligned_u64 blend_descs[MAX_RTS];
++#if PAN_ARCH == 9
++      /* clip (bits 0-7) and cull (8-15) distances the vertex shader writes,
++       * see lower_clip_cull_fs() */
++      uint32_t clip_cull_mask;
++#endif
+    } fs;
+ 
+    struct panvk_input_attachment_info iam[INPUT_ATTACHMENT_MAP_SIZE];
+@@ -404,7 +409,19 @@ struct panvk_shader_variant {
+          uint32_t tile_image_color_read;
+          bool tile_image_z_read;
+          bool tile_image_s_read;
++         /* v9: discards on interpolated clip / cull distances (when the
++          * vertex shader writes any); the _no_clip state is for draws whose
++          * vertex shader writes none, where that discard never happens */
++         bool clip_cull_discard;
++         bool can_discard_no_clip;
++         bool can_fpk_no_clip;
++         struct pan_earlyzs_lut earlyzs_lut_no_clip;
+       } fs;
++
++      struct {
++         /* clip (bits 0-7) and cull (8-15) distances written */
++         uint16_t clip_cull_mask;
++      } vs;
+    };
+ 
+    struct panvk_shader_fau_info fau;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 83a5014..f3223f2 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -867,6 +867,11 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
+    set_gfx_sysval(cmdbuf, dirty_sysvals, vs.draw_id, info->draw_id);
+    set_gfx_sysval(cmdbuf, dirty_sysvals, vs.last_vertex,
+                   panvk_per_arch(cmd_vs_last_vertex)(cmdbuf, info));
++
++   const struct panvk_shader_variant *vs_hw =
++      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
++   set_gfx_sysval(cmdbuf, dirty_sysvals, fs.clip_cull_mask,
++                  vs_hw ? vs_hw->vs.clip_cull_mask : 0);
+ #endif
+ 
+ #if PAN_ARCH < 9
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index cc7a7c0..80c3b67 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -306,8 +306,7 @@ panvk_per_arch(get_physical_device_features)(
+       .independentBlend = true,
+       /* PANVK_DEBUG=dxvk: claimed so DXVK (which requires them) creates a
+        * device, for testing what else it needs. Not implemented: geometry
+-       * shader pipelines fail to compile, non-solid fill draws solid,
+-       * clip / cull distances are dropped. */
++       * shader pipelines fail to compile, LINE fill draws solid. */
+       .geometryShader = PANVK_DEBUG(DXVK),
+       .tessellationShader = false,
+       .sampleRateShading = true,
+@@ -348,8 +347,9 @@ panvk_per_arch(get_physical_device_features)(
+       .shaderSampledImageArrayDynamicIndexing = true,
+       .shaderStorageBufferArrayDynamicIndexing = true,
+       .shaderStorageImageArrayDynamicIndexing = true,
+-      .shaderClipDistance = PANVK_DEBUG(DXVK),
+-      .shaderCullDistance = PANVK_DEBUG(DXVK),
++      /* v9: fragment shader discard, see lower_clip_cull_fs() */
++      .shaderClipDistance = PAN_ARCH == 9,
++      .shaderCullDistance = PAN_ARCH == 9,
+       .shaderFloat64 = false,
+       .shaderInt64 = true,
+       .shaderInt16 = true,
+@@ -1001,9 +1001,9 @@ panvk_per_arch(get_physical_device_properties)(
+          PAN_ARCH >= 9 && device->kmod.dev->props.gpu_can_query_timestamp,
+       .timestampPeriod =
+          PAN_ARCH >= 9 ? panvk_get_gpu_system_timestamp_period(device) : 0,
+-      .maxClipDistances = PANVK_DEBUG(DXVK) ? 8 : 0,
+-      .maxCullDistances = PANVK_DEBUG(DXVK) ? 8 : 0,
+-      .maxCombinedClipAndCullDistances = PANVK_DEBUG(DXVK) ? 8 : 0,
++      .maxClipDistances = PAN_ARCH == 9 ? 8 : 0,
++      .maxCullDistances = PAN_ARCH == 9 ? 8 : 0,
++      .maxCombinedClipAndCullDistances = PAN_ARCH == 9 ? 8 : 0,
+       .discreteQueuePriorities = 2,
+       .pointSizeRange = {pointSizeRangeMin, pointSizeRangeMax},
+       .lineWidthRange = {0.0, 7.9921875},
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 4776264..e498575 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -618,6 +618,96 @@ valhall_pack_buf_idx(nir_builder *b, nir_instr *instr, UNUSED void *data)
+ }
+ #endif
+ 
++/* Early ZS / forward pixel kill state of a fragment shader; with the clip /
++ * cull distance discard also the state without it (draws whose vertex
++ * shader writes no distances: the discard cannot happen). */
++static void
++fs_init_earlyzs(struct panvk_shader_variant *shader)
++{
++   shader->fs.earlyzs_lut = pan_earlyzs_analyze(&shader->info, PAN_ARCH);
++   if (!shader->fs.clip_cull_discard)
++      return;
++
++   struct pan_shader_info no_clip = shader->info;
++   no_clip.fs.can_discard = shader->fs.can_discard_no_clip;
++   no_clip.fs.can_fpk = !no_clip.fs.writes_depth && !no_clip.fs.writes_stencil &&
++                        !no_clip.fs.writes_coverage && !no_clip.fs.can_discard &&
++                        !no_clip.fs.outputs_read;
++   shader->fs.can_fpk_no_clip = no_clip.fs.can_fpk;
++   shader->fs.earlyzs_lut_no_clip = pan_earlyzs_analyze(&no_clip, PAN_ARCH);
++}
++
++#if PAN_ARCH == 9
++/* The v9 rasterizer has no clip / cull distances. The vertex shader writes
++ * them as ordinary varyings, the fragment shader interpolates them and
++ * discards where an enabled one is negative. Cull distances the same way:
++ * per fragment, not per primitive (a primitive with every vertex negative
++ * goes entirely, one partly negative is cut instead of kept). Which
++ * distances the vertex shader writes comes at draw time (fs.clip_cull_mask:
++ * clip bits 0-7, cull 8-15); with a linked vertex shader only the slots it
++ * writes are read, and nothing is added when it writes none. */
++static bool
++lower_clip_cull_fs(nir_shader *nir, const struct pan_varying_layout *vs_layout)
++{
++   static const gl_varying_slot base[2] = {VARYING_SLOT_CLIP_DIST0,
++                                          VARYING_SLOT_CULL_DIST0};
++   static const char *const names[2] = {"panvk_clip_dist", "panvk_cull_dist"};
++   unsigned sizes[2] = {8, 8};
++
++   if (vs_layout) {
++      for (unsigned i = 0; i < 2; i++) {
++         const struct pan_varying_slot *s0 =
++            pan_varying_layout_find_slot(vs_layout, base[i]);
++         const struct pan_varying_slot *s1 =
++            pan_varying_layout_find_slot(vs_layout, base[i] + 1);
++         sizes[i] = s0 ? (s1 ? 4 + s1->ncomps : s0->ncomps) : 0;
++      }
++      if (!sizes[0] && !sizes[1])
++         return false;
++   }
++
++   nir_variable *vars[2] = {NULL, NULL};
++   for (unsigned i = 0; i < 2; i++) {
++      if (!sizes[i])
++         continue;
++      vars[i] = nir_find_variable_with_location(nir, nir_var_shader_in, base[i]);
++      if (vars[i]) {
++         sizes[i] = MIN2(sizes[i], glsl_get_length(vars[i]->type));
++      } else {
++         vars[i] = nir_variable_create(
++            nir, nir_var_shader_in,
++            glsl_array_type(glsl_float_type(), sizes[i], 0), names[i]);
++         vars[i]->data.location = base[i];
++         vars[i]->data.compact = true;
++         vars[i]->data.interpolation = INTERP_MODE_SMOOTH;
++      }
++   }
++
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++   nir_builder b = nir_builder_at(nir_before_impl(impl));
++   nir_def *mask = load_sysval(&b, graphics, 32, fs.clip_cull_mask);
++   nir_push_if(&b, nir_ine_imm(&b, mask, 0));
++   {
++      nir_def *kill = nir_imm_false(&b);
++      for (unsigned i = 0; i < 2; i++) {
++         for (unsigned j = 0; j < sizes[i]; j++) {
++            nir_def *d = nir_load_deref(
++               &b, nir_build_deref_array_imm(
++                      &b, nir_build_deref_var(&b, vars[i]), j));
++            nir_def *on =
++               nir_ine_imm(&b, nir_iand_imm(&b, mask, 1u << (8 * i + j)), 0);
++            kill = nir_ior(&b, kill, nir_iand(&b, on, nir_flt_imm(&b, d, 0.0)));
++         }
++      }
++      nir_discard_if(&b, kill);
++   }
++   nir_pop_if(&b, NULL);
++
++   nir->info.fs.uses_discard = true;
++   return nir_progress(true, impl, nir_metadata_none);
++}
++#endif
++
+ static bool
+ is_robust_ssbo_intr(const nir_intrinsic_instr *intr, UNUSED const void *data)
+ {
+@@ -887,33 +977,6 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
+    }
+ #endif
+ 
+-   /* PANVK_DEBUG=dxvk claims shaderClipDistance / shaderCullDistance
+-    * without implementing them: the distances are dropped */
+-   if (PANVK_DEBUG(DXVK)) {
+-      nir_variable_mode mode = stage == MESA_SHADER_FRAGMENT ?
+-         nir_var_shader_in : nir_var_shader_out;
+-      bool dropped = false;
+-      nir_foreach_variable_with_modes(var, nir, mode) {
+-         if (var->data.location == VARYING_SLOT_CLIP_DIST0 ||
+-             var->data.location == VARYING_SLOT_CLIP_DIST1 ||
+-             var->data.location == VARYING_SLOT_CULL_DIST0 ||
+-             var->data.location == VARYING_SLOT_CULL_DIST1) {
+-            var->data.mode = nir_var_shader_temp;
+-            dropped = true;
+-         }
+-      }
+-      if (dropped) {
+-         nir_fixup_deref_modes(nir);
+-         const uint64_t clip_cull =
+-            VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1 |
+-            VARYING_BIT_CULL_DIST0 | VARYING_BIT_CULL_DIST1;
+-         nir->info.outputs_written &= ~clip_cull;
+-         nir->info.inputs_read &= ~clip_cull;
+-         nir->info.clip_distance_array_size = 0;
+-         nir->info.cull_distance_array_size = 0;
+-      }
+-   }
+-
+    const nir_opt_access_options access_options = {
+       .is_vulkan = true,
+    };
+@@ -1200,7 +1263,7 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+       break;
+ 
+    case MESA_SHADER_FRAGMENT:
+-      shader->fs.earlyzs_lut = pan_earlyzs_analyze(&shader->info, PAN_ARCH);
++      fs_init_earlyzs(shader);
+       break;
+ 
+    default:
+@@ -1523,6 +1586,9 @@ panvk_compile_shader(struct panvk_device *dev,
+          inputs.trust_varying_flat_highp_types = true;
+          struct pan_varying_layout varying_layout;
+          if (v == PANVK_VS_VARIANT_HW) {
++            variant->vs.clip_cull_mask =
++               BITFIELD_MASK(nir->info.clip_distance_array_size) |
++               BITFIELD_MASK(nir->info.cull_distance_array_size) << 8;
+             pan_varying_collect_formats(&varying_layout, nir, inputs.gpu_id,
+                                         inputs.trust_varying_flat_highp_types,
+                                         true);
+@@ -1567,6 +1633,18 @@ panvk_compile_shader(struct panvk_device *dev,
+                &variant->fs.tile_image_z_read,
+                &variant->fs.tile_image_s_read);
+ 
++#if PAN_ARCH == 9
++      if (dev->vk.enabled_features.shaderClipDistance ||
++          dev->vk.enabled_features.shaderCullDistance) {
++         nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++         const bool own_discard = nir->info.fs.uses_discard;
++         if (lower_clip_cull_fs(nir, vs_varying_layout)) {
++            variant->fs.clip_cull_discard = true;
++            variant->fs.can_discard_no_clip = own_discard;
++         }
++      }
++#endif
++
+       /* Lower input intrinsics for fragment shaders early to get the max
+        * number of varying loads, as this number is required during descriptor
+        * lowering for v9+.
+@@ -1918,8 +1996,17 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
+                       sizeof(shader->cs.local_size));
+       break;
+ 
++   case MESA_SHADER_VERTEX:
++      blob_copy_bytes(blob, &shader->vs.clip_cull_mask,
++                      sizeof(shader->vs.clip_cull_mask));
++      break;
++
+    case MESA_SHADER_FRAGMENT:
+-      shader->fs.earlyzs_lut = pan_earlyzs_analyze(&shader->info, PAN_ARCH);
++      blob_copy_bytes(blob, &shader->fs.clip_cull_discard,
++                      sizeof(shader->fs.clip_cull_discard));
++      blob_copy_bytes(blob, &shader->fs.can_discard_no_clip,
++                      sizeof(shader->fs.can_discard_no_clip));
++      fs_init_earlyzs(shader);
+       blob_copy_bytes(blob, &shader->fs.input_attachment_read,
+                       sizeof(shader->fs.input_attachment_read));
+       blob_copy_bytes(blob, &shader->fs.tile_image_color_read,
+@@ -2067,7 +2154,16 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
+                        sizeof(shader->cs.local_size));
+       break;
+ 
++   case MESA_SHADER_VERTEX:
++      blob_write_bytes(blob, &shader->vs.clip_cull_mask,
++                       sizeof(shader->vs.clip_cull_mask));
++      break;
++
+    case MESA_SHADER_FRAGMENT:
++      blob_write_bytes(blob, &shader->fs.clip_cull_discard,
++                       sizeof(shader->fs.clip_cull_discard));
++      blob_write_bytes(blob, &shader->fs.can_discard_no_clip,
++                       sizeof(shader->fs.can_discard_no_clip));
+       blob_write_bytes(blob, &shader->fs.input_attachment_read,
+                        sizeof(shader->fs.input_attachment_read));
+       blob_write_bytes(blob, &shader->fs.tile_image_color_read,
+-- 
+2.56.0
+

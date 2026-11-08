@@ -1,0 +1,3 @@
+# Arch's mutter + the touch crash fix
+UPSTREAM=mutter
+SUFFIX=1

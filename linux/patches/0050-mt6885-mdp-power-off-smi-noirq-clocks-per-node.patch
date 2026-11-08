@@ -1,0 +1,123 @@
+mt6885: MDP powers off at every suspend (SMI noirq clocks per node)
+
+The SMI common noirq clock hold from 0026 (clocks on through noirq so
+other domains' bus protection acks) applied to both SMI commons. On
+smi_mdp it held the MDPSYS gates' enable count across the MDP domain's
+power cycle: the cycle resets mdpsys to all gated, power on only raised
+the count, the gates stayed gated, and every later MDP power off timed
+out (1 s, MM_2 bits 2/4). Now per node (mediatek,clocks-on-in-noirq,
+smi_disp only: MM bits 6/8 are the DISP <-> MDP ports, DISP never power
+cycles); the MDP domain holds SMI0/1/2 + APMCU GALS itself (DT).
+The bus protection timeout message also prints the ack register.
+
+diff --git a/drivers/memory/mtk-smi.c b/drivers/memory/mtk-smi.c
+index f2531d2e3..ef98d3ec4 100644
+--- a/drivers/memory/mtk-smi.c
++++ b/drivers/memory/mtk-smi.c
+@@ -121,12 +121,6 @@ static const char * const mtk_smi_common_clks[] = {"apb", "smi", "gals0", "gals1
+ #define MTK_SMI_SUB_COM_GALS_REQ_CLK_NR 3
+ 
+ struct mtk_smi_common_plat {
+-	/*
+-	 * Keep the clocks on through the noirq phase of a system suspend: the
+-	 * power domain's bus protection (applied by genpd after that) only
+-	 * gets its acks with the SMI running.
+-	 */
+-	bool		clk_on_for_pd_off;
+ 	enum mtk_smi_type	type;
+ 	bool			has_gals;
+ 	u32			bus_sel; /* Balance some larbs to enter mmu0 or mmu1 */
+@@ -153,6 +147,14 @@ struct mtk_smi {
+ 	};
+ 	struct device			*smi_common_dev; /* for sub common */
+ 	const struct mtk_smi_common_plat *plat;
++	/*
++	 * Keep the clocks on through the noirq phase of a system suspend:
++	 * other power domains' bus protection (applied by genpd then) only
++	 * gets its acks with this SMI running. Only for an SMI whose own
++	 * domain stays on: a power cycle resets the gates under the held
++	 * enable count and they stay gated.
++	 */
++	bool				noirq_clks;
+ };
+ 
+ struct mtk_smi_larb { /* larb: local arbiter */
+@@ -817,14 +819,6 @@ static const struct mtk_smi_common_plat mtk_smi_common_mt6893 = {
+ 		    F_MMU1_LARB(5) | F_MMU1_LARB(7),
+ };
+ 
+-static const struct mtk_smi_common_plat mtk_smi_common_mt6885 = {
+-	.type     = MTK_SMI_GEN2,
+-	.has_gals = true,
+-	.bus_sel  = F_MMU1_LARB(1) | F_MMU1_LARB(2) | F_MMU1_LARB(4) |
+-		    F_MMU1_LARB(5) | F_MMU1_LARB(7),
+-	.clk_on_for_pd_off = true,
+-};
+-
+ static const struct mtk_smi_common_plat mtk_smi_common_mt8183 = {
+ 	.type     = MTK_SMI_GEN2,
+ 	.has_gals = true,
+@@ -887,7 +881,7 @@ static const struct of_device_id mtk_smi_common_of_ids[] = {
+ 	{.compatible = "mediatek,mt2712-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt6779-smi-common", .data = &mtk_smi_common_mt6779},
+ 	{.compatible = "mediatek,mt6795-smi-common", .data = &mtk_smi_common_mt6795},
+-	{.compatible = "mediatek,mt6885-smi-common", .data = &mtk_smi_common_mt6885},
++	{.compatible = "mediatek,mt6885-smi-common", .data = &mtk_smi_common_mt6893},
+ 	{.compatible = "mediatek,mt6893-smi-common", .data = &mtk_smi_common_mt6893},
+ 	{.compatible = "mediatek,mt8167-smi-common", .data = &mtk_smi_common_gen2},
+ 	{.compatible = "mediatek,mt8173-smi-common", .data = &mtk_smi_common_gen2},
+@@ -915,6 +909,8 @@ static int mtk_smi_common_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	common->dev = dev;
+ 	common->plat = of_device_get_match_data(dev);
++	common->noirq_clks = of_property_read_bool(dev->of_node,
++						   "mediatek,clocks-on-in-noirq");
+ 
+ 	if (common->plat->has_gals) {
+ 		if (common->plat->type == MTK_SMI_GEN2)
+@@ -1001,7 +997,7 @@ static int __maybe_unused mtk_smi_common_suspend_noirq(struct device *dev)
+ {
+ 	struct mtk_smi *common = dev_get_drvdata(dev);
+ 
+-	if (!common->plat->clk_on_for_pd_off)
++	if (!common->noirq_clks)
+ 		return 0;
+ 	return clk_bulk_prepare_enable(common->clk_num, common->clks);
+ }
+@@ -1010,11 +1006,7 @@ static int __maybe_unused mtk_smi_common_resume_noirq(struct device *dev)
+ {
+ 	struct mtk_smi *common = dev_get_drvdata(dev);
+ 
+-	/*
+-	 * Runtime-suspended here: this drops the clocks to off, which is what
+-	 * a power-cycled domain has in its gates; runtime resume ungates.
+-	 */
+-	if (common->plat->clk_on_for_pd_off)
++	if (common->noirq_clks)
+ 		clk_bulk_disable_unprepare(common->clk_num, common->clks);
+ 	return 0;
+ }
+diff --git a/drivers/pmdomain/mediatek/mtk-pm-domains.c b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+index d6a7237a0..631e6bddd 100644
+--- a/drivers/pmdomain/mediatek/mtk-pm-domains.c
++++ b/drivers/pmdomain/mediatek/mtk-pm-domains.c
+@@ -282,9 +282,16 @@ static int scpsys_bus_protect_enable(struct scpsys_domain *pd, u8 flags)
+ 	return 0;
+ 
+ err_release:
+-	dev_err(pd->scpsys->dev, "%s: bus protection step %d (set 0x%x mask 0x%x) no ack\n",
+-		pd->genpd.name, i, pd->data->bp_cfg[i].bus_prot_set,
+-		pd->data->bp_cfg[i].bus_prot_set_clr_mask);
++	{
++		const struct scpsys_bus_prot_data *bpd = &pd->data->bp_cfg[i];
++		u32 sta = 0;
++
++		regmap_read(scpsys_bus_protect_get_sta_regmap(pd, bpd), bpd->bus_prot_sta, &sta);
++		dev_err(pd->scpsys->dev,
++			"%s: bus protection step %d (set 0x%x mask 0x%x) no ack (sta 0x%x = 0x%08x)\n",
++			pd->genpd.name, i, bpd->bus_prot_set, bpd->bus_prot_set_clr_mask,
++			bpd->bus_prot_sta, sta);
++	}
+ 	/*
+ 	 * Undo the steps already taken (and this one): the domain stays on
+ 	 * and its masters must keep their path to the bus.

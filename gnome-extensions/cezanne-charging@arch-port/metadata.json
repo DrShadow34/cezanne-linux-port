@@ -1,0 +1,12 @@
+{
+  "uuid": "cezanne-charging@arch-port",
+  "name": "Cezanne Charging",
+  "description": "Charging power next to the battery icon, marked when charging fast over USB PD.",
+  "shell-version": [
+    "51"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ]
+}

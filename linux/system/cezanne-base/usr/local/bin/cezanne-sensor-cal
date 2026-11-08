@@ -1,0 +1,73 @@
+#!/usr/bin/python3
+# Send the factory sensor calibration to the SCP sensor hub, the way the
+# MIUI sensor HAL does at startup (captured from its SCP log):
+#   acc   acc_cali.json                   gyro  gyro_cali.json
+#   mag   mag_bias.json + mag_cali.json   prox  ps_cali.json (thresholds)
+#   light [0, 1000, 0...] (scale) then als_data.json
+#   lux_b (type 81) lux_b_cali.json
+# The files live on the nvcfg partition (sensor/). Without the light config
+# the BU27030 reports 0 lux (its scale stays 0).
+import json, os, struct, subprocess, sys, tempfile, time
+
+NVCFG = '/dev/disk/by-partlabel/nvcfg'
+HF = '/dev/hf_manager'
+CONFIG_CALI = 4		# HF_MANAGER_SENSOR_CONFIG_CALI
+ACC, MAG, GYRO, LIGHT, PROX, LUX_B = 1, 2, 4, 5, 8, 81
+
+
+def load(d, name):
+    try:
+        with open(os.path.join(d, 'sensor', name)) as f:
+            return list(json.load(f).values())[0]
+    except (OSError, ValueError) as e:
+        print(f'{name}: {e}', file=sys.stderr)
+        return None
+
+
+def send(fd, sensor, data):
+    data = [int(v) & 0xffffffff for v in data][:12]
+    data += [0] * (12 - len(data))
+    # struct hf_manager_cmd: u8 type, u8 action, s64 delay, s64 latency, s32 data[12], packed
+    pkt = struct.pack('<BBqq12I', sensor, CONFIG_CALI, 0, 0, *data)
+    try:
+        os.write(fd, pkt)
+    except OSError as e:
+        print(f'type {sensor}: {e}', file=sys.stderr)
+
+
+def main():
+    for _ in range(60):	# the hub's manager comes up after the SCP boots
+        if os.path.exists(HF) and 'mtk_nanohub' in open('/proc/hf_manager').read():
+            break
+        time.sleep(1)
+    else:
+        sys.exit('sensor hub not up')
+
+    mnt = tempfile.mkdtemp()
+    subprocess.run(['mount', '-o', 'ro', NVCFG, mnt], check=True)
+    try:
+        cal = {n: load(mnt, n + '.json') for n in
+               ('acc_cali', 'gyro_cali', 'mag_bias', 'mag_cali', 'als_data',
+                'lux_b_cali', 'ps_cali')}
+    finally:
+        subprocess.run(['umount', mnt])
+        os.rmdir(mnt)
+
+    fd = os.open(HF, os.O_RDWR)
+    if cal['acc_cali']:
+        send(fd, ACC, cal['acc_cali'] + [0])
+    if cal['gyro_cali']:
+        send(fd, GYRO, cal['gyro_cali'])
+    if cal['mag_bias'] and cal['mag_cali']:
+        send(fd, MAG, cal['mag_bias'] + cal['mag_cali'])
+    send(fd, LIGHT, [0, 1000, 0, 0, 0, 0])
+    if cal['als_data']:
+        send(fd, LIGHT, cal['als_data'])
+    if cal['lux_b_cali']:
+        send(fd, LUX_B, cal['lux_b_cali'] + [0, 0])
+    if cal['ps_cali']:
+        send(fd, PROX, cal['ps_cali'])
+    os.close(fd)
+
+
+main()

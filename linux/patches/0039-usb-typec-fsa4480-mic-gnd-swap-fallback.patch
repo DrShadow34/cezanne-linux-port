@@ -1,0 +1,85 @@
+usb: typec: mux: fsa4480: MIC/GND fallback when detection misses a headset
+
+diff --git a/drivers/usb/typec/mux/fsa4480.c b/drivers/usb/typec/mux/fsa4480.c
+index bea0c1dee..4d38de271 100644
+--- a/drivers/usb/typec/mux/fsa4480.c
++++ b/drivers/usb/typec/mux/fsa4480.c
+@@ -9,6 +9,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/property.h>
+ #include <linux/regmap.h>
+ #include <linux/usb/typec_dp.h>
+ #include <linux/usb/typec_mux.h>
+@@ -31,6 +32,7 @@
+ #define FSA4480_DELAY_L_SENSE	0x0f
+ #define FSA4480_DELAY_L_AGND	0x10
+ #define FSA4480_FUNCTION_ENABLE	0x12
++#define FSA4480_JACK_STATUS	0x17
+ #define FSA4480_RESET		0x1e
+ #define FSA4480_MAX_REGISTER	0x1f
+ 
+@@ -49,6 +51,8 @@
+ 
+ #define FSA4480_ENABLE_AUTO_JACK_DETECT	BIT(0)
+ 
++#define FSA4480_JACK_4POLE	GENMASK(2, 1)
++
+ struct fsa4480 {
+ 	struct i2c_client *client;
+ 
+@@ -66,6 +70,7 @@ struct fsa4480 {
+ 
+ 	u8 cur_enable;
+ 	bool swap_sbu_lanes;
++	bool audio_swap_fallback;
+ };
+ 
+ static const struct regmap_config fsa4480_regmap_config = {
+@@ -132,10 +137,34 @@ static int fsa4480_set(struct fsa4480 *fsa)
+ 	regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, enable);
+ 
+ 	/* Start AUDIO JACK DETECTION to setup MIC, AGND & Sense muxes */
+-	if (enable & FSA4480_ENABLE_AGND)
++	if (enable & FSA4480_ENABLE_AGND) {
++		unsigned int fn, jack = 0;
++
+ 		regmap_write(fsa->regmap, FSA4480_FUNCTION_ENABLE,
+ 			     FSA4480_ENABLE_AUTO_JACK_DETECT);
+ 
++		/*
++		 * Detection can miss the mic of a 4-pole headset and leave
++		 * MIC/Sense open on a single ground, which plays L - R in both
++		 * ears. If it finds no 4-pole plug, close all audio switches in
++		 * the board's CTIA position (MIC and GND swapped onto SBU2 /
++		 * SBU1); a 3-pole plug shorts both rings, so it works there too.
++		 */
++		if (fsa->audio_swap_fallback &&
++		    !regmap_read_poll_timeout(fsa->regmap, FSA4480_FUNCTION_ENABLE,
++					      fn, !(fn & FSA4480_ENABLE_AUTO_JACK_DETECT),
++					      1000, 200000) &&
++		    !regmap_read(fsa->regmap, FSA4480_JACK_STATUS, &jack) &&
++		    !(jack & FSA4480_JACK_4POLE)) {
++			enable |= FSA4480_ENABLE_SENSE | FSA4480_ENABLE_MIC;
++			sel = FSA4480_SEL_SENSE | FSA4480_SEL_MIC | FSA4480_SEL_AGND;
++			regmap_write(fsa->regmap, FSA4480_SWITCH_SELECT, sel);
++			regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, enable);
++		}
++		dev_dbg(&fsa->client->dev, "audio jack status %#x, enable %#x sel %#x\n",
++			jack, enable, sel);
++	}
++
+ 	if (enable & FSA4480_ENABLE_SBU) {
+ 		/* 15us to allow the SBU switch to turn on again */
+ 		usleep_range(15, 1000);
+@@ -270,6 +299,9 @@ static int fsa4480_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return ret;
+ 
++	fsa->audio_swap_fallback =
++		device_property_read_bool(dev, "fcs,audio-mic-gnd-swap-fallback");
++
+ 	fsa->regmap = devm_regmap_init_i2c(client, &fsa4480_regmap_config);
+ 	if (IS_ERR(fsa->regmap))
+ 		return dev_err_probe(dev, PTR_ERR(fsa->regmap), "failed to initialize regmap\n");

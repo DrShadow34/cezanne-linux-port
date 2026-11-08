@@ -1,0 +1,26 @@
+# Storage page for the Redmi K30 Ultra (cezanne), as Android shows it: the
+# used space by category (apps, games, images, videos, audio, documents,
+# cache, trash, system) with the folders, files, apps and caches behind each,
+# cache clearing and emptying the trash. The root file system is walked by
+# worker processes of the script itself; apps come from pacman's database.
+# With polkit (org.cezanne.storage.policy) the workers run as root through
+# pkexec and also measure what the files take on disk (btrfs compression).
+pkgname=cezanne-storage
+pkgver=1.1
+pkgrel=3
+pkgdesc="Storage usage by category, Android style"
+arch=(any)
+license=(MIT)
+depends=(python python-gobject gtk4 libadwaita pacman polkit)
+source=(cezanne-storage
+        org.cezanne.Storage.desktop
+        org.cezanne.Storage.svg
+        org.cezanne.storage.policy)
+sha256sums=(SKIP SKIP SKIP SKIP)
+
+package() {
+  install -Dm755 cezanne-storage "$pkgdir/usr/bin/cezanne-storage"
+  install -Dm644 org.cezanne.Storage.desktop "$pkgdir/usr/share/applications/org.cezanne.Storage.desktop"
+  install -Dm644 org.cezanne.Storage.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/org.cezanne.Storage.svg"
+  install -Dm644 org.cezanne.storage.policy "$pkgdir/usr/share/polkit-1/actions/org.cezanne.storage.policy"
+}

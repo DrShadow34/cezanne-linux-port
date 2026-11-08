@@ -1,0 +1,22 @@
+[Unit]
+Description=GNSS location service (cezanne: GPS / BeiDou fixes as NMEA for GeoClue)
+Wants=cezanne-gps.service network-online.target
+After=cezanne-gps.service network-online.target
+Before=geoclue.service
+
+[Service]
+ExecStart=/usr/bin/cezanne-gnssd
+Restart=on-failure
+# GeoClue's connection survives restarts in the fd store (it never reconnects)
+NotifyAccess=main
+FileDescriptorStoreMax=8
+RuntimeDirectory=cezanne-gnss
+RuntimeDirectoryMode=0755
+StateDirectory=cezanne-gnss
+CacheDirectory=cezanne-gnss
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

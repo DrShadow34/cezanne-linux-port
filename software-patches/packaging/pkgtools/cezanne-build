@@ -1,0 +1,386 @@
+#!/bin/bash
+# cezanne-build: build the cezanne packages into the local pacman repo [cezanne]
+# (runs on the phone, as root; makepkg runs as $BUILDER).
+#
+#   cezanne-build [-f] [-n] [NAME...]   build NAMEs (default: all) that are stale
+#                                       -f: even when current, -n: dry run
+#   cezanne-build --status              every package: built key vs current key
+#
+# packaging/packages.list (in $TOP, the synced project subset) lists the packages in build order, "NAME TYPE DIR":
+#   own      DIR holds a complete PKGBUILD (our own software); stale when the
+#            directory's contents change
+#   track    DIR holds our PKGBUILD for software that has to follow an upstream
+#            package's version (plugins built against it): DIR/upstream names
+#            it (PROBE=<pkgname>), the PKGBUILD gets its version as $CZ_UPVER;
+#            stale when that version or the directory changes
+#   overlay  DIR holds "upstream" (UPSTREAM=<pkgbase>, SUFFIX=<n>), cezanne.sh
+#            and our patches; the PKGBUILD is the current upstream one (ALARM's
+#            PKGBUILDs repo if it modifies the package, else Arch's packaging
+#            repo at the tag of the version in the ALARM sync db) + overlay-lib.sh
+#            + cezanne.sh; stale when that upstream version or the overlay changes.
+#            FROM=arch in "upstream": a package ALARM does not carry; the
+#            version is Arch's (x86_64 [core] / [extra], archlinux.org), the
+#            PKGBUILD Arch's at that tag, so the overlay follows Arch's releases
+#   follow   DIR holds our PKGBUILD for software released outside the distro
+#            repos (Valve's Steam): DIR/upstream-version prints what is
+#            followed (versions, one line), DIR/update-sources.sh pins the
+#            build copy's PKGBUILD to the current release before the build;
+#            stale when that line or the directory changes
+# Built packages go to $REPO (repo-add -R: older files dropped); the key each
+# package was built from is kept in $STATE/NAME.
+# Every build runs in a clean copy of the chroot $CHROOT/root (devtools
+# makechrootpkg; the system's pacman.conf without IgnorePkg, [cezanne] bound
+# in read-only): build dependencies never touch the installed system. The
+# upstream versions come from sync dbs of our own ($CACHE/db, as
+# checkupdates): the system's are never refreshed without an upgrade.
+set -euo pipefail
+export LC_ALL=C
+
+TOP=${CEZANNE_PKG:-/home/alarm/cezanne-pkg}
+REPO=${CEZANNE_REPO:-/var/lib/cezanne/repo}
+DB=$REPO/cezanne.db.tar.gz
+STATE=/var/lib/cezanne/built
+WORK=${CEZANNE_WORK:-/home/alarm/cezanne-build}
+CACHE=/var/cache/cezanne-build
+DBP=$CACHE/db
+CHROOT=${CEZANNE_CHROOT:-/var/lib/cezanne/chroot}
+BUILDER=${CEZANNE_BUILDER:-alarm}
+SYNC_REPOS=(core extra alarm)
+ARCH_GIT=https://gitlab.archlinux.org/archlinux/packaging/packages
+ALARM_GIT=https://github.com/archlinuxarm/PKGBUILDs
+
+force= dry= status=
+while [[ ${1-} == -* ]]; do
+	case $1 in
+	-f) force=1 ;;
+	-n) dry=1 ;;
+	--status) status=1 ;;
+	*) echo "unknown option $1" >&2; exit 2 ;;
+	esac
+	shift
+done
+[[ $(id -u) == 0 ]] || { echo "run as root" >&2; exit 1; }
+# one run at a time (the timer and a manual build)
+if [[ -z $status ]]; then
+	exec 9> /run/cezanne-build.lock
+	flock -n 9 || { echo "cezanne-build: another run is active" >&2; exit 1; }
+fi
+mkdir -p "$REPO" "$STATE" "$CACHE" "$WORK"
+chown "$BUILDER:" "$WORK"
+
+log() { echo "cezanne-build: $*"; }
+as_builder() { runuser -u "$BUILDER" -- "$@"; }
+
+# the builder's keyring for source signatures, ours alone and a plain
+# keybox: with keyboxd (GnuPG 2.4's default) an import and a verify running
+# close together failed ("SQL library used incorrectly", key then unknown)
+export GNUPGHOME=$CACHE/gnupg
+if [[ ! -f $GNUPGHOME/common.conf ]]; then
+	install -d -m700 -o "$BUILDER" -g "$BUILDER" "$GNUPGHOME"
+	echo "# no use-keyboxd: pubring.kbx" > "$GNUPGHOME/common.conf"
+	chown "$BUILDER:" "$GNUPGHOME/common.conf"
+fi
+# downloaded sources survive the build directories (git mirrors, tarballs,
+# fex-guestos-mesa's 1 GB image)
+export SRCDEST=$CACHE/sources
+install -d -o "$BUILDER" -g "$BUILDER" "$SRCDEST"
+
+# our own copy of the sync dbs (the local db is the system's)
+sync_dbs() {
+	mkdir -p "$DBP"
+	ln -sfn /var/lib/pacman/local "$DBP/local"
+	pacman -Sy --dbpath "$DBP" --logfile /dev/null >/dev/null
+}
+
+# the build chroot: created once, updated once per run
+chroot_ready() {
+	mkdir -p "$CHROOT"
+	sed '/^[[:space:]]*IgnorePkg/d' /etc/pacman.conf > "$CHROOT/pacman.conf"
+	# zstd (multithreaded) instead of ALARM's single-threaded xz: the
+	# fex-guestos-mesa root is 4.3 GB
+	{ cat /etc/makepkg.conf; echo "PKGEXT='.pkg.tar.zst'"; } > "$CHROOT/makepkg.conf"
+	if [[ ! -d $CHROOT/root ]]; then
+		log "creating the build chroot $CHROOT/root"
+		mkarchroot -C "$CHROOT/pacman.conf" -M "$CHROOT/makepkg.conf" "$CHROOT/root" base-devel
+	fi
+	arch-nspawn -C "$CHROOT/pacman.conf" -M "$CHROOT/makepkg.conf" "$CHROOT/root" \
+		--bind-ro="$REPO" pacman -Syuu --noconfirm
+}
+
+# contents of a directory, without build leftovers and without the packages
+# nested in it (mainline/rootfs holds gstreamer/ and libva-v4l2-request/).
+# src/ counts: chroot builds keep makepkg's src/ in /build, and sources live
+# there (libva-v4l2-request/src)
+dir_hash() {
+	local nested=() n skip=()
+	mapfile -t nested < <(cd "$1" && find . -mindepth 2 -name PKGBUILD -printf '%h\n')
+	for n in "${nested[@]}"; do
+		skip+=(! -path "$n/*")
+	done
+	(cd "$1" && find . -type f ! -path './pkg/*' \
+		! -name '*.pkg.tar*' ! -name '*.log' ! -path './.*' ! -path '*/.git/*' \
+		! -path '*/__pycache__/*' "${skip[@]}" -print0 |
+		LC_ALL=C sort -z | xargs -0 -r sha256sum) | sha256sum | cut -c1-16
+}
+
+# version of a package in the ALARM sync dbs (not our repo)
+upstream_version() {
+	pacman -Sl --dbpath "$DBP" "${SYNC_REPOS[@]}" 2>/dev/null | awk -v p="$1" '$2 == p { print $3; exit }'
+}
+
+# version of a package in Arch's own [core] / [extra] (x86_64 or any), for
+# overlays of packages ALARM does not build (FROM=arch): archlinux.org's
+# package search, empty when it does not answer
+arch_version() {
+	curl -sf -m 30 "https://archlinux.org/packages/search/json/?name=$1" | python3 -c '
+import json, sys
+for p in json.load(sys.stdin)["results"]:
+    if p["repo"] in ("core", "extra") and p["arch"] in ("x86_64", "any"):
+        print(("%d:" % p["epoch"] if p["epoch"] else "") + "%s-%s" % (p["pkgver"], p["pkgrel"]))
+        break' 2>/dev/null || true
+}
+
+# pkgbase of a package in the ALARM sync dbs
+upstream_base() {
+	local r db
+	for r in "${SYNC_REPOS[@]}"; do
+		db=$DBP/sync/$r.db
+		[[ -f $db ]] || continue
+		bsdtar -xOf "$db" "$1-$2/desc" 2>/dev/null |
+			awk '/^%BASE%$/ { getline; print; f=1; exit } END { if (!f) exit 1 }' && return
+	done
+	echo "$1"
+}
+
+# our pkgrel: upstream pkgrel + suffix (ALARM's own ".N" rebuilds folded in)
+cz_rel() {
+	local r=$1 n=$2
+	if [[ $r == *.* ]]; then
+		echo "${r%%.*}.$(( ${r#*.} * 100 + n ))"
+	else
+		echo "$r.$n"
+	fi
+}
+
+# fetch the upstream packaging of BASE at version VER into DEST (FROM: arch
+# for Arch's packaging alone)
+fetch_upstream() {
+	local base=$1 ver=$2 dest=$3 from=${4:-} r v pv rel tag
+	rm -rf "$dest"
+	# ALARM's PKGBUILDs repo carries the packages it changes for ARM
+	for r in core extra alarm; do
+		[[ $from == arch ]] && break
+		if curl -sfI -m 20 "https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/master/$r/$base/PKGBUILD" >/dev/null; then
+			if [[ ! -d $CACHE/alarm/.git ]]; then
+				git clone -q --depth 1 --filter=blob:none --sparse "$ALARM_GIT" "$CACHE/alarm"
+			fi
+			# a shallow clone cannot pull (divergent histories): reset
+			git -C "$CACHE/alarm" fetch -q --depth 1 origin master &&
+				git -C "$CACHE/alarm" reset -q --hard FETCH_HEAD || true
+			git -C "$CACHE/alarm" sparse-checkout add "$r/$base"
+			v=$(cd "$CACHE/alarm/$r/$base" && as_builder bash -c 'source ./PKGBUILD >/dev/null; echo "${epoch:+$epoch:}$pkgver-$pkgrel"')
+			if [[ $v == "$ver" ]]; then
+				cp -a "$CACHE/alarm/$r/$base" "$dest"
+				log "$base $ver: ALARM $r/$base"
+				return
+			fi
+			log "$base: ALARM PKGBUILD is $v, the repo has $ver; trying Arch's"
+		fi
+	done
+	# Arch tags: [epoch-]pkgver-pkgrel; ALARM rebuild suffixes (.N) are ALARM's
+	pv=${ver%-*}
+	rel=${ver##*-}
+	tag="${pv/:/-}-${rel%%.*}"
+	git clone -q --depth 1 --branch "$tag" "$ARCH_GIT/$base.git" "$dest"
+	log "$base $ver: Arch $tag"
+}
+
+# make the build directory of overlay NAME (DIR) for upstream version VER
+prepare_overlay() {
+	local name=$1 dir=$2 ver=$3 base=$4 dest=$WORK/$name rel
+	local SUFFIX=1 UPSTREAM= PROBE= FROM=
+	# shellcheck source=/dev/null
+	source "$dir/upstream"
+	fetch_upstream "$base" "$ver" "$dest.up" "$FROM"
+	rm -rf "$dest"
+	mkdir -p "$dest"
+	cp -a "$dest.up"/. "$dest"/
+	rm -rf "$dest/.git" "$dest.up"
+	cp -a "$dir"/. "$dest"/
+	rel=$(cd "$dest" && as_builder bash -c 'source ./PKGBUILD >/dev/null; echo "$pkgrel"')
+	{
+		cat "$TOP/packaging/overlay-lib.sh"
+		echo "# ---- cezanne overlay $name ----"
+		cat "$dir/cezanne.sh"
+		echo "[[ \${arch[*]} == *aarch64* ]] || arch=(aarch64)"
+		echo "pkgrel=$(cz_rel "$rel" "$SUFFIX")"
+	} >> "$dest/PKGBUILD"
+	rm -f "$dest/upstream" "$dest/cezanne.sh"
+	chown -R "$BUILDER:" "$dest"
+}
+
+# key a package is built from: what makes it stale when it changes
+current_key() {
+	local name=$1 type=$2 dir=$3 UPSTREAM= PROBE= SUFFIX=1 FROM= ver
+	case $type in
+	own)
+		echo "own $(dir_hash "$dir")"
+		;;
+	track)
+		# shellcheck source=/dev/null
+		source "$dir/upstream"
+		ver=$(upstream_version "$PROBE")
+		[[ -n $ver ]] || { echo "missing"; return; }
+		echo "$ver $(dir_hash "$dir")"
+		;;
+	follow)
+		# the upstream's current release, asked as the builder (network)
+		ver=$(as_builder timeout 120 "$dir/upstream-version" 2>/dev/null | head -1 | tr ' ' '+')
+		[[ -n $ver ]] || { echo "missing"; return; }
+		echo "$ver $(dir_hash "$dir")"
+		;;
+	overlay)
+		# shellcheck source=/dev/null
+		source "$dir/upstream"
+		if [[ $FROM == arch ]]; then
+			ver=$(arch_version "${UPSTREAM:-$name}")
+		else
+			ver=$(upstream_version "${PROBE:-${UPSTREAM:-$name}}")
+		fi
+		[[ -n $ver ]] || { echo "missing"; return; }
+		echo "$ver $(dir_hash "$dir") $(sha256sum "$TOP/packaging/overlay-lib.sh" | cut -c1-8)"
+		;;
+	esac
+}
+
+build_one() {
+	local name=$1 type=$2 dir=$3 key=$4 dest=$WORK/$name UPSTREAM= PROBE= SUFFIX=1 FROM= ver base
+	# free space for the chroot copy, the sources and the package (GB): 3,
+	# or DIR/.minfree; a full root file system would hurt the whole phone
+	local need avail
+	need=$(cat "$dir/.minfree" 2>/dev/null || echo 3)
+	avail=$(df -BG --output=avail "$CHROOT" | tail -1 | tr -dc 0-9)
+	if (( avail < need )); then
+		log "$name: skipped, $avail GB free, needs $need GB"
+		return 1
+	fi
+	if [[ $type == overlay ]]; then
+		# shellcheck source=/dev/null
+		source "$dir/upstream"
+		ver=${key%% *}
+		if [[ $FROM == arch ]]; then
+			base=${UPSTREAM:-$name}
+		else
+			base=$(upstream_base "${PROBE:-${UPSTREAM:-$name}}" "$ver")
+		fi
+		prepare_overlay "$name" "$dir" "$ver" "${UPSTREAM:-$base}"
+	else
+		rm -rf "$dest"
+		mkdir -p "$dest"
+		cp -a "$dir"/. "$dest"/
+		chown -R "$BUILDER:" "$dest"
+	fi
+	# track: the upstream version the PKGBUILD builds against, written into
+	# the build copy (the chroot build sees none of our environment)
+	if [[ $type == track ]]; then
+		sed -i "1i CZ_UPVER=${key%% *}" "$dest/PKGBUILD"
+	fi
+	# follow: the sources pinned to the current release (in the copy only)
+	if [[ $type == follow ]] &&
+	   ! (cd "$dest" && as_builder ./update-sources.sh) > "$WORK/$name.sources.log" 2>&1; then
+		log "$name: update-sources.sh FAILED, see $WORK/$name.sources.log"
+		return 1
+	fi
+	log "building $name ($key)"
+	local rc=0
+	# signed git tags / tarballs: the PKGBUILD's keys into the builder's
+	# keyring (makechrootpkg verifies the sources outside the chroot, as him)
+	local keys=()
+	mapfile -t keys < <(cd "$dest" && as_builder makepkg --printsrcinfo |
+		awk -F' = ' '$1 == "\tvalidpgpkeys" { print $2 }')
+	# Arch packaging repos ship them as keys/pgp/<fingerprint>.asc
+	if compgen -G "$dest/keys/pgp/*.asc" >/dev/null; then
+		as_builder gpg --batch --quiet --import "$dest"/keys/pgp/*.asc \
+			> "$WORK/$name.keys.log" 2>&1 || true
+	fi
+	if (( ${#keys[@]} )) && ! as_builder gpg --batch --list-keys "${keys[@]}" >/dev/null 2>&1; then
+		as_builder gpg --batch --quiet --recv-keys "${keys[@]}" \
+			>> "$WORK/$name.keys.log" 2>&1 ||
+			log "$name: could not fetch all of ${keys[*]}"
+	fi
+	# a clean copy of the chroot; makepkg -s in there installs the
+	# dependencies (from [cezanne] too); SUDO_USER: makechrootpkg's user
+	(cd "$dest" && SUDO_USER=$BUILDER makechrootpkg -c -r "$CHROOT" -U "$BUILDER" -D "$REPO") \
+		< /dev/null > "$WORK/$name.log" 2>&1 || rc=$?
+	if (( rc )); then
+		log "$name: build FAILED, see $WORK/$name.log"
+		tail -20 "$WORK/$name.log"
+		return 1
+	fi
+	# the copy's build directory (sources, pkg/): gigabytes for some packages
+	rm -rf "$CHROOT/$BUILDER/build"
+	# a version already in the repo is never replaced (whatever the
+	# compression): pacman caches by file name, and a different file under
+	# the same name fails its checksum
+	local all=("$dest"/*.pkg.tar.*) pkgs=() p
+	for p in "${all[@]}"; do
+		if compgen -G "$REPO/$(basename "${p%.pkg.tar.*}").pkg.tar.*" >/dev/null; then
+			log "WARNING: kept the repo's ${p##*/}: bump pkgrel to publish this build"
+		else
+			pkgs+=("$p")
+		fi
+	done
+	echo "$key" > "$STATE/$name"
+	# the next build starts from a fresh copy anyway (logs stay in $WORK)
+	if (( ! ${#pkgs[@]} )); then
+		rm -rf "$dest"
+		return 0
+	fi
+	cp "${pkgs[@]}" "$REPO"/
+	(cd "$REPO" && repo-add -q -R "$DB" "${pkgs[@]##*/}")
+	# the next builds of this run see it (a sync db is the repo's db file)
+	cp -L "$REPO/cezanne.db" "$CHROOT/root/var/lib/pacman/sync/cezanne.db"
+	rm -rf "$dest"
+	log "$name: added ${pkgs[*]##*/}"
+}
+
+sync_dbs
+failed=() todo=()
+declare -A t_type t_dir t_key
+while read -r name type dir; do
+	[[ -z $name || $name == \#* ]] && continue
+	if (( $# )); then
+		[[ " $* " == *" $name "* ]] || continue
+	fi
+	dir=$TOP/$dir
+	key=$(current_key "$name" "$type" "$dir")
+	built=$(cat "$STATE/$name" 2>/dev/null || echo none)
+	if [[ -n $status ]]; then
+		printf '%-24s %-8s %s\n' "$name" "$([[ $key == "$built" ]] && echo ok || echo STALE)" "$key"
+		continue
+	fi
+	[[ $key == missing ]] && { log "$name: no upstream version (sync dbs / archlinux.org)"; failed+=("$name"); continue; }
+	[[ -z $force && $key == "$built" ]] && continue
+	if [[ -n $dry ]]; then
+		log "would build $name ($built -> $key)"
+		continue
+	fi
+	todo+=("$name")
+	t_type[$name]=$type t_dir[$name]=$dir t_key[$name]=$key
+done < "$TOP/packaging/packages.list"
+
+if (( ${#todo[@]} )); then
+	chroot_ready > "$WORK/chroot.log" 2>&1 || {
+		log "build chroot FAILED, see $WORK/chroot.log"
+		tail -20 "$WORK/chroot.log"
+		exit 1
+	}
+	for name in "${todo[@]}"; do
+		build_one "$name" "${t_type[$name]}" "${t_dir[$name]}" "${t_key[$name]}" || failed+=("$name")
+	done
+fi
+
+if (( ${#failed[@]} )); then
+	log "failed: ${failed[*]}"
+	exit 1
+fi

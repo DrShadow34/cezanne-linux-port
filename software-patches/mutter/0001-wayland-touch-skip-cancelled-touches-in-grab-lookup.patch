@@ -1,0 +1,28 @@
+From: arch-port <26345330+DrShadow34@users.noreply.github.com>
+Subject: [PATCH] wayland/touch: Skip cancelled touches when looking up grab sequences
+
+meta_wayland_touch_cancel() clears the focus surface of every live touch
+but keeps the touch info until the sequence ends, serial included. A
+client asking for a move / resize (xdg_toplevel.move) with the serial of
+such a touch - Firefox does when a touch drag on its tab bar ends up in a
+compositor grab - made touch_can_grab_surface() dereference the NULL
+focus surface: gnome-shell segfaulted
+(meta_wayland_seat_get_grab_info -> meta_wayland_touch_find_grab_sequence).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013fD3if93WntovhmD8fGa8C
+---
+--- a/src/wayland/meta-wayland-touch.c
++++ b/src/wayland/meta-wayland-touch.c
+@@ -690,7 +690,11 @@
+   while (g_hash_table_iter_next (&iter, (gpointer*) &sequence,
+                                  (gpointer*) &touch_info))
+     {
++      /* A cancelled touch (meta_wayland_touch_cancel(), e.g. a compositor
++       * grab) keeps its serial until it ends, but has no focus surface.
++       */
+       if (touch_info->slot_serial == serial &&
++          touch_info->focus_surface &&
+           touch_can_grab_surface (touch_info, surface))
+         {
+           if (sprite_out)

@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+# full-screen solid colour (default white) for panel calibration
+import sys, gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, Gdk
+color = sys.argv[1] if len(sys.argv) > 1 else "#ffffff"
+def act(app):
+    w = Gtk.ApplicationWindow(application=app)
+    css = Gtk.CssProvider()
+    css.load_from_string(f"window {{ background: {color}; }}")
+    Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, 800)
+    w.fullscreen(); w.present()
+app = Gtk.Application(application_id="org.cezanne.White")
+app.connect("activate", act); app.run()

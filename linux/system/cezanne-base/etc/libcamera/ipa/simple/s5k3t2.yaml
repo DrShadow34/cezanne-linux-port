@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: CC0-1.0
+# Redmi K30 Ultra front camera (S5K3T2) for libcamera's software ISP.
+#
+# White locus anchored at the raw R/G, B/G of a wall next to a MIUI photo of
+# it (backup/camera-ref), other points following the main camera's shape.
+# The scene had too few colours for a matrix of its own: the main camera's
+# fitted matrix with a milder saturation (x1.3).  The lens shades strongly
+# and the software ISP has no shading correction: corners stay darker.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+      locus:
+        - { ct: 2800, r: 1.13, b: 0.305 }
+        - { ct: 4000, r: 0.85, b: 0.433 }
+        - { ct: 5500, r: 0.65, b: 0.57 }
+        - { ct: 7500, r: 0.537, b: 0.678 }
+  - Ccm:
+      ccms:
+        - ct: 5500
+          ccm: [  1.696, -0.575, -0.121,
+                 -0.187,  1.163,  0.024,
+                 -0.514,  0.229,  1.285 ]
+  - Adjust:
+      gamma: 3.0
+      contrast: 1.1
+  - Agc:
+...

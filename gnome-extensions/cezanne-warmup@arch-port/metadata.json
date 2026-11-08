@@ -1,0 +1,7 @@
+{
+  "uuid": "cezanne-warmup@arch-port",
+  "name": "Cezanne Warm-up",
+  "description": "Smooth first menus after a shell start: styles the quick settings and calendar menus in idle time ahead of their first open.",
+  "shell-version": ["51"],
+  "session-modes": ["user", "unlock-dialog"]
+}

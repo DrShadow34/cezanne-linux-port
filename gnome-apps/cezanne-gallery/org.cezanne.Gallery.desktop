@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Gallery
+Comment=Photos and videos on this phone
+Exec=cezanne-gallery
+Icon=org.cezanne.Gallery
+Terminal=false
+Type=Application
+Categories=Graphics;Photography;
+Keywords=photo;picture;image;video;album;camera;screenshot;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

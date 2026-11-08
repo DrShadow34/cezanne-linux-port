@@ -1,0 +1,19 @@
+# cezanne-top: GPU / media engine monitor of the cezanne port (this
+# directory is the source). Replaces nvtop in Mission Center's helper.
+pkgname=cezanne-top
+pkgver=0.1
+pkgrel=1
+pkgdesc="GPU render, GPU memory and hardware decoder / encoder usage monitor for SoCs (panfrost fdinfo, vcodec sysfs)"
+arch=(aarch64 x86_64)
+license=(MIT)
+depends=(glibc)
+source=(Makefile ctop.h ctop.c cezanne-top.c)
+sha256sums=(SKIP SKIP SKIP SKIP)
+
+build() {
+  make -C "$srcdir"
+}
+
+package() {
+  make -C "$srcdir" DESTDIR="$pkgdir" install
+}

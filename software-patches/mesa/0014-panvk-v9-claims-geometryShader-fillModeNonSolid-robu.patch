@@ -1,0 +1,111 @@
+From 4a6820f08bd4685571de95c5e9a4d53b5cf050bd Mon Sep 17 00:00:00 2001
+From: arch-port <26345330+DrShadow34@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:34:38 +0100
+Subject: [PATCH] panvk: v9 claims geometryShader, fillModeNonSolid,
+ robustBufferAccess2
+
+All three are implemented on v9 now (0011-0013): drop PANVK_DEBUG=dxvk,
+which claimed them for testing. Geometry shader limits: 32 invocations,
+128 input / output components (inputs come from memory, outputs are the
+varyings of the rasterization vertex shader; D3D11 has 32 vec4 each
+way), 256 vertices, 1024 total components.
+
+Without the debug flag: CTS geometry.* 188 pass / 11 skip, robustness2
+(comp / frag, 1/25) 571 pass, draw / clipping / pipeline samples fail
+only in known places (mixed clip + cull, LINE fill culling, adjacency
+with indirect draws / restart, viewport index).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013fD3if93WntovhmD8fGa8C
+---
+ src/panfrost/vulkan/panvk_instance.c          |  1 -
+ src/panfrost/vulkan/panvk_instance.h          |  1 -
+ .../vulkan/panvk_vX_physical_device.c         | 27 ++++++++++---------
+ 3 files changed, 14 insertions(+), 15 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index beefc97..102dc93 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -53,7 +53,6 @@ static const struct debug_control panvk_debug_options[] = {
+    {"cached_before_coherent", PANVK_DEBUG_CACHED_BEFORE_COHERENT},
+    {"no_extended_va_range", PANVK_DEBUG_NO_EXTENDED_VA_RANGE},
+    {"hsr_prepass", PANVK_DEBUG_HSR_PREPASS},
+-   {"dxvk", PANVK_DEBUG_DXVK},
+    {NULL, 0},
+ };
+ 
+diff --git a/src/panfrost/vulkan/panvk_instance.h b/src/panfrost/vulkan/panvk_instance.h
+index 1029d78..12a9386 100644
+--- a/src/panfrost/vulkan/panvk_instance.h
++++ b/src/panfrost/vulkan/panvk_instance.h
+@@ -34,7 +34,6 @@ enum panvk_debug_flags {
+    PANVK_DEBUG_CACHED_BEFORE_COHERENT = 1 << 16,
+    PANVK_DEBUG_NO_EXTENDED_VA_RANGE = 1 << 17,
+    PANVK_DEBUG_HSR_PREPASS = 1 << 18,
+-   PANVK_DEBUG_DXVK = 1 << 19,
+ };
+ 
+ extern uint64_t panvk_debug;
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 3dceedf..d9581fd 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -304,10 +304,8 @@ panvk_per_arch(get_physical_device_features)(
+       .fullDrawIndexUint32 = true,
+       .imageCubeArray = true,
+       .independentBlend = true,
+-      /* PANVK_DEBUG=dxvk: claimed so DXVK (which requires them) creates a
+-       * device, for testing what else it needs. Not implemented: geometry
+-       * shader pipelines fail to compile, LINE fill draws solid. */
+-      .geometryShader = PANVK_DEBUG(DXVK),
++      /* v9: emulated, src/poly (panvk_vX_cmd_draw_v9.c) */
++      .geometryShader = PAN_ARCH == 9,
+       .tessellationShader = false,
+       .sampleRateShading = true,
+       .dualSrcBlend = true,
+@@ -316,7 +314,8 @@ panvk_per_arch(get_physical_device_features)(
+       .drawIndirectFirstInstance = true,
+       .depthClamp = true,
+       .depthBiasClamp = true,
+-      .fillModeNonSolid = PANVK_DEBUG(DXVK),
++      /* v9: POINT as a point list, LINE through an index rewrite job */
++      .fillModeNonSolid = PAN_ARCH == 9,
+       .depthBounds = false,
+       .wideLines = true,
+       .largePoints = true,
+@@ -619,7 +618,9 @@ panvk_per_arch(get_physical_device_features)(
+       .pipelineExecutableInfo = true,
+ 
+       /* VK_KHR_robustness2 */
+-      .robustBufferAccess2 = PAN_ARCH >= 11 || PANVK_DEBUG(DXVK),
++      /* v9: hardware-checked buffer loads, software SSBO stores and texel
++       * buffer bounds */
++      .robustBufferAccess2 = PAN_ARCH >= 11 || PAN_ARCH == 9,
+       .robustImageAccess2 = false,
+       .nullDescriptor = PAN_ARCH >= 9,
+ 
+@@ -919,13 +920,13 @@ panvk_per_arch(get_physical_device_properties)(
+       .maxTessellationControlTotalOutputComponents = 0,
+       .maxTessellationEvaluationInputComponents = 0,
+       .maxTessellationEvaluationOutputComponents = 0,
+-      /* Geometry shaders not supported (PANVK_DEBUG=dxvk: the minimums,
+-       * pipelines with one fail to compile). */
+-      .maxGeometryShaderInvocations = PANVK_DEBUG(DXVK) ? 32 : 0,
+-      .maxGeometryInputComponents = PANVK_DEBUG(DXVK) ? 64 : 0,
+-      .maxGeometryOutputComponents = PANVK_DEBUG(DXVK) ? 64 : 0,
+-      .maxGeometryOutputVertices = PANVK_DEBUG(DXVK) ? 256 : 0,
+-      .maxGeometryTotalOutputComponents = PANVK_DEBUG(DXVK) ? 1024 : 0,
++      /* v9 geometry shaders (src/poly): inputs from memory, outputs as
++       * the varyings of a vertex shader (D3D11: 32 vec4 each way) */
++      .maxGeometryShaderInvocations = PAN_ARCH == 9 ? 32 : 0,
++      .maxGeometryInputComponents = PAN_ARCH == 9 ? 128 : 0,
++      .maxGeometryOutputComponents = PAN_ARCH == 9 ? 128 : 0,
++      .maxGeometryOutputVertices = PAN_ARCH == 9 ? 256 : 0,
++      .maxGeometryTotalOutputComponents = PAN_ARCH == 9 ? 1024 : 0,
+       /* 32 vec4 varyings. */
+       .maxFragmentInputComponents = 128,
+       /* 8 render targets. */
+-- 
+2.56.0
+

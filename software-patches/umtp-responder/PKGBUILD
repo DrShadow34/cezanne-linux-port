@@ -1,0 +1,26 @@
+# uMTP-Responder: lightweight MTP responder on FunctionFS. cezanne-usbd
+# (apps/cezanne-usb) runs it for the "Data storage" USB mode with its own
+# config (the home folder as one storage, files owned by the user).
+pkgname=umtp-responder
+pkgver=1.8.1
+pkgrel=1
+pkgdesc="Lightweight USB Media Transfer Protocol (MTP) responder (FunctionFS)"
+arch=(aarch64)
+url="https://github.com/viveris/uMTP-Responder"
+license=(GPL-3.0-or-later)
+depends=(glibc systemd-libs)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/viveris/uMTP-Responder/archive/refs/tags/umtprd-$pkgver.tar.gz")
+sha256sums=('6f57f61a1993059bcdd5f598d8c2a3888991497ef42ba3594947f00bd7746b1f')
+
+build() {
+  cd "uMTP-Responder-umtprd-$pkgver"
+  # the Makefile strips with -s: keep makepkg's own stripping
+  make SYSTEMD=1 LDFLAGS="$LDFLAGS -lpthread -lrt -lsystemd"
+}
+
+package() {
+  cd "uMTP-Responder-umtprd-$pkgver"
+  install -Dm755 umtprd "$pkgdir/usr/bin/umtprd"
+  install -Dm644 conf/umtprd.conf "$pkgdir/usr/share/doc/$pkgname/umtprd.conf.example"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

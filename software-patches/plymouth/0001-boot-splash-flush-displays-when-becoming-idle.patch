@@ -1,0 +1,24 @@
+From: cezanne port
+Subject: [PATCH] boot-splash: flush the displays when the splash becomes idle
+
+The displays stay paused while the splash is shown and on_new_frame
+flushes them every frame tick. Becoming idle for a deactivate, two-step
+without an end animation stops the throbber (drawn away, not flushed),
+the idle handler drops DRM master 10 ms later: the last throbber frame
+stays on screen (GDM deactivates plymouth at its start).
+---
+diff --git a/src/libply-splash-core/ply-boot-splash.c b/src/libply-splash-core/ply-boot-splash.c
+--- a/src/libply-splash-core/ply-boot-splash.c
++++ b/src/libply-splash-core/ply-boot-splash.c
+@@ -775,6 +775,11 @@
+ on_idle (ply_boot_splash_t *splash)
+ {
+         ply_trace ("splash now idle");
++        /* The plugin may have drawn its final state (e.g. erased a stopped
++         * throbber) since the last frame tick, and the idle handler can
++         * deactivate the renderer before the next tick would flush it.
++         */
++        ply_boot_splash_flush_displays (splash);
+         ply_event_loop_watch_for_timeout (splash->loop, 0.01,
+                                           (ply_event_loop_timeout_handler_t)
+                                           splash->idle_handler,

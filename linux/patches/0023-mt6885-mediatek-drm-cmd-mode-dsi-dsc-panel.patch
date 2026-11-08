@@ -1,0 +1,1268 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_crtc.c b/drivers/gpu/drm/mediatek/mtk_crtc.c
+index 97e3ff412..8e3999102 100644
+--- a/drivers/gpu/drm/mediatek/mtk_crtc.c
++++ b/drivers/gpu/drm/mediatek/mtk_crtc.c
+@@ -22,6 +22,7 @@
+ 
+ #include "mtk_crtc.h"
+ #include "mtk_ddp_comp.h"
++#include "mtk_disp_drv.h"
+ #include "mtk_drm_drv.h"
+ #include "mtk_plane.h"
+ 
+@@ -60,6 +61,11 @@ struct mtk_crtc {
+ 
+ 	struct device			*mmsys_dev;
+ 	struct device			*dma_dev;
++	/*
++	 * DSI host of a command-mode panel: no free-running frames, every
++	 * update is sent as one frame (single-shot mutex + DSI trigger).
++	 */
++	struct device			*cmd_dsi;
+ 	struct mtk_mutex		*mutex;
+ 	unsigned int			ddp_comp_nr;
+ 	unsigned int			num_conn_routes;
+@@ -338,6 +344,12 @@ static void ddp_cmdq_cb(struct mbox_client *cl, void *mssg)
+ }
+ #endif
+ 
++/* panel TE of a command-mode panel: its refresh, our vblank */
++static void mtk_crtc_te_irq(void *data)
++{
++	drm_crtc_handle_vblank(data);
++}
++
+ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ {
+ 	struct drm_crtc *crtc = &mtk_crtc->base;
+@@ -389,6 +401,9 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 		goto err_mutex_unprepare;
+ 	}
+ 
++	/* a bootloader-started pipeline may have left more modules in it */
++	mtk_mutex_clear_mods(mtk_crtc->mutex);
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr - 1; i++) {
+ 		if (!mtk_ddp_comp_connect(mtk_crtc->ddp_comp[i], mtk_crtc->mmsys_dev,
+ 					  mtk_crtc->ddp_comp[i + 1]->id))
+@@ -401,12 +416,30 @@ static int mtk_crtc_ddp_hw_init(struct mtk_crtc *mtk_crtc)
+ 	}
+ 	if (!mtk_ddp_comp_add(mtk_crtc->ddp_comp[i], mtk_crtc->mutex))
+ 		mtk_mutex_add_comp(mtk_crtc->mutex, mtk_crtc->ddp_comp[i]->id);
+-	mtk_mutex_enable(mtk_crtc->mutex);
++
++	mtk_crtc->cmd_dsi = NULL;
++	if (mtk_ddp_comp_get_type(mtk_crtc->ddp_comp[i]->id) == MTK_DSI &&
++	    mtk_dsi_is_cmd_mode(mtk_crtc->ddp_comp[i]->dev))
++		mtk_crtc->cmd_dsi = mtk_crtc->ddp_comp[i]->dev;
++
++	/* command mode: the first frame goes out at the first plane update */
++	if (mtk_crtc->cmd_dsi) {
++		mtk_mutex_write_sof(mtk_crtc->mutex, MUTEX_SOF_IDX_SINGLE_MODE);
++		mtk_dsi_cmd_set_te_cb(mtk_crtc->cmd_dsi, mtk_crtc_te_irq, crtc);
++	} else
++		mtk_mutex_enable(mtk_crtc->mutex);
+ 
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 		struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[i];
+ 
+-		if (i == 1)
++		/*
++		 * Only a second OVL takes the first one's output as background;
++		 * the first may still have it on from a bootloader that chained
++		 * another OVL in front (it then waits for that one forever).
++		 */
++		if (i == 0)
++			mtk_ddp_comp_bgclr_in_off(comp);
++		else if (i == 1)
+ 			mtk_ddp_comp_bgclr_in_on(comp);
+ 
+ 		mtk_ddp_comp_config(comp, width, height, vrefresh, bpc, NULL);
+@@ -446,6 +479,9 @@ static void mtk_crtc_ddp_hw_fini(struct mtk_crtc *mtk_crtc)
+ 	unsigned long flags;
+ 	int i;
+ 
++	if (mtk_crtc->cmd_dsi)
++		mtk_dsi_cmd_set_te_cb(mtk_crtc->cmd_dsi, NULL, NULL);
++
+ 	for (i = 0; i < mtk_crtc->ddp_comp_nr; i++) {
+ 		mtk_ddp_comp_stop(mtk_crtc->ddp_comp[i]);
+ 		if (i == 1)
+@@ -595,13 +631,18 @@ static void mtk_crtc_update_config(struct mtk_crtc *mtk_crtc, bool needs_vblank)
+ 	if (pending_async_planes)
+ 		mtk_crtc->pending_async_planes = true;
+ 
+-	if (priv->data->shadow_register) {
++	if (mtk_crtc->cmd_dsi) {
++		/* reprogram between frames, then send one */
++		mtk_dsi_cmd_frame_begin(mtk_crtc->cmd_dsi);
++		mtk_crtc_ddp_config(crtc, NULL);
++		mtk_dsi_cmd_frame_end(mtk_crtc->cmd_dsi, mtk_crtc->mutex);
++	} else if (priv->data->shadow_register) {
+ 		mtk_mutex_acquire(mtk_crtc->mutex);
+ 		mtk_crtc_ddp_config(crtc, NULL);
+ 		mtk_mutex_release(mtk_crtc->mutex);
+ 	}
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+-	if (mtk_crtc->cmdq_client.chan) {
++	if (mtk_crtc->cmdq_client.chan && !mtk_crtc->cmd_dsi) {
+ 		mbox_flush(mtk_crtc->cmdq_client.chan, 2000);
+ 		cmdq_handle->cmd_buf_size = 0;
+ 		cmdq_pkt_clear_event(cmdq_handle, mtk_crtc->cmdq_event);
+@@ -648,9 +689,28 @@ static void mtk_crtc_ddp_irq(void *data)
+ 	struct drm_crtc *crtc = data;
+ 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
+ 	struct mtk_drm_private *priv = crtc->dev->dev_private;
+-
+ #if IS_REACHABLE(CONFIG_MTK_CMDQ)
+ 	struct drm_device *dev = mtk_crtc->base.dev;
++#endif
++
++	/*
++	 * Command mode: frame done, the update was applied before the frame.
++	 * Vblanks come from the panel TE (mtk_crtc_te_irq), this only
++	 * completes the flip.
++	 */
++	if (mtk_crtc->cmd_dsi) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&mtk_crtc->config_lock, flags);
++		if (!mtk_crtc->config_updating && mtk_crtc->pending_needs_vblank) {
++			mtk_crtc_finish_page_flip(mtk_crtc);
++			mtk_crtc->pending_needs_vblank = false;
++		}
++		spin_unlock_irqrestore(&mtk_crtc->config_lock, flags);
++		return;
++	}
++
++#if IS_REACHABLE(CONFIG_MTK_CMDQ)
+ 	if (!priv->data->shadow_register && !mtk_crtc->cmdq_client.chan)
+ 		mtk_crtc_ddp_config(crtc, NULL);
+ 	else if (mtk_crtc->cmdq_vblank_cnt > 0 && --mtk_crtc->cmdq_vblank_cnt == 0)
+diff --git a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+index 9672ea1f9..8a2e57e1c 100644
+--- a/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
++++ b/drivers/gpu/drm/mediatek/mtk_ddp_comp.c
+@@ -12,6 +12,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/soc/mediatek/mtk-cmdq.h>
++#include <drm/display/drm_dsc.h>
+ #include <drm/drm_print.h>
+ 
+ #include "mtk_crtc.h"
+@@ -45,6 +46,28 @@
+ #define DSC_DUAL_INOUT				BIT(2)
+ #define DSC_BYPASS				BIT(4)
+ #define DSC_UFOE_SEL				BIT(16)
++#define DSC_EMPTY_FLAG_SEL			GENMASK(15, 14)
++#define DSC_EMPTY_FLAG_ALWAYS_HIGH		BIT(14)
++#define DISP_REG_DSC_PIC_W			0x0018
++#define DISP_REG_DSC_PIC_H			0x001c
++#define DISP_REG_DSC_SLICE_W			0x0020
++#define DISP_REG_DSC_SLICE_H			0x0024
++#define DISP_REG_DSC_CHUNK_SIZE			0x0028
++#define DISP_REG_DSC_BUF_SIZE			0x002c
++#define DISP_REG_DSC_MODE			0x0030
++#define DSC_SLICE_MODE				BIT(0)
++#define DSC_INIT_DELAY_HEIGHT(n)		((n) << 8)
++#define DISP_REG_DSC_CFG			0x0034
++#define DISP_REG_DSC_PAD			0x0038
++#define DISP_REG_DSC_DBG_CON			0x0060
++#define DSC_CKSM_CAL_EN				BIT(9)
++#define DISP_REG_DSC_OBUF			0x0070
++#define DISP_REG_DSC_PPS(n)			(0x0080 + 4 * (n))
++#define DISP_REG_DSC_SHADOW			0x0200
++#define DSC_SHADOW_MASK				(BIT(0) | BIT(1) | GENMASK(6, 5))
++#define DSC_FORCE_COMMIT			BIT(0)
++#define DSC_BYPASS_SHADOW			BIT(1)
++#define DSC_SHADOW_VER_1_1			BIT(5)
+ 
+ #define DISP_REG_OD_EN				0x0000
+ #define DISP_REG_OD_CFG				0x0020
+@@ -187,11 +210,79 @@ static void mtk_dither_set(struct device *dev, unsigned int bpc,
+ 			      DISP_DITHERING, cmdq_pkt);
+ }
+ 
++/*
++ * Real compression for a panel that asked for DSC (mipi_dsi_device.dsc, via
++ * the DSI host).  Register programming from the MediaTek BSP mtk_dsc_config
++ * (MT6885, DSC 1.1, single pipe); PPS6-19 are the BSP's fixed rate-control
++ * tables (the DSC 1.1 defaults for 8 bpc / 8 bpp).
++ */
++static void mtk_dsc_encoder_config(struct mtk_ddp_comp_dev *priv,
++				   const struct drm_dsc_config *dsc,
++				   unsigned int w, unsigned int h)
++{
++	static const u32 rc_tables[14] = {
++		0x20000c03, 0x330b0b06, 0x382a1c0e, 0x69625446, 0x7b797770,
++		0x00007e7d, 0x00800880, 0xf8c100a1, 0xe8e3f0e3, 0xe103e0e3,
++		0xd943e123, 0xd185d965, 0xd1a7d1a5, 0x0000d1ed,
++	};
++	void __iomem *regs = priv->regs;
++	unsigned int sw = dsc->slice_width, sh = dsc->slice_height;
++	unsigned int pic_group_width = (w + 2) / 3;
++	unsigned int pic_height_ext = DIV_ROUND_UP(h, sh);
++	unsigned int slice_group_width = (sw + 2) / 3;
++	unsigned int chunk = sw * dsc->bits_per_pixel / 8 / 16;
++	unsigned int pad = (chunk + 2) / 3 * 3 - chunk;
++	int i;
++
++	writel(DSC_UFOE_SEL | DSC_EMPTY_FLAG_ALWAYS_HIGH, regs + DISP_REG_DSC_CON);
++	writel((pic_group_width - 1) << 16 | w, regs + DISP_REG_DSC_PIC_W);
++	writel((pic_height_ext * sh - 1) << 16 | (h - 1), regs + DISP_REG_DSC_PIC_H);
++	writel((slice_group_width - 1) << 16 | sw, regs + DISP_REG_DSC_SLICE_W);
++	writel((sw % 3) << 30 | (pic_height_ext - 1) << 16 | (sh - 1),
++	       regs + DISP_REG_DSC_SLICE_H);
++	writel(chunk, regs + DISP_REG_DSC_CHUNK_SIZE);
++	writel(pad, regs + DISP_REG_DSC_PAD);
++	writel(chunk * sh, regs + DISP_REG_DSC_BUF_SIZE);
++	writel((readl(regs + DISP_REG_DSC_MODE) & ~0xffff) |
++	       (dsc->slice_count > 1 ? DSC_SLICE_MODE : 0) |
++	       DSC_INIT_DELAY_HEIGHT(4), regs + DISP_REG_DSC_MODE);
++	writel(0x22, regs + DISP_REG_DSC_CFG);		/* BSP dsc_cfg 34 */
++	writel(readl(regs + DISP_REG_DSC_DBG_CON) | DSC_CKSM_CAL_EN,
++	       regs + DISP_REG_DSC_DBG_CON);
++	/* registers take effect at once: no command queue to commit them */
++	writel((readl(regs + DISP_REG_DSC_SHADOW) & ~DSC_SHADOW_MASK) |
++	       DSC_BYPASS_SHADOW | DSC_FORCE_COMMIT | DSC_SHADOW_VER_1_1,
++	       regs + DISP_REG_DSC_SHADOW);
++
++	writel(dsc->line_buf_depth | dsc->bits_per_component << 4 |
++	       dsc->bits_per_pixel << 8 | dsc->convert_rgb << 18 |
++	       dsc->block_pred_enable << 19, regs + DISP_REG_DSC_PPS(0));
++	writel(dsc->initial_xmit_delay | dsc->initial_dec_delay << 16,
++	       regs + DISP_REG_DSC_PPS(1));
++	writel(dsc->initial_scale_value | dsc->scale_increment_interval << 16,
++	       regs + DISP_REG_DSC_PPS(2));
++	writel(dsc->scale_decrement_interval | dsc->first_line_bpg_offset << 16,
++	       regs + DISP_REG_DSC_PPS(3));
++	writel(dsc->nfl_bpg_offset | dsc->slice_bpg_offset << 16,
++	       regs + DISP_REG_DSC_PPS(4));
++	writel(dsc->initial_offset | dsc->final_offset << 16,
++	       regs + DISP_REG_DSC_PPS(5));
++	for (i = 0; i < ARRAY_SIZE(rc_tables); i++)
++		writel(rc_tables[i], regs + DISP_REG_DSC_PPS(6 + i));
++	writel(0x800002c2, regs + DISP_REG_DSC_OBUF);	/* BSP: FHD+ out buffer */
++}
++
+ static void mtk_dsc_config(struct device *dev, unsigned int w,
+ 			   unsigned int h, unsigned int vrefresh,
+ 			   unsigned int bpc, struct cmdq_pkt *cmdq_pkt)
+ {
+ 	struct mtk_ddp_comp_dev *priv = dev_get_drvdata(dev);
++	const struct drm_dsc_config *dsc = mtk_dsi_get_dsc();
++
++	if (dsc) {
++		mtk_dsc_encoder_config(priv, dsc, w, h);
++		return;
++	}
+ 
+ 	/* dsc bypass mode */
+ 	mtk_ddp_write_mask(cmdq_pkt, DSC_BYPASS, &priv->cmdq_reg, priv->regs,
+@@ -555,6 +646,14 @@ static bool mtk_ddp_path_available(const unsigned int *path,
+ 	return true;
+ }
+ 
++enum mtk_ddp_comp_type mtk_ddp_comp_get_type(unsigned int comp_id)
++{
++	if (comp_id >= ARRAY_SIZE(mtk_ddp_matches))
++		return MTK_DDP_COMP_TYPE_MAX;
++
++	return mtk_ddp_matches[comp_id].type;
++}
++
+ int mtk_ddp_comp_get_id(struct device_node *node,
+ 			enum mtk_ddp_comp_type comp_type)
+ {
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_drv.h b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+index 679d413bf..341c69c51 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_drv.h
++++ b/drivers/gpu/drm/mediatek/mtk_disp_drv.h
+@@ -176,4 +176,14 @@ int mtk_padding_clk_enable(struct device *dev);
+ void mtk_padding_clk_disable(struct device *dev);
+ void mtk_padding_start(struct device *dev);
+ void mtk_padding_stop(struct device *dev);
++/* panel DSC parameters seen by the DSI host, for the DSC component */
++struct drm_dsc_config;
++const struct drm_dsc_config *mtk_dsi_get_dsc(void);
++struct mtk_mutex;
++bool mtk_dsi_is_cmd_mode(struct device *dev);
++void mtk_dsi_cmd_set_te_cb(struct device *dev, void (*cb)(void *data),
++			   void *data);
++void mtk_dsi_cmd_frame_begin(struct device *dev);
++void mtk_dsi_cmd_frame_end(struct device *dev, struct mtk_mutex *mutex);
++
+ #endif
+diff --git a/drivers/gpu/drm/mediatek/mtk_disp_rdma.c b/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
+index c9d41d75e..3fe31dfba 100644
+--- a/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
++++ b/drivers/gpu/drm/mediatek/mtk_disp_rdma.c
+@@ -45,6 +45,7 @@
+ #define MEM_MODE_INPUT_SWAP				BIT(8)
+ #define DISP_RDMA_MEM_SRC_PITCH			0x002c
+ #define DISP_RDMA_MEM_GMC_SETTING_0		0x0030
++#define DISP_REG_RDMA_MEM_GMC_SETTING_2	0x003c
+ #define DISP_REG_RDMA_FIFO_CON			0x0040
+ #define RDMA_FIFO_UNDERFLOW_EN				BIT(31)
+ #define RDMA_FIFO_PSEUDO_SIZE(bytes)			(((bytes) / 16) << 16)
+@@ -86,6 +87,7 @@ struct mtk_disp_rdma {
+ 	void				(*vblank_cb)(void *data);
+ 	void				*vblank_cb_data;
+ 	u32				fifo_size;
++	bool				cmd_mode_fifo;
+ };
+ 
+ static irqreturn_t mtk_disp_rdma_irq_handler(int irq, void *dev_id)
+@@ -206,6 +208,20 @@ void mtk_rdma_config(struct device *dev, unsigned int width,
+ 	 * output threshold to 70% of max fifo size to make sure the
+ 	 * threhold will not overflow
+ 	 */
++	/*
++	 * A command-mode sink (DSI with a GRAM panel) is not timed, so a
++	 * fetch shortfall should stall the pipe, not emit filler pixels:
++	 * BSP golden setting, no underflow output, no output threshold and a
++	 * 256-entry request threshold.
++	 */
++	if (rdma->cmd_mode_fifo) {
++		mtk_ddp_write(cmdq_pkt, RDMA_FIFO_PSEUDO_SIZE(rdma_fifo_size),
++			      &rdma->cmdq_reg, rdma->regs, DISP_REG_RDMA_FIFO_CON);
++		mtk_ddp_write(cmdq_pkt, 256, &rdma->cmdq_reg, rdma->regs,
++			      DISP_REG_RDMA_MEM_GMC_SETTING_2);
++		return;
++	}
++
+ 	threshold = rdma_fifo_size * 7 / 10;
+ 	reg = RDMA_FIFO_UNDERFLOW_EN |
+ 	      RDMA_FIFO_PSEUDO_SIZE(rdma_fifo_size) |
+@@ -345,6 +361,9 @@ static int mtk_disp_rdma_probe(struct platform_device *pdev)
+ 	if (ret && (ret != -EINVAL))
+ 		return dev_err_probe(dev, ret, "Failed to get rdma fifo size\n");
+ 
++	priv->cmd_mode_fifo = of_property_read_bool(dev->of_node,
++						    "mediatek,rdma-cmd-mode-fifo");
++
+ 	/* Disable and clear pending interrupts */
+ 	writel(0x0, priv->regs + DISP_REG_RDMA_INT_ENABLE);
+ 	writel(0x0, priv->regs + DISP_REG_RDMA_INT_STATUS);
+diff --git a/drivers/gpu/drm/mediatek/mtk_drm_drv.c b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+index dc8e3e917..3f0566aa5 100644
+--- a/drivers/gpu/drm/mediatek/mtk_drm_drv.c
++++ b/drivers/gpu/drm/mediatek/mtk_drm_drv.c
+@@ -193,6 +193,23 @@ static const struct mtk_drm_route mt8188_mtk_ddp_main_routes[] = {
+ 	{0, DDP_COMPONENT_DSI0},
+ };
+ 
++/*
++ * Single pipe (pipe 0 of the BSP's dual-pipe setup), enough for 1080x2400
++ * at 60 Hz; the command-mode panel takes DSC from DSC_WRAP0.
++ */
++static const unsigned int mt6885_mtk_ddp_main[] = {
++	DDP_COMPONENT_OVL0,
++	DDP_COMPONENT_RDMA0,
++	DDP_COMPONENT_COLOR0,
++	DDP_COMPONENT_CCORR,
++	DDP_COMPONENT_AAL0,
++	DDP_COMPONENT_GAMMA,
++	DDP_COMPONENT_POSTMASK0,
++	DDP_COMPONENT_DITHER0,
++	DDP_COMPONENT_DSC0,
++	DDP_COMPONENT_DSI0,
++};
++
+ static const unsigned int mt8192_mtk_ddp_main[] = {
+ 	DDP_COMPONENT_OVL0,
+ 	DDP_COMPONENT_OVL_2L0,
+@@ -300,6 +317,12 @@ static const struct mtk_mmsys_driver_data mt8188_vdosys0_driver_data = {
+ 	.min_height = 1,
+ };
+ 
++static const struct mtk_mmsys_driver_data mt6885_mmsys_driver_data = {
++	.main_path = mt6885_mtk_ddp_main,
++	.main_len = ARRAY_SIZE(mt6885_mtk_ddp_main),
++	.mmsys_dev_num = 1,
++};
++
+ static const struct mtk_mmsys_driver_data mt8192_mmsys_driver_data = {
+ 	.main_path = mt8192_mtk_ddp_main,
+ 	.main_len = ARRAY_SIZE(mt8192_mtk_ddp_main),
+@@ -338,6 +361,8 @@ static const struct of_device_id mtk_drm_of_ids[] = {
+ 	  .data = &mt7623_mmsys_driver_data},
+ 	{ .compatible = "mediatek,mt2712-mmsys",
+ 	  .data = &mt2712_mmsys_driver_data},
++	{ .compatible = "mediatek,mt6885-mmsys",
++	  .data = &mt6885_mmsys_driver_data},
+ 	{ .compatible = "mediatek,mt8167-mmsys",
+ 	  .data = &mt8167_mmsys_driver_data},
+ 	{ .compatible = "mediatek,mt8173-mmsys",
+@@ -634,6 +659,13 @@ static int mtk_drm_bind(struct device *dev)
+ 		return -EPROBE_DEFER;
+ 	}
+ 
++	/* the device exists before its driver has probed (mtk_mutex_get) */
++	if (!platform_get_drvdata(pdev)) {
++		dev_dbg(dev, "Waiting for disp-mutex driver\n");
++		put_device(&pdev->dev);
++		return -EPROBE_DEFER;
++	}
++
+ 	private->mutex_dev = &pdev->dev;
+ 	private->mtk_drm_bound = true;
+ 	private->dev = dev;
+@@ -744,6 +776,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DISP_MUTEX },
+ 	{ .compatible = "mediatek,mt2712-disp-mutex",
+ 	  .data = (void *)MTK_DISP_MUTEX },
++	{ .compatible = "mediatek,mt6885-disp-mutex",
++	  .data = (void *)MTK_DISP_MUTEX },
+ 	{ .compatible = "mediatek,mt8167-disp-mutex",
+ 	  .data = (void *)MTK_DISP_MUTEX },
+ 	{ .compatible = "mediatek,mt8173-disp-mutex",
+@@ -820,6 +854,8 @@ static const struct of_device_id mtk_ddp_comp_dt_ids[] = {
+ 	  .data = (void *)MTK_DPI },
+ 	{ .compatible = "mediatek,mt2701-dsi",
+ 	  .data = (void *)MTK_DSI },
++	{ .compatible = "mediatek,mt6885-dsi",
++	  .data = (void *)MTK_DSI },
+ 	{ .compatible = "mediatek,mt8173-dsi",
+ 	  .data = (void *)MTK_DSI },
+ 	{ .compatible = "mediatek,mt8183-dsi",
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+index 796113933..4206404cb 100644
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -8,11 +8,16 @@
+ #include <linux/component.h>
+ #include <linux/iopoll.h>
+ #include <linux/irq.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/regmap.h>
+ #include <linux/reset.h>
++#include <linux/soc/mediatek/mtk-mmsys.h>
++#include <linux/soc/mediatek/mtk-mutex.h>
+ #include <linux/units.h>
+ 
+ #include <video/mipi_display.h>
+@@ -21,6 +26,7 @@
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_bridge.h>
+ #include <drm/drm_bridge_connector.h>
++#include <drm/display/drm_dsc.h>
+ #include <drm/drm_mipi_dsi.h>
+ #include <drm/drm_of.h>
+ #include <drm/drm_panel.h>
+@@ -76,6 +82,9 @@
+ #define PACKED_PS_18BIT_RGB666		1
+ #define LOOSELY_PS_24BIT_RGB666		2
+ #define PACKED_PS_24BIT_RGB888		3
++/* compressed (DSC) pixel stream: 3-bit PS_SEL, vendor mtk_dsi_ps_control */
++#define DSI_PS_SEL_DSC			GENMASK(18, 16)
++#define PS_DSC				5
+ 
+ #define DSI_VSA_NL		0x20
+ #define DSI_VBP_NL		0x24
+@@ -151,6 +160,7 @@
+ #define CONFIG				GENMASK(7, 0)
+ #define SHORT_PACKET			0
+ #define LONG_PACKET			2
++#define FRAME_PACKET			1
+ #define BTA				BIT(2)
+ #define HSTX				BIT(3)
+ #define DATA_ID				GENMASK(15, 8)
+@@ -194,6 +204,8 @@ struct mtk_dsi_driver_data {
+ 	bool has_size_ctl;
+ 	bool cmdq_long_packet_ctl;
+ 	bool support_per_frame_lp;
++	/* mmsys register whose bit 0 is set on each command-mode frame (BSP) */
++	u32 mmsys_cmd_trig_off;
+ };
+ 
+ struct mtk_dsi {
+@@ -224,8 +236,37 @@ struct mtk_dsi {
+ 	u32 irq_data;
+ 	wait_queue_head_t irq_wait_queue;
+ 	const struct mtk_dsi_driver_data *driver_data;
++
++	/*
++	 * Command-mode panel: no video timing, the crtc sends each frame with
++	 * mtk_dsi_cmd_frame_begin()/end() (DCS write_memory_start after TE).
++	 */
++	bool cmd_mode;
++	const struct drm_dsc_config *dsc;
++	unsigned long hs_rate;
++	struct regmap *mmsys;
++	/* engine owner: a frame in flight vs. DCS commands from the panel */
++	struct mutex cmd_lock;
++	/*
++	 * Panel TE: the panel's refresh, periodic whether or not a frame is
++	 * sent. Frames start after it; the crtc takes it as its vblank.
++	 */
++	u32 te_seq;
++	wait_queue_head_t te_wq;
++	void (*te_cb)(void *data);
++	void *te_cb_data;
+ };
+ 
++/* one DSI host per SoC here; the DSC component has no handle to us */
++static struct mtk_dsi *mtk_dsi_dsc_host;
++
++const struct drm_dsc_config *mtk_dsi_get_dsc(void)
++{
++	struct mtk_dsi *dsi = READ_ONCE(mtk_dsi_dsc_host);
++
++	return dsi ? dsi->dsc : NULL;
++}
++
+ static inline struct mtk_dsi *bridge_to_dsi(struct drm_bridge *b)
+ {
+ 	return container_of(b, struct mtk_dsi, bridge);
+@@ -390,6 +431,10 @@ static void mtk_dsi_rxtx_control(struct mtk_dsi *dsi)
+ 	if (dsi->mode_flags & MIPI_DSI_MODE_NO_EOT_PACKET)
+ 		regval |= DIS_EOT;
+ 
++	/* the panel's TE line, reported as TE_RDY in DSI_INTSTA */
++	if (dsi->cmd_mode)
++		regval |= EXT_TE_EN;
++
+ 	writel(regval, dsi->regs + DSI_TXRX_CTRL);
+ }
+ 
+@@ -397,6 +442,33 @@ static void mtk_dsi_ps_control(struct mtk_dsi *dsi, bool config_vact)
+ {
+ 	u32 dsi_buf_bpp, ps_val, ps_wc, vact_nl;
+ 
++	if (dsi->dsc) {
++		const struct drm_dsc_config *dsc = dsi->dsc;
++		u32 chunk = DIV_ROUND_UP(dsc->slice_width * dsc->bits_per_pixel,
++					 8 * 16);
++
++		/*
++		 * Vendor mtk_dsi_ps_control: the word count is the compressed
++		 * line (chunks rounded up to whole 3-byte pixels), SIZE_CON
++		 * width is in 3-byte units. lk: PSCTRL wc 1080 / PS_SEL 5,
++		 * SIZE_CON 0x09600168.
++		 */
++		ps_wc = roundup(chunk, 3) * dsc->slice_count;
++		mtk_dsi_mask(dsi, DSI_PSCTRL, DSI_PS_WC | DSI_PS_SEL_DSC,
++			     FIELD_PREP(DSI_PS_WC, ps_wc) |
++			     FIELD_PREP(DSI_PS_SEL_DSC, PS_DSC));
++		if (config_vact) {
++			writel(FIELD_PREP(VACT_NL, dsi->vm.vactive),
++			       dsi->regs + DSI_VACT_NL);
++			writel(ps_wc, dsi->regs + DSI_HSTX_CKL_WC);
++		}
++		if (dsi->driver_data->has_size_ctl)
++			writel(FIELD_PREP(DSI_HEIGHT, dsi->vm.vactive) |
++			       FIELD_PREP(DSI_WIDTH, ps_wc / 3),
++			       dsi->regs + DSI_SIZE_CON);
++		return;
++	}
++
+ 	if (dsi->format == MIPI_DSI_FMT_RGB565)
+ 		dsi_buf_bpp = 2;
+ 	else
+@@ -607,6 +679,9 @@ static void mtk_dsi_set_interrupt_enable(struct mtk_dsi *dsi)
+ {
+ 	u32 inten = LPRX_RD_RDY_INT_FLAG | CMD_DONE_INT_FLAG | VM_DONE_INT_FLAG;
+ 
++	if (dsi->cmd_mode)
++		inten |= TE_RDY_INT_FLAG;
++
+ 	writel(inten, dsi->regs + DSI_INTEN);
+ }
+ 
+@@ -645,8 +720,24 @@ static irqreturn_t mtk_dsi_irq(int irq, void *dev_id)
+ 	struct mtk_dsi *dsi = dev_id;
+ 	u32 status, tmp;
+ 	u32 flag = LPRX_RD_RDY_INT_FLAG | CMD_DONE_INT_FLAG | VM_DONE_INT_FLAG;
++	void (*te_cb)(void *data);
++
++	status = readl(dsi->regs + DSI_INTSTA);
++
++	/*
++	 * TE also arrives while a frame is going out (engine busy): ack it on
++	 * its own. INTSTA bits are write-0-to-clear, 1s leave the others.
++	 */
++	if (dsi->cmd_mode && (status & TE_RDY_INT_FLAG)) {
++		writel(~(u32)TE_RDY_INT_FLAG, dsi->regs + DSI_INTSTA);
++		WRITE_ONCE(dsi->te_seq, dsi->te_seq + 1);
++		wake_up_all(&dsi->te_wq);
++		te_cb = READ_ONCE(dsi->te_cb);
++		if (te_cb)
++			te_cb(READ_ONCE(dsi->te_cb_data));
++	}
+ 
+-	status = readl(dsi->regs + DSI_INTSTA) & flag;
++	status &= flag;
+ 
+ 	if (status) {
+ 		do {
+@@ -707,8 +798,11 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	}
+ 	bit_per_pixel = ret;
+ 
+-	dsi->data_rate = DIV_ROUND_UP_ULL(dsi->vm.pixelclock * bit_per_pixel,
+-					  dsi->lanes);
++	if (dsi->hs_rate)
++		dsi->data_rate = dsi->hs_rate;
++	else
++		dsi->data_rate = DIV_ROUND_UP_ULL(dsi->vm.pixelclock * bit_per_pixel,
++						  dsi->lanes);
+ 
+ 	ret = clk_set_rate(dsi->hs_clk, dsi->data_rate);
+ 	if (ret < 0) {
+@@ -740,8 +834,15 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	mtk_dsi_phy_timconfig(dsi);
+ 
+ 	mtk_dsi_ps_control(dsi, true);
+-	mtk_dsi_set_vm_cmd(dsi);
+-	mtk_dsi_config_vdo_timing(dsi);
++	if (dsi->cmd_mode) {
++		if (!dsi->dsc && dsi->driver_data->has_size_ctl)
++			writel(FIELD_PREP(DSI_HEIGHT, dsi->vm.vactive) |
++			       FIELD_PREP(DSI_WIDTH, dsi->vm.hactive),
++			       dsi->regs + DSI_SIZE_CON);
++	} else {
++		mtk_dsi_set_vm_cmd(dsi);
++		mtk_dsi_config_vdo_timing(dsi);
++	}
+ 	mtk_dsi_set_interrupt_enable(dsi);
+ 
+ 	return 0;
+@@ -754,6 +855,8 @@ static int mtk_dsi_poweron(struct mtk_dsi *dsi)
+ 	return ret;
+ }
+ 
++static void mtk_dsi_wait_for_idle(struct mtk_dsi *dsi);
++
+ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
+ {
+ 	if (WARN_ON(dsi->refcount == 0))
+@@ -771,7 +874,10 @@ static void mtk_dsi_poweroff(struct mtk_dsi *dsi)
+ 	 */
+ 	mtk_dsi_stop(dsi);
+ 
+-	mtk_dsi_switch_to_cmd_mode(dsi, VM_DONE_INT_FLAG, 500);
++	if (dsi->cmd_mode)
++		mtk_dsi_wait_for_idle(dsi);
++	else
++		mtk_dsi_switch_to_cmd_mode(dsi, VM_DONE_INT_FLAG, 500);
+ 	mtk_dsi_reset_engine(dsi);
+ 	mtk_dsi_lane0_ulp_mode_enter(dsi);
+ 	mtk_dsi_clk_ulp_mode_enter(dsi);
+@@ -794,7 +900,9 @@ static void mtk_output_dsi_enable(struct mtk_dsi *dsi)
+ 		return;
+ 
+ 	mtk_dsi_set_mode(dsi);
+-	mtk_dsi_start(dsi);
++	/* command mode: DSI_START only per frame (mtk_dsi_cmd_frame_end) */
++	if (!dsi->cmd_mode)
++		mtk_dsi_start(dsi);
+ 
+ 	dsi->enabled = true;
+ }
+@@ -995,6 +1103,11 @@ static int mtk_dsi_host_attach(struct mipi_dsi_host *host,
+ 	dsi->lanes = device->lanes;
+ 	dsi->format = device->format;
+ 	dsi->mode_flags = device->mode_flags;
++	dsi->cmd_mode = !(device->mode_flags & MIPI_DSI_MODE_VIDEO);
++	dsi->hs_rate = device->hs_rate;
++	dsi->dsc = device->dsc;
++	if (dsi->dsc)
++		WRITE_ONCE(mtk_dsi_dsc_host, dsi);
+ 	dsi->next_bridge = devm_drm_of_get_bridge(dev, dev->of_node, 1, 0);
+ 	if (IS_ERR(dsi->next_bridge)) {
+ 		ret = PTR_ERR(dsi->next_bridge);
+@@ -1026,6 +1139,9 @@ static int mtk_dsi_host_detach(struct mipi_dsi_host *host,
+ 
+ 	component_del(host->dev, &mtk_dsi_component_ops);
+ 	drm_bridge_remove(&dsi->bridge);
++	if (READ_ONCE(mtk_dsi_dsc_host) == dsi)
++		WRITE_ONCE(mtk_dsi_dsc_host, NULL);
++	dsi->dsc = NULL;
+ 	return 0;
+ }
+ 
+@@ -1045,6 +1161,72 @@ static void mtk_dsi_wait_for_idle(struct mtk_dsi *dsi)
+ 	}
+ }
+ 
++/* called from the DSI interrupt on every panel TE; NULL to stop */
++void mtk_dsi_cmd_set_te_cb(struct device *dev, void (*cb)(void *data),
++			   void *data)
++{
++	struct mtk_dsi *dsi = dev_get_drvdata(dev);
++
++	WRITE_ONCE(dsi->te_cb_data, data);
++	WRITE_ONCE(dsi->te_cb, cb);
++}
++
++bool mtk_dsi_is_cmd_mode(struct device *dev)
++{
++	struct mtk_dsi *dsi = dev_get_drvdata(dev);
++
++	return dsi->cmd_mode;
++}
++
++/*
++ * Command-mode frame, as the BSP trigger loop (mtk_crtc_start_trig_loop):
++ * mtk_dsi_cmd_frame_begin() waits until the previous frame is out, so the
++ * caller can reprogram the pipeline, and owns the engine until
++ * mtk_dsi_cmd_frame_end(), which waits for the panel's TE (start of its
++ * vblank: the transfer then stays ahead of the panel scan, no tearing),
++ * enables the single-shot mutex and sends DCS write_memory_start.
++ */
++void mtk_dsi_cmd_frame_begin(struct device *dev)
++{
++	struct mtk_dsi *dsi = dev_get_drvdata(dev);
++
++	mutex_lock(&dsi->cmd_lock);
++	mtk_dsi_wait_for_idle(dsi);
++}
++
++void mtk_dsi_cmd_frame_end(struct device *dev, struct mtk_mutex *mutex)
++{
++	struct mtk_dsi *dsi = dev_get_drvdata(dev);
++	u32 reg_cmdq_off = dsi->driver_data->reg_cmdq_off;
++	u32 seq;
++
++	if (!dsi->enabled)
++		goto out;
++
++	seq = READ_ONCE(dsi->te_seq);
++	if (!wait_event_timeout(dsi->te_wq, READ_ONCE(dsi->te_seq) != seq,
++				msecs_to_jiffies(25)))
++		dev_warn_ratelimited(dev, "no TE from the panel\n");
++
++	mtk_mutex_enable(mutex);
++	if (dsi->mmsys && dsi->driver_data->mmsys_cmd_trig_off)
++		regmap_set_bits(dsi->mmsys, dsi->driver_data->mmsys_cmd_trig_off,
++				BIT(0));
++
++	/*
++	 * DCS long write of write_memory_start (0x2c) in HS, CMDQ type 1:
++	 * the payload is the pixel stream from the pipeline (BSP 0x002c3909)
++	 */
++	writel(FIELD_PREP(CONFIG, FRAME_PACKET | HSTX) |
++	       FIELD_PREP(DATA_ID, MIPI_DSI_DCS_LONG_WRITE) |
++	       FIELD_PREP(DATA_0, MIPI_DCS_WRITE_MEMORY_START),
++	       dsi->regs + reg_cmdq_off);
++	mtk_dsi_mask(dsi, DSI_CMDQ_SIZE, CMDQ_SIZE, 1);
++	mtk_dsi_start(dsi);
++out:
++	mutex_unlock(&dsi->cmd_lock);
++}
++
+ static u32 mtk_dsi_recv_cnt(u8 type, u8 *read_data)
+ {
+ 	switch (type) {
+@@ -1134,6 +1316,12 @@ static ssize_t mtk_dsi_host_transfer(struct mipi_dsi_host *host,
+ 	u32 dsi_mode;
+ 	int ret, i;
+ 
++	guard(mutex)(&dsi->cmd_lock);
++
++	/* e.g. a panel backlight update while the display is off */
++	if (!dsi->refcount)
++		return -EAGAIN;
++
+ 	dsi_mode = readl(dsi->regs + DSI_MODE_CTRL);
+ 	if (dsi_mode & MODE) {
+ 		mtk_dsi_stop(dsi);
+@@ -1244,6 +1432,16 @@ static int mtk_dsi_probe(struct platform_device *pdev)
+ 	dsi->host.dev = dev;
+ 
+ 	init_waitqueue_head(&dsi->irq_wait_queue);
++	init_waitqueue_head(&dsi->te_wq);
++	ret = devm_mutex_init(dev, &dsi->cmd_lock);
++	if (ret)
++		return ret;
++
++	/* optional: frame trigger bit some SoCs need on command-mode starts */
++	dsi->mmsys = syscon_regmap_lookup_by_phandle_optional(dev->of_node,
++							      "mediatek,mmsys");
++	if (IS_ERR(dsi->mmsys))
++		return dev_err_probe(dev, PTR_ERR(dsi->mmsys), "Failed to get mmsys\n");
+ 
+ 	platform_set_drvdata(pdev, dsi);
+ 
+@@ -1284,6 +1482,14 @@ static const struct mtk_dsi_driver_data mt2701_dsi_driver_data = {
+ 	.reg_shadow_dbg_off = 0x190
+ };
+ 
++static const struct mtk_dsi_driver_data mt6885_dsi_driver_data = {
++	.reg_cmdq_off = 0x200,
++	.reg_vm_cmd_off = 0x130,
++	.reg_shadow_dbg_off = 0x190,
++	.has_size_ctl = true,
++	.mmsys_cmd_trig_off = 0xf0,
++};
++
+ static const struct mtk_dsi_driver_data mt8183_dsi_driver_data = {
+ 	.reg_cmdq_off = 0x200,
+ 	.reg_vm_cmd_off = 0x130,
+@@ -1312,6 +1518,7 @@ static const struct mtk_dsi_driver_data mt8188_dsi_driver_data = {
+ 
+ static const struct of_device_id mtk_dsi_of_match[] = {
+ 	{ .compatible = "mediatek,mt2701-dsi", .data = &mt2701_dsi_driver_data },
++	{ .compatible = "mediatek,mt6885-dsi", .data = &mt6885_dsi_driver_data },
+ 	{ .compatible = "mediatek,mt8167-dsi", .data = &mt2701_dsi_driver_data },
+ 	{ .compatible = "mediatek,mt8173-dsi", .data = &mt8173_dsi_driver_data },
+ 	{ .compatible = "mediatek,mt8183-dsi", .data = &mt8183_dsi_driver_data },
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index cbdf7b8f7..f42ff6823 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -1406,6 +1406,17 @@ config DRM_PANEL_WIDECHIPS_WS2401
+ 	  480x800 display controller used in panels such as Samsung LMS380KF01.
+ 	  This display is used in the Samsung Galaxy Ace 2 GT-I8160 (Codina).
+ 
++config DRM_PANEL_XIAOMI_J10
++	tristate "Xiaomi Redmi K30 Ultra (j10 38 08 0a) DSC command-mode panel"
++	depends on OF
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	select DRM_DISPLAY_DSC_HELPER
++	select DRM_DISPLAY_HELPER
++	help
++	  Say Y here for the 1080x2400 AMOLED panel of the Redmi K30 Ultra
++	  (cezanne): MIPI DSI command mode, 4 lanes, DSC 1.1.
++
+ config DRM_PANEL_XINPENG_XPP055C272
+ 	tristate "Xinpeng XPP055C272 panel driver"
+ 	depends on OF
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index 3b523cf37..d2fb565ce 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -136,4 +136,5 @@ obj-$(CONFIG_DRM_PANEL_VISIONOX_RM692E5) += panel-visionox-rm692e5.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_VTDR6130) += panel-visionox-vtdr6130.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_R66451) += panel-visionox-r66451.o
+ obj-$(CONFIG_DRM_PANEL_WIDECHIPS_WS2401) += panel-widechips-ws2401.o
++obj-$(CONFIG_DRM_PANEL_XIAOMI_J10) += panel-xiaomi-j10-38-08-0a.o
+ obj-$(CONFIG_DRM_PANEL_XINPENG_XPP055C272) += panel-xinpeng-xpp055c272.o
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+new file mode 100644
+index 000000000..e2ed519e9
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-xiaomi-j10-38-08-0a.c
+@@ -0,0 +1,372 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Redmi K30 Ultra (cezanne) AMOLED: 1080x2400, MIPI DSI command mode, 4
++ * lanes at 820 Mbps, DSC 1.1 (2 slices of 540x8, 8 bpc -> 8 bpp), TE.
++ * Vendor driver: panel-j10-38-08-0a-dsc-cmd.c (Xiaomi kernel); the init
++ * sequence, including its pre-encoded PPS (DCS 0x9E), is taken verbatim.
++ */
++
++#include <linux/backlight.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regulator/consumer.h>
++
++#include <drm/display/drm_dsc.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_panel.h>
++#include <drm/drm_probe_helper.h>
++
++#include <video/mipi_display.h>
++
++#define J10_MAX_BRIGHTNESS	2047
++
++struct j10_panel {
++	struct drm_panel panel;
++	struct mipi_dsi_device *dsi;
++	struct regulator *vci;
++	struct gpio_desc *reset_gpio;
++	struct gpio_desc *bias_gpio;
++	struct drm_dsc_config dsc;
++};
++
++static inline struct j10_panel *to_j10_panel(struct drm_panel *panel)
++{
++	return container_of(panel, struct j10_panel, panel);
++}
++
++static void j10_reset(struct j10_panel *ctx)
++{
++	usleep_range(10000, 11000);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);	/* active low: in reset */
++	usleep_range(1000, 2000);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
++	usleep_range(10000, 11000);
++}
++
++static int j10_on(struct j10_panel *ctx)
++{
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++
++	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 10);
++	/* TE on */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_TEAR_ON, 0x00);
++
++	/* PPS */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x9d, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x9e,
++		0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x09, 0x60,
++		0x04, 0x38, 0x00, 0x08, 0x02, 0x1c, 0x02, 0x1c,
++		0x02, 0x00, 0x02, 0x0e, 0x00, 0x20, 0x00, 0xbb,
++		0x00, 0x07, 0x00, 0x0c, 0x0d, 0xb7, 0x0c, 0xb7,
++		0x18, 0x00, 0x10, 0xf0, 0x03, 0x0c, 0x20, 0x00,
++		0x06, 0x0b, 0x0b, 0x33, 0x0e, 0x1c, 0x2a, 0x38,
++		0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b,
++		0x7d, 0x7e, 0x01, 0x02, 0x01, 0x00, 0x09, 0x40,
++		0x09, 0xbe, 0x19, 0xfc, 0x19, 0xfa, 0x19, 0xf8,
++		0x1a, 0x38, 0x1a, 0x78, 0x1a, 0xb6, 0x2a, 0xf6,
++		0x2b, 0x34, 0x2b, 0x74, 0x3b, 0x74, 0x6b, 0xf4,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
++
++	/* page address set: full 1080x2400 */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_COLUMN_ADDRESS,
++				     0x00, 0x00, 0x04, 0x37);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_PAGE_ADDRESS,
++				     0x00, 0x00, 0x09, 0x5f);
++
++	/* 11-bit dimming */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x4f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++
++	/* error flag */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x02);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xec, 0x00, 0xc2, 0xc2, 0x42);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0d);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xec, 0x19);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x06);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xe4, 0x10);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++
++	/* TE frequency (121.4 / 60.7 Hz) */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x16);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd1, 0x11);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++
++	/* ripple improvement */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x36);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xd3, 0x0f);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x03);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++
++	/* OFC (MIPI 820 Mbps, OSC 91.8 MHz) */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xe4, 0xdf, 0x4c, 0xa2);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xe9,
++				     0x11, 0x75, 0xdf, 0x4c, 0xa2, 0xa6, 0x37, 0xbe,
++				     0xa6, 0x37, 0xbe, 0x00, 0x32, 0x32);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfc, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_msleep(&dsi_ctx, 80);
++
++	/* 60 Hz (0x10 0x00 = 120 Hz) */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x60, 0x00, 0x00);
++
++	/* dimming */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x06);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x10);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb7, 0x13);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	/* HBM off, backlight 0 until the backlight device sets it */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
++				     0x20, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
++				     0x00, 0x00);
++
++	/* ACL off */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_POWER_SAVE, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0xd9);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xbb, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++
++	/* colour: P3 tables (vendor CRC_P3 default) */
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x81, 0x92);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1, 0x00);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01, 0xb1);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1,
++				     0x9c, 0x07, 0x04, 0x3e, 0xc1, 0x13, 0x07, 0x07,
++				     0xa5, 0x52, 0xe2, 0xd3, 0xb9, 0x11, 0xbd, 0xe4,
++				     0xd8, 0x1b, 0xff, 0xf5, 0xe0);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x2b, 0xb1);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1,
++				     0xb7, 0x00, 0x00, 0x15, 0xc2, 0x00, 0x08, 0x08,
++				     0xb9, 0x26, 0xee, 0xdb, 0xdc, 0x05, 0xcc, 0xe4,
++				     0xd7, 0x00, 0xff, 0xff, 0xff);
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++
++	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
++
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	return dsi_ctx.accum_err;
++}
++
++static int j10_prepare(struct drm_panel *panel)
++{
++	struct j10_panel *ctx = to_j10_panel(panel);
++	int ret;
++
++	ret = regulator_enable(ctx->vci);
++	if (ret)
++		return ret;
++	gpiod_set_value_cansleep(ctx->bias_gpio, 1);
++	j10_reset(ctx);
++
++	ret = j10_on(ctx);
++	if (ret < 0) {
++		dev_err(panel->dev, "panel init failed: %d\n", ret);
++		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++		gpiod_set_value_cansleep(ctx->bias_gpio, 0);
++		regulator_disable(ctx->vci);
++	}
++	return ret;
++}
++
++static int j10_unprepare(struct drm_panel *panel)
++{
++	struct j10_panel *ctx = to_j10_panel(panel);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++	mipi_dsi_msleep(&dsi_ctx, 20);
++	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 10);
++	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 120);
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++
++	gpiod_set_value_cansleep(ctx->bias_gpio, 0);
++	regulator_disable(ctx->vci);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	return 0;
++}
++
++/* 60 Hz; clock gives exactly 60 Hz with the vendor porches */
++static const struct drm_display_mode j10_mode = {
++	.clock = (1080 + 40 + 10 + 20) * (2400 + 20 + 2 + 8) * 60 / 1000,
++	.hdisplay = 1080,
++	.hsync_start = 1080 + 40,
++	.hsync_end = 1080 + 40 + 10,
++	.htotal = 1080 + 40 + 10 + 20,
++	.vdisplay = 2400,
++	.vsync_start = 2400 + 20,
++	.vsync_end = 2400 + 20 + 2,
++	.vtotal = 2400 + 20 + 2 + 8,
++	.width_mm = 70,
++	.height_mm = 155,
++	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++};
++
++static int j10_get_modes(struct drm_panel *panel,
++			 struct drm_connector *connector)
++{
++	return drm_connector_helper_get_modes_fixed(connector, &j10_mode);
++}
++
++static const struct drm_panel_funcs j10_panel_funcs = {
++	.prepare = j10_prepare,
++	.unprepare = j10_unprepare,
++	.get_modes = j10_get_modes,
++};
++
++static int j10_bl_update_status(struct backlight_device *bl)
++{
++	struct mipi_dsi_device *dsi = bl_get_data(bl);
++	u16 brightness = backlight_get_brightness(bl);
++	int ret;
++
++	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
++	return ret < 0 ? ret : 0;
++}
++
++static const struct backlight_ops j10_bl_ops = {
++	.update_status = j10_bl_update_status,
++};
++
++static int j10_probe(struct mipi_dsi_device *dsi)
++{
++	const struct backlight_properties props = {
++		.type = BACKLIGHT_RAW,
++		.brightness = 1023,
++		.max_brightness = J10_MAX_BRIGHTNESS,
++	};
++	struct device *dev = &dsi->dev;
++	struct j10_panel *ctx;
++	struct drm_dsc_config *dsc;
++	int ret;
++
++	ctx = devm_drm_panel_alloc(dev, struct j10_panel, panel,
++				   &j10_panel_funcs, DRM_MODE_CONNECTOR_DSI);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	ctx->vci = devm_regulator_get(dev, "vci");
++	if (IS_ERR(ctx->vci))
++		return dev_err_probe(dev, PTR_ERR(ctx->vci), "vci supply\n");
++	/* lk left the panel running: keep it out of reset until prepare */
++	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(ctx->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio), "reset gpio\n");
++	ctx->bias_gpio = devm_gpiod_get(dev, "bias", GPIOD_OUT_HIGH);
++	if (IS_ERR(ctx->bias_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->bias_gpio), "bias gpio\n");
++
++	ctx->dsi = dsi;
++	mipi_dsi_set_drvdata(dsi, ctx);
++
++	/* vendor dsc_params (DSC 1.1); the encoder is set up from this */
++	dsc = &ctx->dsc;
++	dsc->dsc_version_major = 1;
++	dsc->dsc_version_minor = 1;
++	dsc->pic_width = 1080;
++	dsc->pic_height = 2400;
++	dsc->slice_width = 540;
++	dsc->slice_height = 8;
++	dsc->slice_count = 2;
++	dsc->slice_chunk_size = 540;
++	dsc->bits_per_component = 8;
++	dsc->bits_per_pixel = 8 << 4;
++	dsc->line_buf_depth = 9;
++	dsc->convert_rgb = true;
++	dsc->block_pred_enable = true;
++	dsc->initial_xmit_delay = 512;
++	dsc->initial_dec_delay = 526;
++	dsc->initial_scale_value = 32;
++	dsc->scale_increment_interval = 187;
++	dsc->scale_decrement_interval = 7;
++	dsc->first_line_bpg_offset = 12;
++	dsc->nfl_bpg_offset = 3511;
++	dsc->slice_bpg_offset = 3255;
++	dsc->initial_offset = 6144;
++	dsc->final_offset = 4336;
++	dsc->flatness_min_qp = 3;
++	dsc->flatness_max_qp = 12;
++	dsc->rc_model_size = 8192;
++	dsc->rc_edge_factor = 6;
++	dsc->rc_quant_incr_limit0 = 11;
++	dsc->rc_quant_incr_limit1 = 11;
++	dsc->rc_tgt_offset_high = 3;
++	dsc->rc_tgt_offset_low = 3;
++	dsi->dsc = dsc;
++
++	dsi->lanes = 4;
++	dsi->format = MIPI_DSI_FMT_RGB888;
++	dsi->hs_rate = 820000000;
++	dsi->mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS;
++
++	ctx->panel.prepare_prev_first = true;
++	ctx->panel.backlight = devm_backlight_device_register(dev, dev_name(dev),
++							      dev, dsi,
++							      &j10_bl_ops, &props);
++	if (IS_ERR(ctx->panel.backlight))
++		return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
++				     "backlight\n");
++
++	drm_panel_add(&ctx->panel);
++	ret = mipi_dsi_attach(dsi);
++	if (ret < 0) {
++		drm_panel_remove(&ctx->panel);
++		return dev_err_probe(dev, ret, "mipi_dsi_attach\n");
++	}
++	return 0;
++}
++
++static void j10_remove(struct mipi_dsi_device *dsi)
++{
++	struct j10_panel *ctx = mipi_dsi_get_drvdata(dsi);
++
++	mipi_dsi_detach(dsi);
++	drm_panel_remove(&ctx->panel);
++}
++
++static const struct of_device_id j10_of_match[] = {
++	{ .compatible = "xiaomi,j10-38-08-0a" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, j10_of_match);
++
++static struct mipi_dsi_driver j10_driver = {
++	.probe = j10_probe,
++	.remove = j10_remove,
++	.driver = {
++		.name = "panel-xiaomi-j10-38-08-0a",
++		.of_match_table = j10_of_match,
++	},
++};
++module_mipi_dsi_driver(j10_driver);
++
++MODULE_DESCRIPTION("Redmi K30 Ultra j10 (38 08 0a) DSC command-mode AMOLED panel");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/mediatek/mtk-mutex.c b/drivers/soc/mediatek/mtk-mutex.c
+index 6312d150d..b52f0da2a 100644
+--- a/drivers/soc/mediatek/mtk-mutex.c
++++ b/drivers/soc/mediatek/mtk-mutex.c
+@@ -1050,6 +1050,25 @@ void mtk_mutex_disable(struct mtk_mutex *mutex)
+ }
+ EXPORT_SYMBOL_GPL(mtk_mutex_disable);
+ 
++/*
++ * Drop every module from a mutex, e.g. ones a bootloader left in it for a
++ * pipeline the caller does not drive (would otherwise start with each frame).
++ */
++void mtk_mutex_clear_mods(struct mtk_mutex *mutex)
++{
++	struct mtk_mutex_ctx *mtx = container_of(mutex, struct mtk_mutex_ctx,
++						 mutex[mutex->id]);
++
++	WARN_ON(&mtx->mutex[mutex->id] != mutex);
++
++	writel(0, mtx->regs + DISP_REG_MUTEX_EN(mutex->id));
++	writel_relaxed(0, mtx->regs + mtx->data->mutex_mod_reg + 0x20 * mutex->id);
++	if (mtx->data->mutex_mod1_reg)
++		writel_relaxed(0, mtx->regs + mtx->data->mutex_mod1_reg +
++			       0x20 * mutex->id);
++}
++EXPORT_SYMBOL_GPL(mtk_mutex_clear_mods);
++
+ void mtk_mutex_acquire(struct mtk_mutex *mutex)
+ {
+ 	struct mtk_mutex_ctx *mtx = container_of(mutex, struct mtk_mutex_ctx,
+diff --git a/include/linux/soc/mediatek/mtk-mutex.h b/include/linux/soc/mediatek/mtk-mutex.h
+index 635218e3a..a3b6e2f55 100644
+--- a/include/linux/soc/mediatek/mtk-mutex.h
++++ b/include/linux/soc/mediatek/mtk-mutex.h
+@@ -75,6 +75,7 @@ void mtk_mutex_enable(struct mtk_mutex *mutex);
+ int mtk_mutex_enable_by_cmdq(struct mtk_mutex *mutex,
+ 			     void *pkt);
+ void mtk_mutex_disable(struct mtk_mutex *mutex);
++void mtk_mutex_clear_mods(struct mtk_mutex *mutex);
+ void mtk_mutex_remove_comp(struct mtk_mutex *mutex,
+ 			   enum mtk_ddp_comp_id id);
+ void mtk_mutex_unprepare(struct mtk_mutex *mutex);

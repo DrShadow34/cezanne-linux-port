@@ -1,0 +1,18 @@
+post_install() {
+  systemctl daemon-reload 2>/dev/null || true
+  modprobe cezanne-apu 2>/dev/null || true
+  systemctl enable --now cezanne-upscaled.socket 2>/dev/null || true
+}
+
+post_upgrade() {
+  systemctl daemon-reload 2>/dev/null || true
+  modprobe cezanne-apu 2>/dev/null || true
+  # also out of a failed state (a daemon that kept failing stops the socket)
+  systemctl reset-failed cezanne-upscaled.socket cezanne-upscaled.service 2>/dev/null || true
+  systemctl is-enabled -q cezanne-upscaled.socket 2>/dev/null &&
+    systemctl restart cezanne-upscaled.socket 2>/dev/null || true
+}
+
+pre_remove() {
+  systemctl disable --now cezanne-upscaled.socket cezanne-upscaled.service 2>/dev/null || true
+}

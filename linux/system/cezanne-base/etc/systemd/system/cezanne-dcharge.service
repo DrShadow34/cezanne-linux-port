@@ -1,0 +1,11 @@
+[Unit]
+Description=Direct (charge pump) charging from USB PD PPS adapters
+# the bq25970 driver stops the pump 5 s after the last keepalive if this dies
+
+[Service]
+ExecStart=/usr/local/bin/cezanne-dcharge
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
