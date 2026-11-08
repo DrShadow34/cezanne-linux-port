@@ -1,0 +1,4 @@
+stock-firmware.tar.zst
+src/
+pkg/
+*.pkg.tar.*

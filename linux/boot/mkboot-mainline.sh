@@ -6,11 +6,22 @@
 # RAM flag is set (cezanne-bootsel, `reboot miui`), else Arch.
 # NO_MIUI=1 (with CHOOSER=1): boot-slot image without MIUI (MIUI wiped
 # 2026-10-30); the shim then always boots Arch and counts no failed boots.
+# STOCK_BOOT: a stock boot image (MIUI's boot partition, or any image of
+# ours, which keep its dtb section): its dtb section goes into ours, as
+# every image that booted has had; lk passes its own DTB, which the shim
+# replaces, but an image with our DTB in that section was never shown to
+# boot (OWN_DTB=1 builds one, untested). CHOOSER=1 without NO_MIUI takes
+# MIUI's kernel + ramdisk from it as well.
 # Usage: mkboot-mainline.sh <ramdisk-dir> <out.img>
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-M="$ROOT/mainline"
+# the shim sits next to this script, the DTS next to it (development tree:
+# mainline/) or one level up (repository: linux/boot -> linux/dts)
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SHIM="$HERE/shim"
+DTS="${DTS:-$HERE/dts}"
+[[ -d $DTS ]] || DTS="$HERE/../dts"
+ROOT="$(cd "$HERE/.." && pwd)"
 # KSRC / KOUT / W: kernel tree, its build dir, work dir (linux-cezanne's
 # PKGBUILD points them at its own build)
 KSRC="${KSRC:-$ROOT/src/linux-mainline}"
@@ -18,7 +29,7 @@ KOUT="${KOUT:-$ROOT/src/out-mainline}"
 RD_DIR="$(realpath "${1:?ramdisk dir}")"
 OUT="$(realpath -m "${2:?out image}")"
 W="${W:-$ROOT/build/mainline}"
-STOCK_BOOT="$ROOT/tools/magisk/magisk_patched_V14.0.5.0.img"
+STOCK_BOOT="${STOCK_BOOT:-$ROOT/tools/magisk/magisk_patched_V14.0.5.0.img}"
 RAMDISK_ADDR=0x47c80000		# where lk loads the boot.img ramdisk
 
 mkdir -p "$W"
@@ -34,8 +45,8 @@ rd_end=$(printf '0x%x' $((RAMDISK_ADDR + rd_size)))
 DT_DEFS=()
 [[ "${DISPLAY_DRV:-drm}" == drm ]] && DT_DEFS+=(-DCEZANNE_DRM)
 cpp -nostdinc -undef -x assembler-with-cpp -D__DTS__ "${DT_DEFS[@]}" \
-    -I "$M/dts" -I "$KSRC/include" -I "$KSRC/scripts/dtc/include-prefixes" \
-    "$M/dts/mt6885-xiaomi-cezanne.dts" > "$W/board.dts"
+    -I "$DTS" -I "$KSRC/include" -I "$KSRC/scripts/dtc/include-prefixes" \
+    "$DTS/mt6885-xiaomi-cezanne.dts" > "$W/board.dts"
 cat >> "$W/board.dts" <<EOF
 &{/chosen} {
 	linux,initrd-start = <0x0 $RAMDISK_ADDR>;
@@ -53,28 +64,35 @@ EOF
 "$KOUT/scripts/dtc/dtc" -q -I dts -O dtb -o "$W/board.dtb" "$W/board.dts"
 
 # shim + DTB + Image, gzipped like a stock kernel
-clang --target=aarch64-linux-gnu -nostdlib -ffreestanding -c "$M/shim/shim.S" -o "$W/shim.o"
+clang --target=aarch64-linux-gnu -nostdlib -ffreestanding -c "$SHIM/shim.S" -o "$W/shim.o"
 clang --target=aarch64-linux-gnu -nostdlib -ffreestanding -fno-builtin -O2 \
     -mstrict-align -mgeneral-regs-only -fno-pic -fno-stack-protector -Wall \
-    -c "$M/shim/shim.c" -o "$W/shim-c.o"
-(cd "$W" && ld.lld -T "$M/shim/shim.lds" shim.o shim-c.o -o shim.elf)
+    -c "$SHIM/shim.c" -o "$W/shim-c.o"
+(cd "$W" && ld.lld -T "$SHIM/shim.lds" shim.o shim-c.o -o shim.elf)
 llvm-objcopy -O binary "$W/shim.elf" "$W/shim.bin"
-unpack_bootimg --boot_img "$STOCK_BOOT" --out "$W/stock" >/dev/null
 MIUI_PARTS=()
+if [[ "${OWN_DTB:-0}" == 1 ]]; then
+    DTB_SECTION="$W/board.dtb"
+else
+    [[ -f $STOCK_BOOT ]] || { echo "mkboot: no stock boot image at $STOCK_BOOT (its dtb section is needed)" >&2; exit 1; }
+    rm -rf "$W/stock"
+    unpack_bootimg --boot_img "$STOCK_BOOT" --out "$W/stock" >/dev/null
+    DTB_SECTION="$W/stock/dtb"
+fi
 if [[ "${CHOOSER:-0}" == 1 && "${NO_MIUI:-0}" != 1 ]]; then
     gzip -dc "$W/stock/kernel" > "$W/stock/Image"
     MIUI_PARTS=("$W/stock/Image" "$W/stock/ramdisk")
 fi
-python3 -I "$M/shim/mkshim.py" "$W/shim.bin" "$W/board.dtb" "$KOUT/arch/arm64/boot/Image" "$W/kernel.bin" "${MIUI_PARTS[@]}"
+python3 -I "$SHIM/mkshim.py" "$W/shim.bin" "$W/board.dtb" "$KOUT/arch/arm64/boot/Image" "$W/kernel.bin" "${MIUI_PARTS[@]}"
 if [[ "${RAW_KERNEL:-0}" == 1 ]]; then cp "$W/kernel.bin" "$W/kernel.gz"; else gzip -n -9 -c "$W/kernel.bin" > "$W/kernel.gz"; fi	# lk chokes on the gzip FNAME field
 
-# boot image v2 with the stock layout; lk ignores the dtb section, keep stock's.
+# boot image v2 with the stock layout and the stock dtb section.
 # lk builds MIUI's command line from this one (stock: + buildvariant=user)
 PART=recovery CMDLINE="bootopt=64S3,32N2,64N2"
 [[ "${CHOOSER:-0}" == 1 ]] && PART=boot CMDLINE="bootopt=64S3,32N2,64N2 buildvariant=user"
 PART=${AVB_PART:-$PART}	# AVB_PART=recovery: test a chooser image in the recovery slot
 mkbootimg --header_version 2 --os_version 12.0.0 --os_patch_level 2023-07 \
-    --kernel "$W/kernel.gz" --ramdisk "$W/ramdisk.gz" --dtb "$W/stock/dtb" \
+    --kernel "$W/kernel.gz" --ramdisk "$W/ramdisk.gz" --dtb "$DTB_SECTION" \
     --pagesize 2048 --base 0 --kernel_offset 0x40080000 --ramdisk_offset 0x47c80000 \
     --tags_offset 0x4bc80000 --dtb_offset 0x4bc80000 \
     --cmdline "$CMDLINE" -o "$OUT"	# lk reads the kernel bitness from bootopt

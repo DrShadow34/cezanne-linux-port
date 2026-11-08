@@ -31,6 +31,9 @@ import time
 MOTOR = '/sys/bus/platform/devices/popup-camera'
 SOCK = '/run/cezanne-popup.sock'
 CALI_FILES = ['/var/lib/cezanne-popup/hall_calidata.txt']
+# where MIUI keeps it: copied once into CALI_FILES[0] (mounted read only)
+PERSIST = '/dev/disk/by-partlabel/persist'
+PERSIST_CALI = 'sensors/hall_calidata.txt'
 STREAM_ATTRS = ['/sys/bus/platform/devices/1a004000.camera/streaming']
 RELEASE_DELAY = 0.5		# s: app switches should not bounce the camera
 WARN_COUNT, WARN_WINDOW = 5, 60		# pop-ups per s before notifying
@@ -77,7 +80,35 @@ class Hall:
         self.broken_until = 0
 
     @staticmethod
+    def copy_persist_cali():
+        """the per-unit calibration out of MIUI's persist partition, once"""
+        dst = CALI_FILES[0]
+        if os.path.exists(dst) or not os.path.exists(PERSIST):
+            return
+        mnt = f'/run/cezanne-popup.persist.{os.getpid()}'
+        os.makedirs(mnt, exist_ok=True)
+        try:
+            if subprocess.run(['mount', '-o', 'ro', PERSIST, mnt],
+                              capture_output=True).returncode != 0:
+                return
+            try:
+                with open(os.path.join(mnt, PERSIST_CALI), 'rb') as f:
+                    data = f.read()
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst + '.new', 'wb') as f:
+                    f.write(data)
+                os.rename(dst + '.new', dst)
+                log(f'calibration copied from persist:/{PERSIST_CALI}')
+            except OSError:
+                pass
+            finally:
+                subprocess.run(['umount', mnt], capture_output=True)
+        finally:
+            os.rmdir(mnt)
+
+    @staticmethod
     def load_table():
+        Hall.copy_persist_cali()
         for path in CALI_FILES:
             try:
                 pts = []

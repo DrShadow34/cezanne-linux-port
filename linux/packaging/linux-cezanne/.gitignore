@@ -1,0 +1,12 @@
+src/
+pkg/
+*.pkg.tar.*
+linux-*.tar.xz
+stock-boot.img
+conninfra/
+wlan-adaptor/
+wlan-core-gen4m/
+common/
+connfem/
+bt-mt66xx/
+gps/

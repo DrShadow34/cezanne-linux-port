@@ -1,0 +1,94 @@
+# cezanne-firmware: the vendor firmware the cezanne drivers load, extracted
+# from the phone's stock MIUI partitions. Not redistributable, so not in the
+# repository: first run collect-stock-firmware.sh (as root on the phone while
+# its super partition still holds the stock system, or with images of super
+# and scp1), which writes stock-firmware.tar.zst next to this file; then
+# build. What goes where (hardware.md, Firmware column):
+#   /usr/lib/firmware/            CONNSYS Wi-Fi / BT / FM blobs and configs,
+#                                 AW8697 haptics library (vendor /firmware)
+#   /usr/lib/firmware/cirrus/     CS35L41 speaker protection, per amp
+#   /usr/lib/firmware/mediatek/cezanne/mdota/  modem OTA configs (vendor
+#                                 /etc/mdota)
+#   /usr/lib/firmware/mediatek/cezanne/gnss-l{1,5}.bin  GNSS DSP RAM code,
+#                                 out of vendor /lib64/libmnl.so
+#   /usr/lib/firmware/mediatek/mt6885/scp.img  SCP image (scp1 partition)
+# Made for MIUI V14.0.5.0.SJNCNXM: the GNSS images are checked by sha256
+# (another libmnl build needs new offsets in extract-dsp.py).
+# Bump pkgver (date) when the extraction changes.
+pkgname=cezanne-firmware
+pkgver=20261108
+pkgrel=1
+pkgdesc="Vendor firmware for the Redmi K30 Ultra (cezanne), extracted from the stock MIUI partitions"
+arch=(any)
+url="https://github.com/DrShadow34/cezanne-linux-port"
+license=(LicenseRef-vendor-firmware)
+makedepends=(python)
+options=(!strip)
+source=(stock-firmware.tar.zst extract-dsp.py)
+sha256sums=(SKIP SKIP)
+
+# CONNSYS (conninfra, Wi-Fi, Bluetooth, FM) and the AW8697 waveform library,
+# as named in the vendor's /firmware
+_vendor_fw=(
+  WIFI_RAM_CODE_soc3_0_1_1.bin soc3_0_ram_wifi_1_1_hdr.bin
+  soc3_0_ram_mcu_1_1_hdr.bin soc3_0_ram_mcu_1a_1_hdr.bin soc3_0_ram_mcu_e1_hdr.bin
+  soc3_0_ram_bt_1_1_hdr.bin soc3_0_ram_bt_1a_1_hdr.bin
+  soc3_0_patch_wmmcu_1_1_hdr.bin soc3_0_ram_wmmcu_1_1_hdr.bin
+  wifi.cfg conninfra.cfg BT_FW.cfg
+  mt6635_fm_v1_patch.bin mt6635_fm_v1_coeff.bin fm_cust.cfg
+  aw8697_haptic.bin
+)
+
+check() {
+  cd "$srcdir"
+  sha256sum -c --quiet SHA256SUMS
+}
+
+package() {
+  local fw=$pkgdir/usr/lib/firmware v=$srcdir/vendor/firmware f
+  for f in "${_vendor_fw[@]}"; do
+    install -Dm644 "$v/$f" "$fw/$f"
+  done
+
+  # CS35L41: one speaker protection program for both amps; the bottom
+  # (loudspeaker) amp takes the vendor's speaker tuning, the top (earpiece
+  # side) one its RCV- tuning; the ASoC driver asks per amp name
+  install -Dm644 "$v/cs35l41-dsp1-spk-prot.wmfw" "$fw/cirrus/cs35l41-dsp1-spk-prot-cezanne-bottom.wmfw"
+  install -Dm644 "$v/cs35l41-dsp1-spk-prot.wmfw" "$fw/cirrus/cs35l41-dsp1-spk-prot-cezanne-top.wmfw"
+  install -Dm644 "$v/cs35l41-dsp1-spk-prot.bin" "$fw/cirrus/cs35l41-dsp1-spk-prot-cezanne-bottom.bin"
+  install -Dm644 "$v/RCV-cs35l41-dsp1-spk-prot.bin" "$fw/cirrus/cs35l41-dsp1-spk-prot-cezanne-top.bin"
+  for f in cs35l41-delta-{rcv,spk}-{handsfree,music}.txt; do
+    install -Dm644 "$v/$f" "$fw/cirrus/$f"
+  done
+
+  # the modem's OTA configuration (drive T: of cezanne-modem's file service)
+  install -d "$fw/mediatek/cezanne/mdota"
+  for f in "$srcdir"/vendor/etc/mdota/*; do
+    install -m644 "$f" "$fw/mediatek/cezanne/mdota/"
+  done
+
+  # GNSS DSP RAM code (L1, L5), stored in MIUI's libmnl
+  python "$srcdir/extract-dsp.py" "$srcdir/vendor/lib64/libmnl.so" "$fw/mediatek/cezanne"
+  chmod 644 "$fw"/mediatek/cezanne/gnss-l*.bin
+
+  # SCP image: the scp1 partition up to the end of its last MediaTek image
+  # section (the rest is padding)
+  install -d "$fw/mediatek/mt6885"
+  python - "$srcdir/scp1.img" "$fw/mediatek/mt6885/scp.img" <<'EOF'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+off = 0
+while True:
+    magic, dsize = struct.unpack_from('<II', d, off)
+    if magic != 0x58881688:
+        sys.exit(f'scp1: no image header at {off:#x}')
+    hsize, last, align = struct.unpack_from('<I', d, off + 0x34)[0], \
+        struct.unpack_from('<I', d, off + 0x40)[0], struct.unpack_from('<I', d, off + 0x44)[0]
+    end = off + hsize + dsize
+    off = -(-end // (align or 16)) * (align or 16)
+    if last:
+        break
+open(sys.argv[2], 'wb').write(d[:off])
+EOF
+  chmod 644 "$fw/mediatek/mt6885/scp.img"
+}

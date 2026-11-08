@@ -8,8 +8,10 @@ the conventions they follow, and how to test one without holding the phone.
 All phone-specific shell behaviour is done with extensions; GNOME Shell
 itself is the Arch package (51.1, the same version as on the build host)
 with one St patch, a CSS selector index (packaging/overlays/gnome-shell;
-NOTES "GNOME startup stalls"). Each extension lives in the project next to the kernel / rootfs
-pieces it belongs to, under `mainline/rootfs/<area>/<uuid>/`:
+NOTES "GNOME startup stalls"). The extensions live in `mainline/extensions/<uuid>/`
+and are packaged as cezanne-extensions (the `PKGBUILD` there; schemas
+compiled at build time); the area column names the kernel / rootfs pieces
+each one belongs to:
 
 | uuid (`@arch-port`)        | area    | what it does |
 |----------------------------|---------|--------------|
@@ -162,7 +164,7 @@ bus is `unix:path=/run/user/1002/bus`. From the host:
 ```sh
 cd ~/arch-port
 R='runuser -u arch -- env XDG_RUNTIME_DIR=/run/user/1002 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1002/bus'
-tar -C mainline/rootfs/display -cf - cezanne-portrait-calendar@arch-port |
+tar -C mainline/extensions -cf - cezanne-portrait-calendar@arch-port |
   scripts/arch-ssh.sh "D=/home/arch/.local/share/gnome-shell/extensions;
     tar -C \$D -xf - && chown -R arch:arch \$D/cezanne-portrait-calendar@arch-port"
 scripts/arch-ssh.sh "$R gnome-extensions enable cezanne-portrait-calendar@arch-port"
@@ -284,7 +286,7 @@ Look at the screen first: the user may be using the phone (`scr`, below).
 
 ## Checklist for a new extension
 
-1. Pick the area directory and uuid, write `metadata.json` and
+1. Pick the uuid (`mainline/extensions/<uuid>/`), write `metadata.json` and
    `extension.js` as above; keep it to the one job the phone needs.
 2. Read the relevant shell source and theme CSS first; note the private
    fields you depend on in the header comment.

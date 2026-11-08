@@ -12,7 +12,7 @@
 - Needs `ledtrig-pattern` (CONFIG_LEDS_TRIGGER_PATTERN=m,
   rootfs etc/modules-load.d/cezanne-leds.conf) and udev
   64-cezanne-rgb.rules for the video group.
-- GNOME: rootfs/leds/cezanne-notification-led@arch-port (schemas compiled
+- GNOME: extensions/cezanne-notification-led@arch-port (schemas compiled
   with glib-compile-schemas).
 - Details, findings and TODO (notifications in suspend): NOTES.md
   "Notification light".

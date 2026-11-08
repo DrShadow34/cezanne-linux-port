@@ -1,0 +1,32 @@
+# cezanne-extensions: the port's GNOME Shell extensions (cezanne-*@arch-port,
+# every directory here), installed system-wide; schemas compiled at build
+# time. They rely on cezanne-base's scripts, units and udev rules
+# (GNOME-EXTENSIONS.md). Until 2026-11-08 they were part of cezanne-base.
+# The version is the build time: cezanne-build rebuilds when the tree changes.
+pkgname=cezanne-extensions
+pkgver=0
+pkgrel=1
+pkgdesc="Redmi K30 Ultra (cezanne) GNOME Shell extensions"
+arch=(any)
+url="https://github.com/DrShadow34/cezanne-linux-port"
+license=(GPL-2.0-or-later)
+depends=(gnome-shell cezanne-base)
+makedepends=(glib2)
+
+pkgver() {
+  date -u +%Y%m%d.%H%M%S
+}
+
+package() {
+  cd "$startdir"
+  local ext d=usr/share/gnome-shell/extensions
+  install -d "$pkgdir/$d"
+  for ext in *@arch-port; do
+    [[ -f $ext/metadata.json ]] || continue
+    cp -r "$ext" "$pkgdir/$d/"
+    rm -f "$pkgdir/$d/$ext/schemas/gschemas.compiled"
+    if [[ -d $pkgdir/$d/$ext/schemas ]]; then
+      glib-compile-schemas "$pkgdir/$d/$ext/schemas"
+    fi
+  done
+}

@@ -1,0 +1,13 @@
+Pristine vendor sources that the linux-cezanne build patches
+(../patches/btif.patch, ../patches/fmradio.patch). GPL-2.0, unmodified:
+
+  btif/     drivers/misc/mediatek/btif of the MT6885 4.14 BSP kernel,
+            github.com/Winkmoon/shirokoneko_kernel_xiaomi_mt6885 at
+            b13455ecf2cce22faa62b49548827f8695d86ae3
+  fmradio/  drivers/misc/mediatek/connectivity/fmradio of the same tree,
+            without its Android.mk, dummy.c and init.fmradio_drv.rc
+
+The other MediaTek connectivity drivers (conninfra, wlan-adaptor,
+wlan-core-gen4m, common, connfem, bt-mt66xx, gps) are not copied here: the
+linux-cezanne PKGBUILD fetches MotorolaMobilityLLC's GPL releases of them at
+pinned commits and applies ../patches/<name>.patch.

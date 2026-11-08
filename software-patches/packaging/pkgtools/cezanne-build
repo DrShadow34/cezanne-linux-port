@@ -6,7 +6,8 @@
 #                                       -f: even when current, -n: dry run
 #   cezanne-build --status              every package: built key vs current key
 #
-# packaging/packages.list (in $TOP, the synced project subset) lists the packages in build order, "NAME TYPE DIR":
+# packages.list (in $PKGS, below $TOP: the synced project subset or a clone
+# of the public repository) lists the packages in build order, "NAME TYPE DIR":
 #   own      DIR holds a complete PKGBUILD (our own software); stale when the
 #            directory's contents change
 #   track    DIR holds our PKGBUILD for software that has to follow an upstream
@@ -37,9 +38,13 @@ set -euo pipefail
 export LC_ALL=C
 
 TOP=${CEZANNE_PKG:-/home/alarm/cezanne-pkg}
+# packages.list and overlay-lib.sh: packaging/ in the development tree,
+# software-patches/packaging/ in the public repository (a clone as TOP)
+PKGS=$TOP/packaging
+[[ -f $PKGS/packages.list ]] || PKGS=$TOP/software-patches/packaging
 REPO=${CEZANNE_REPO:-/var/lib/cezanne/repo}
 DB=$REPO/cezanne.db.tar.gz
-STATE=/var/lib/cezanne/built
+STATE=${CEZANNE_STATE:-/var/lib/cezanne/built}
 WORK=${CEZANNE_WORK:-/home/alarm/cezanne-build}
 CACHE=/var/cache/cezanne-build
 DBP=$CACHE/db
@@ -209,7 +214,7 @@ prepare_overlay() {
 	cp -a "$dir"/. "$dest"/
 	rel=$(cd "$dest" && as_builder bash -c 'source ./PKGBUILD >/dev/null; echo "$pkgrel"')
 	{
-		cat "$TOP/packaging/overlay-lib.sh"
+		cat "$PKGS/overlay-lib.sh"
 		echo "# ---- cezanne overlay $name ----"
 		cat "$dir/cezanne.sh"
 		echo "[[ \${arch[*]} == *aarch64* ]] || arch=(aarch64)"
@@ -248,7 +253,7 @@ current_key() {
 			ver=$(upstream_version "${PROBE:-${UPSTREAM:-$name}}")
 		fi
 		[[ -n $ver ]] || { echo "missing"; return; }
-		echo "$ver $(dir_hash "$dir") $(sha256sum "$TOP/packaging/overlay-lib.sh" | cut -c1-8)"
+		echo "$ver $(dir_hash "$dir") $(sha256sum "$PKGS/overlay-lib.sh" | cut -c1-8)"
 		;;
 	esac
 }
@@ -367,7 +372,7 @@ while read -r name type dir; do
 	fi
 	todo+=("$name")
 	t_type[$name]=$type t_dir[$name]=$dir t_key[$name]=$key
-done < "$TOP/packaging/packages.list"
+done < "$PKGS/packages.list"
 
 if (( ${#todo[@]} )); then
 	chroot_ready > "$WORK/chroot.log" 2>&1 || {

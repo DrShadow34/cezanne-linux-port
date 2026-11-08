@@ -1,0 +1,39 @@
+# Out-of-tree / relocated modules installed on the phone: <path under
+# /lib/modules/<release>> <built file in the project>. Modules under kernel/
+# not listed here come from src/out-mainline/<same path>.
+# Used by scripts/stage-modules.sh.
+kernel/drivers/leds/leds-aw2015.ko mainline/leds/leds-aw2015.ko
+updates/uinput.ko mainline/uinput/uinput.ko
+extra/vdec/v4l2-mem2mem.ko src/out-mainline/drivers/media/v4l2-core/v4l2-mem2mem.ko
+extra/vdec/v4l2-h264.ko src/out-mainline/drivers/media/v4l2-core/v4l2-h264.ko
+extra/vdec/v4l2-vp9.ko src/out-mainline/drivers/media/v4l2-core/v4l2-vp9.ko
+extra/vdec/cezanne-vdec.ko mainline/vcodec/cezanne-vdec/cezanne-vdec.ko
+extra/venc/cezanne-venc.ko mainline/vcodec/cezanne-venc/cezanne-venc.ko
+extra/camera/dw9719.ko mainline/camera/dw9719.ko
+extra/camera/imx682.ko mainline/camera/imx682.ko
+extra/camera/cezanne_camsv.ko mainline/camera/cezanne_camsv.ko
+extra/camera/v4l2-cci.ko mainline/camera/v4l2-cci.ko
+extra/camera/cezanne_sensor.ko mainline/camera/cezanne_sensor.ko
+extra/camera/fan53870.ko mainline/camera/fan53870.ko
+extra/camera/s5k3t2.ko mainline/camera/s5k3t2.ko
+extra/popup/ak09970.ko mainline/popup/ak09970.ko
+extra/popup/popup-motor.ko mainline/popup/popup-motor.ko
+extra/fingerprint/goodix_fp.ko mainline/fingerprint/goodix_fp.ko
+extra/fingerprint/cezanne_teei.ko mainline/fingerprint/teei/cezanne_teei.ko
+extra/scp/scp-cezanne.ko src/scp-port/scp-cezanne.ko
+extra/scp/hf-manager.ko src/scp-port/sensor/hf-manager.ko
+extra/scp/mtk-nanohub.ko src/scp-port/sensor/mtk-nanohub.ko
+extra/scp/nanohub.ko src/scp-port/sensor/nanohub.ko
+extra/scp/scp-iio.ko src/scp-port/sensor/scp-iio.ko
+extra/modem/cezanne_ccci.ko mainline/modem/ccci/cezanne_ccci.ko
+extra/aw8697.ko mainline/haptics/aw8697.ko
+extra/cezanne-bootsel.ko mainline/bootsel/cezanne-bootsel.ko
+extra/conninfra.ko src/connectivity/conninfra/conninfra.ko
+extra/wmt_chrdev_wifi_connac2.ko src/connectivity/wlan-adaptor/wmt_chrdev_wifi_connac2.ko
+extra/wlan_drv_gen4m_6885.ko src/connectivity/wlan-core-gen4m/wlan_drv_gen4m_6885.ko
+extra/mtk_btif.ko src/connectivity/btif/mtk_btif.ko
+extra/bt_drv_6885.ko src/connectivity/bt-mt66xx/6885/bt_drv_6885.ko
+extra/gps_drv_dl_v010.ko src/connectivity/gps/data_link/plat/v010/gps_drv_dl_v010.ko
+extra/xmusb350.ko mainline/xmusb350/xmusb350.ko
+extra/fmradio_drv.ko src/connectivity/fmradio/fmradio_drv.ko
+extra/apu/cezanne-apu.ko mainline/apu/cezanne-apu.ko

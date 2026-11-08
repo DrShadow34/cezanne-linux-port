@@ -1,4 +1,11 @@
-MediaTek connectivity (Wi-Fi + Bluetooth) for mainline 7.2, out of tree.
+MediaTek connectivity (Wi-Fi + Bluetooth + GNSS + FM) for mainline 7.x, out of tree.
+
+Packaged builds: the linux-cezanne PKGBUILD fetches the vendor repositories
+below at pinned commits, copies btif / fmradio from vendor/ (pristine 4.14
+BSP sources), applies patches/<name>.patch to each, adds compat/ and
+Kbuild.6885, and builds the modules; no local checkout is needed. The
+manual steps below are the development setup (src/connectivity working
+trees; regenerate patches/ from them after a change).
 
 Sources: github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity-<repo>,
 branch android-15-release-vvob35 (conninfra, wlan-adaptor, wlan-core-gen4m, common, connfem).

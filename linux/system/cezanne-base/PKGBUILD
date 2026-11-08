@@ -1,19 +1,19 @@
 # cezanne-base: the port's system integration from this rootfs overlay tree:
 # configs and drop-ins (/etc), systemd units, udev rules, the cezanne-* system
 # scripts (/usr/local/bin, /usr/local/lib/cezanne), ALSA UCM, the Plymouth
-# theme, the GSettings override and our GNOME Shell extensions (system-wide).
-# Not here: firmware (cezanne-firmware), kernel modules (linux-cezanne),
+# theme and the GSettings override.
+# Not here: the GNOME Shell extensions (cezanne-extensions, since
+# 2026-11-08), firmware (cezanne-firmware), kernel modules (linux-cezanne),
 # installation-specific files (fstab, locale.conf), device state (/var/lib).
 # The version is the build time: cezanne-build rebuilds when the tree changes.
 pkgname=cezanne-base
 pkgver=0
 pkgrel=1
-pkgdesc="Redmi K30 Ultra (cezanne) system integration: configs, units, udev rules, scripts, GNOME extensions"
+pkgdesc="Redmi K30 Ultra (cezanne) system integration: configs, units, udev rules, scripts"
 arch=(any)
-url="https://localhost/arch-port"
+url="https://github.com/DrShadow34/cezanne-linux-port"
 license=(GPL-2.0-or-later)
 depends=(systemd python dconf gnome-shell plymouth btrfs-progs compsize)
-makedepends=(glib2)
 install=cezanne-base.install
 
 pkgver() {
@@ -40,16 +40,6 @@ package() {
       install -Dm"$mode" "$f" "$pkgdir/$f"
     fi
   done < <(find ./etc ./usr \( -type f -o -type l \) -print0)
-
-  # GNOME Shell extensions (cezanne-*@arch-port), schemas compiled in place
-  local ext d=usr/share/gnome-shell/extensions
-  for ext in */*@arch-port; do
-    install -d "$pkgdir/$d"
-    cp -r "$ext" "$pkgdir/$d/"
-    if [[ -d $pkgdir/$d/${ext#*/}/schemas ]]; then
-      glib-compile-schemas "$pkgdir/$d/${ext#*/}/schemas"
-    fi
-  done
 
   # units enabled on the first install (systemctl preset in the .install)
   install -d "$pkgdir/usr/lib/systemd/system-preset"

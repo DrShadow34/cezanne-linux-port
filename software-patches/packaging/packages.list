@@ -1,48 +1,49 @@
-# cezanne packages, in build order: NAME TYPE DIR (DIR relative to the project)
+# cezanne packages, in build order: NAME TYPE DIR (DIR relative to the repository)
 # own: our PKGBUILD in DIR; overlay: upstream PKGBUILD + DIR/cezanne.sh (see cezanne-build)
 
 # the build tooling itself
-cezanne-pkgtools    own      packaging/pkgtools
+cezanne-pkgtools    own      software-patches/packaging/pkgtools
 
 # patched Arch packages
-mutter              overlay  packaging/overlays/mutter
-xorg-xwayland       overlay  packaging/overlays/xorg-xwayland
-libcamera           overlay  packaging/overlays/libcamera
-mesa                overlay  packaging/overlays/mesa
-fex-guestos-mesa    track    mainline/fex-guestos
-gst-plugins-cezanne track    mainline/rootfs/gstreamer
-cezanne-va          own      mainline/rootfs/libva-v4l2-request
-modemmanager        overlay  packaging/overlays/modemmanager
-realesrgan-ncnn-vulkan own   apps/realesrgan-ncnn-vulkan
-cezanne-photo       own      mainline/camera/hdr
-cezanne-upscale     own      mainline/apu/upscaler
-cezanne-voice       own      apps/cezanne-voice
-snapshot            overlay  packaging/overlays/snapshot
-plymouth            overlay  packaging/overlays/plymouth
-gnome-shell         overlay  packaging/overlays/gnome-shell
+mutter              overlay  software-patches/mutter
+xorg-xwayland       overlay  software-patches/xorg-xwayland
+libcamera           overlay  software-patches/libcamera
+mesa                overlay  software-patches/mesa
+fex-guestos-mesa    track    software-patches/fex-guestos-mesa
+gst-plugins-cezanne track    software-patches/gstreamer
+cezanne-va          own      software-patches/libva-v4l2-request
+modemmanager        overlay  software-patches/modemmanager
+realesrgan-ncnn-vulkan own      software-patches/realesrgan-ncnn-vulkan
+cezanne-photo       own      gnome-apps/cezanne-photo
+cezanne-upscale     own      gnome-apps/cezanne-upscale
+cezanne-voice       own      gnome-apps/cezanne-voice
+snapshot            overlay  gnome-apps/snapshot
+plymouth            overlay  software-patches/plymouth
+gnome-shell         overlay  software-patches/gnome-shell
 
 # the port's system integration and firmware
-cezanne-firmware    own      packaging/cezanne-firmware
-cezanne-base        own      mainline/rootfs
+cezanne-firmware    own      linux/firmware
+cezanne-base        own      linux/system/cezanne-base
+cezanne-extensions  own      gnome-extensions
 
 # our software
-cezanne-boost       own      apps/cezanne-boost
-cezanne-top         own      apps/cezanne-top
-cezanne-power       own      apps/cezanne-power
-cezanne-fm          own      apps/cezanne-fm
-cezanne-fp          own      apps/cezanne-fp
-cezanne-gnss        own      apps/cezanne-gnss
-cezanne-modem       own      apps/cezanne-modem
-neard               own      mainline/rootfs/nfc/neard
-cezanne-nfc         own      apps/cezanne-nfc
-cezanne-remote      own      apps/cezanne-remote
-cezanne-gallery     own      apps/cezanne-gallery
-cezanne-storage     own      apps/cezanne-storage
-umtp-responder      own      packaging/umtp-responder
-gnome-shell-extension-caffeine own packaging/gnome-shell-extension-caffeine
-cezanne-usb         own      apps/cezanne-usb
+cezanne-boost       own      gnome-apps/cezanne-boost
+cezanne-top         own      gnome-apps/cezanne-top
+cezanne-power       own      gnome-apps/cezanne-power
+cezanne-fm          own      gnome-apps/cezanne-fm
+cezanne-fp          own      gnome-apps/cezanne-fp
+cezanne-gnss        own      gnome-apps/cezanne-gnss
+cezanne-modem       own      gnome-apps/cezanne-modem
+neard               own      software-patches/neard
+cezanne-nfc         own      gnome-apps/cezanne-nfc
+cezanne-remote      own      gnome-apps/cezanne-remote
+cezanne-gallery     own      gnome-apps/cezanne-gallery
+cezanne-storage     own      gnome-apps/cezanne-storage
+umtp-responder      own      software-patches/umtp-responder
+gnome-shell-extension-caffeine own      software-patches/gnome-shell-extension-caffeine
+cezanne-usb         own      gnome-apps/cezanne-usb
 
 # not in the ALARM repos (or older there)
-mission-center      overlay  packaging/overlays/mission-center
-mangohud            overlay  packaging/overlays/mangohud
-steam-arm64         follow   apps/steam-arm64
+mission-center      overlay  software-patches/mission-center
+mangohud            overlay  software-patches/mangohud
+steam-arm64         follow   software-patches/steam-arm64

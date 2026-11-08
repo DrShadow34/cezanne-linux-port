@@ -1,85 +1,169 @@
 # linux-cezanne: the mainline kernel for the Redmi K30 Ultra (MT6885) with all
 # of the port's modules and the boot image.
-#   kernel   v7.3.1 + mainline/patches/*.patch (they reproduce
-#            src/linux-mainline exactly) + config (= src/out-mainline/.config)
-#   modules  the in-tree ones + every out-of-tree module of mainline/modules.map,
-#            built against this kernel (no MODVERSIONS: never mix builds)
-#   boot     boot.img for the boot slot (mainline/mkboot-mainline.sh: shim + DTB
-#            from mainline/dts + Image + the nolibc init); 90-cezanne-boot.hook
-#            flashes it after saving the slot to /var/lib/cezanne/boot-prev.img
-# Built on the build PC / laptop (cross, LLVM=1, needs the project tree:
-# $startdir/../..), then uploaded to the phone's [cezanne] repo:
-#   packaging/cezanne-pkg host linux-cezanne
-# Bump pkgrel with every change: it is part of the kernel release
-# (7.3.1-cezanne<pkgrel>), so a new build never overwrites the running
-# kernel's modules.
+#   kernel   linux-7.3.1 from kernel.org + the port's patches, config here
+#   modules  the in-tree ones + every out-of-tree module of modules.map, built
+#            against this kernel (no MODVERSIONS: never mix builds): the
+#            port's own drivers, the SCP sensor hub, and MediaTek's
+#            connectivity drivers (MotorolaMobilityLLC's GPL repositories at
+#            pinned commits + btif / fmradio from the 4.14 BSP, with the
+#            port's patches)
+#   boot     boot.img for the boot slot (mkboot-mainline.sh: shim + DTB +
+#            Image + the nolibc init built here, the dtb section of a stock
+#            boot image); 90-cezanne-boot.hook flashes it after saving the
+#            slot to /var/lib/cezanne/boot-prev.img
+# Needs stock-boot.img next to this file: the phone's boot partition
+#   (dd if=/dev/disk/by-partlabel/boot of=stock-boot.img, MIUI's or one of
+#   ours: both carry the stock dtb section); the development tree falls
+#   back to tools/magisk's stock image.
+# Builds in two layouts, found from here ($startdir/../..):
+#   repository   linux/{patches,dts,drivers,boot}, this file in
+#                linux/packaging/linux-cezanne
+#   development  mainline/{patches,dts,<driver>,mkboot-mainline.sh,...}, this
+#                file in packaging/linux-cezanne
+# Cross build on x86_64 (LLVM=1): makepkg --config <makepkg-host.conf>, or
+# natively on aarch64. Bump pkgrel with every change: it is part of the
+# kernel release (7.3.1-cezanne<pkgrel>), so a new build never overwrites the
+# running kernel's modules.
 pkgname=linux-cezanne
 _kver=7.3.1
 pkgver=$_kver
-pkgrel=13
+pkgrel=15
 pkgdesc="Mainline Linux for the Redmi K30 Ultra (cezanne, MT6885): kernel, modules, boot image"
 arch=(aarch64)
-url="https://www.kernel.org/"
+url="https://github.com/DrShadow34/cezanne-linux-port"
 license=(GPL-2.0-only)
 depends=(coreutils kmod)
-makedepends=(clang lld llvm bc cpio perl python dtc mkbootimg android-tools)
+makedepends=(clang lld llvm bc cpio perl python dtc mkbootimg android-tools git rsync)
 provides=(linux "cezanne-kernel=$pkgver")
 options=(!strip !debug !lto)
 install=linux-cezanne.install
 _localver=-cezanne$pkgrel
 _rel=$_kver$_localver
 
-_root() { realpath "$startdir/../.."; }
+# MediaTek connectivity: MotorolaMobilityLLC's GPL releases
+_mtk=https://github.com/MotorolaMobilityLLC/vendor-mediatek-kernel_modules-connectivity
+source=("https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-$_kver.tar.xz"
+        "conninfra::git+$_mtk-conninfra.git#commit=db63c376c7d0b4523990ae9dcbdb7694fbf0ca1c"
+        "wlan-adaptor::git+$_mtk-wlan-adaptor.git#commit=11353556671e288dfe73ff7abbdc24dbeb28420e"
+        "wlan-core-gen4m::git+$_mtk-wlan-core-gen4m.git#commit=fa87f7db913bd36e517fe03c99f67d827a8bf64c"
+        "common::git+$_mtk-common.git#commit=2993f4be3ed27009c5a61daae4749150faf119e5"
+        "connfem::git+$_mtk-connfem.git#commit=8a665a04c76989bafbf2bf664abf7e1901c23ca8"
+        "bt-mt66xx::git+$_mtk-bt-mt66xx.git#commit=1d54bce193752325fe3f37ef54cff1e75711882b"
+        "gps::git+$_mtk-gps.git#commit=de1d61d93862540cd30ded68214fbaba1677dd3d")
+sha256sums=('fa595aad93734f829c963c2a90ef7c3673224fd7fdae7b49406e397cde2de231'
+            SKIP SKIP SKIP SKIP SKIP SKIP SKIP)
+_mtk_repos=(conninfra wlan-adaptor wlan-core-gen4m common connfem bt-mt66xx gps)
+
+# out-of-tree drivers: "build dir:development path:repository path"; the
+# build dirs keep the development layout (bootsel includes ../shim)
+_oot=(
+  mainline/apu:mainline/apu:drivers/apu
+  mainline/bootsel:mainline/bootsel:drivers/bootsel
+  mainline/shim:mainline/shim:boot/shim
+  mainline/camera:mainline/camera:drivers/camera
+  mainline/fingerprint:mainline/fingerprint:drivers/fingerprint
+  mainline/haptics:mainline/haptics:drivers/haptics
+  mainline/leds:mainline/leds:drivers/leds
+  mainline/modem/ccci:mainline/modem/ccci:drivers/modem-ccci
+  mainline/popup:mainline/popup:drivers/popup
+  mainline/uinput:mainline/uinput:drivers/uinput
+  mainline/vcodec/cezanne-vdec:mainline/vcodec/cezanne-vdec:drivers/cezanne-vdec
+  mainline/vcodec/cezanne-venc:mainline/vcodec/cezanne-venc:drivers/cezanne-venc
+  mainline/xmusb350:mainline/xmusb350:drivers/xmusb350
+  scp-port:mainline/scp:drivers/scp
+)
+
+# _layout: sets _repo (1 in the repository) and the source paths
+_layout() {
+  _top=$(realpath "$startdir/../..")
+  if [[ -f $_top/PATCHES.md && -d $_top/drivers ]]; then
+    _repo=1 _patches=$_top/patches _boot=$_top/boot
+    _conn=$_top/drivers/connectivity _init=$_top/boot/nolibc-init
+  else
+    _repo= _patches=$_top/mainline/patches _boot=$_top/mainline
+    _conn=$_top/mainline/connectivity _init=$_top/mainline/nolibc-init
+  fi
+  _modmap=$startdir/modules.map
+  [[ -f $_modmap ]] || _modmap=$_top/mainline/modules.map
+  _stock=$startdir/stock-boot.img
+  [[ -f $_stock || -n $_repo ]] || _stock=$_top/tools/magisk/magisk_patched_V14.0.5.0.img
+}
+
 _kmake() {
   make -C "$srcdir/linux" O="$srcdir/build" ARCH=arm64 LLVM=1 \
     LOCALVERSION="$_localver" -j"$(nproc)" "$@"
 }
-# out-of-tree module sources, without build products and captures
+# a source tree without build products, captures and tools
 _copy_src() {
-  mkdir -p "$srcdir/oot/$2"
+  mkdir -p "$2"
   tar -C "$1" -cf - --exclude='*.o' --exclude='*.ko' --exclude='*.cmd' --exclude='*.mod' \
     --exclude='*.mod.c' --exclude='modules.order' --exclude='Module.symvers' \
     --exclude='.git' --exclude='dumps' --exclude='ref' --exclude='tools' --exclude='hdr' \
     --exclude='*.dng' --exclude='*.pgm' --exclude='*.png' --exclude='*.raw*' \
-    --exclude='*.ppm' --exclude='*.log' --exclude='*.tar' . | tar -C "$srcdir/oot/$2" -xf -
+    --exclude='*.ppm' --exclude='*.log' --exclude='*.tar' . | tar -C "$2" -xf -
+}
+_patch() {	# _patch DIR PATCH: apply unless empty
+  [[ -s $2 ]] && patch -d "$1" -Np1 -s -i "$2"
+  return 0
 }
 
 prepare() {
-  local root p
-  root=$(_root)
-  rm -rf linux build oot
-  mkdir linux build
-  git -C "$root/src/linux-mainline" archive "v$_kver" | tar -x -C linux
-  for p in "$root"/mainline/patches/*.patch; do
+  _layout
+  [[ -f $_stock ]] || { error "no $_stock: copy the phone's boot partition there (see the top of the PKGBUILD)"; return 1; }
+  local p e r c=$srcdir/oot/connectivity
+  rm -rf linux build oot initramfs
+  mv "linux-$_kver" linux
+  for p in "$_patches"/*.patch; do
     patch -d linux -Np1 -s -i "$p"
   done
+  mkdir build
   cp "$startdir/config" build/.config
   _kmake olddefconfig
 
-  local d
-  # shim: bootsel.h (-I$(src)/../shim)
-  for d in apu bootsel shim camera fingerprint haptics leds modem/ccci popup uinput \
-           vcodec/cezanne-vdec vcodec/cezanne-venc xmusb350; do
-    _copy_src "$root/mainline/$d" "mainline/$d"
+  for e in "${_oot[@]}"; do
+    IFS=: read -r dir dev pub <<< "$e"
+    _copy_src "$_top/$([[ -n $_repo ]] && echo "$pub" || echo "$dev")" "$srcdir/oot/$dir"
   done
-  _copy_src "$root/src/scp-port" scp-port
-  _copy_src "$root/src/connectivity" connectivity
-  _copy_src "$root/src/vtop" vtop
+
+  # connectivity: the vendor trees + the port's patches; compat headers,
+  # the MT6885 Wi-Fi Kbuild, the Android-style tree the Makefiles expect
+  mkdir -p "$c"
+  for r in "${_mtk_repos[@]}"; do
+    _copy_src "$srcdir/$r" "$c/$r"
+    _patch "$c/$r" "$_conn/patches/$r.patch"
+  done
+  for r in btif fmradio; do
+    _copy_src "$_conn/vendor/$r" "$c/$r"
+    _patch "$c/$r" "$_conn/patches/$r.patch"
+  done
+  cp -a "$_conn/compat" "$c/compat"
+  cp "$_conn/Kbuild.6885" "$c/wlan-core-gen4m/Kbuild.6885"
+  local v=$srcdir/oot/vtop/vendor/mediatek/kernel_modules/connectivity
+  mkdir -p "$v/wlan/core"
+  ln -s "$c/conninfra" "$v/conninfra"
+  ln -s "$c/common" "$v/common"
+  ln -s "$c/connfem" "$v/connfem"
+  ln -s "$c/btif" "$v/btif"
+  ln -s "$c/bt-mt66xx" "$v/bt"
+  ln -s "$c/wlan-adaptor" "$v/wlan/adaptor"
+  ln -s "$c/wlan-core-gen4m" "$v/wlan/core/gen4m"
 }
 
 build() {
-  local o=$srcdir/oot c=$srcdir/oot/connectivity d
+  _layout
+  local o=$srcdir/oot c=$srcdir/oot/connectivity d e
   _kmake Image modules
 
-  # mainline/: our own drivers (stage-modules.sh)
-  for d in apu bootsel camera fingerprint haptics leds modem/ccci popup uinput \
-           vcodec/cezanne-vdec vcodec/cezanne-venc xmusb350; do
-    _kmake M="$o/mainline/$d" modules
+  # the port's own drivers
+  for e in "${_oot[@]}"; do
+    d=${e%%:*}
+    [[ $d == mainline/shim || $d == scp-port ]] && continue
+    _kmake M="$o/$d" modules
   done
   # SCP sensor hub (sensor/ links against scp-port's symbols)
   _kmake M="$o/scp-port" modules
   _kmake M="$o/scp-port/sensor" KBUILD_EXTRA_SYMBOLS="$o/scp-port/Module.symvers" modules
-  # CONNSYS (mainline/connectivity/build.sh, build2.sh)
+  # CONNSYS
   local base=(CONNINFRA_SRC="$c/conninfra" CONFIG_MTK_COMBO_CHIP_CONSYS_6885=y)
   local two=(TOP="$o/vtop" GEN4M_SRC="$c/wlan-core-gen4m" CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH=y)
   _kmake M="$c/conninfra" "${base[@]}" CONFIG_MTK_COMBO_CHIP_CONSYS_6893=n modules
@@ -100,20 +184,31 @@ build() {
     CONFIG_MTK_GPS_SUPPORT=y modules
   _kmake M="$c/fmradio" "${base[@]}" "${two[@]}" KBUILD_EXTRA_SYMBOLS="$(_extra "$c/fmradio")" modules
 
-  # boot image for the boot slot (as boot-NN: CHOOSER=1 NO_MIUI=1 KEEP_WDT=1)
-  local root
-  root=$(_root)
+  # initramfs: the nolibc init (mounts the root file system, then systemd),
+  # against this kernel's arm64 UAPI headers, never the build host's: an
+  # x86_64 host's asm/unistd.h gave 7.3.1-14's init x86 system call numbers
+  # (mount 165 instead of 40) and the phone a boot loop
+  _kmake headers_install INSTALL_HDR_PATH="$srcdir/uapi"
+  local cc=(clang --target=aarch64-linux-gnu -nostdlib -nostdlibinc -static -ffreestanding
+            -fno-stack-protector -Os -fuse-ld=lld -I "$srcdir/uapi/include"
+            -include "$srcdir/linux/tools/include/nolibc/nolibc.h" -I "$srcdir/linux/tools/include/nolibc")
+  [[ $(printf '#include <asm/unistd.h>\n__NR_mount\n' | "${cc[@]}" -E -P - | tail -1) == 40 ]] ||
+    { error "init: asm/unistd.h is not arm64's"; return 1; }
+  mkdir -p initramfs/{dev,proc,sys}
+  "${cc[@]}" "$_init/archboot.c" -o initramfs/init
+
+  # boot image for the boot slot
   CHOOSER=1 NO_MIUI=1 KEEP_WDT=1 KSRC="$srcdir/linux" KOUT="$srcdir/build" W="$srcdir/boot" \
-    "$root/mainline/mkboot-mainline.sh" "$root/initramfs/mainline-arch" "$srcdir/boot.img"
+    STOCK_BOOT="$_stock" bash "$_boot/mkboot-mainline.sh" "$srcdir/initramfs" "$srcdir/boot.img"
 }
 
 package() {
-  local root m dst src
-  root=$(_root)
+  _layout
+  local m dst src
   _kmake INSTALL_MOD_PATH="$pkgdir/usr" INSTALL_MOD_STRIP=1 DEPMOD=/bin/true modules_install
   rm -f "$pkgdir/usr/lib/modules/$_rel"/{build,source}
 
-  # out-of-tree modules at the paths of mainline/modules.map
+  # out-of-tree modules at the paths of modules.map
   while read -r dst src; do
     [[ -z $dst || $dst == \#* ]] && continue
     case $src in
@@ -124,7 +219,7 @@ package() {
       *) echo "modules.map: unknown source $src" >&2; return 1 ;;
     esac
     install -Dm644 "$m" "$pkgdir/usr/lib/modules/$_rel/$dst"
-  done < "$root/mainline/modules.map"
+  done < "$_modmap"
   find "$pkgdir/usr/lib/modules/$_rel/extra" "$pkgdir/usr/lib/modules/$_rel/updates" \
     -name '*.ko' -exec llvm-strip --strip-debug {} + 2>/dev/null || true
   echo "$pkgname" > "$pkgdir/usr/lib/modules/$_rel/pkgbase"

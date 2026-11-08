@@ -89,7 +89,37 @@ New patched Arch package: `packaging/overlays/NAME/{upstream,cezanne.sh,*.patch}
 and a line in packages.list. New own package: a PKGBUILD in its directory
 and a line in packages.list.
 
+## Building from the public repository
+
+A clone of github.com/DrShadow34/cezanne-linux-port has the same package
+directories (their paths: `software-patches/packaging/packages.list`).
+- Kernel: `linux/packaging/linux-cezanne`, `makepkg --config
+  software-patches/packaging/makepkg-host.conf` on an x86_64 PC (cross,
+  LLVM) or `makepkg` on the phone. It downloads Linux from kernel.org and
+  MediaTek's connectivity drivers from GitHub (pinned commits); everything
+  else is in the clone, except `stock-boot.img` next to the PKGBUILD: a dd
+  of the phone's boot partition (MIUI's, or ours, which keeps the stock dtb
+  section), whose dtb section the boot image carries. Installing the package writes its boot image to the
+  boot slot (the hook; the old one is kept in /var/lib/cezanne).
+- Firmware: as root on the phone while `super` still holds MIUI's system,
+  `linux/firmware/collect-stock-firmware.sh` (or `-s super.img -c
+  scp1.img` with images), then the package builds from that.
+- Everything else, on the phone as root: install cezanne-pkgtools
+  (`software-patches/packaging/pkgtools`, `makepkg -si`), add the
+  [cezanne] repo to /etc/pacman.conf before [core] (above), then
+  `CEZANNE_PKG=<clone> cezanne-build` builds every package in order into
+  /var/lib/cezanne/repo (the builder user is `alarm`, CEZANNE_BUILDER to
+  change it). `pacman -Syu` then takes the patched Arch packages; the
+  port's own ones are installed once by name (`pacman -S cezanne-base
+  cezanne-extensions cezanne-firmware ...`).
+
 ## State (2026-11-02)
+
+2026-11-08: the GNOME Shell extensions moved from cezanne-base into their
+own package cezanne-extensions (mainline/extensions), and cezanne-firmware
+is built from the stock partitions (collect-stock-firmware.sh) instead of
+copies of the blobs; the kernel builds from kernel.org and the vendor
+repositories plus the patches.
 
 Installed on the phone from [cezanne], all built in the clean chroot: the
 cezanne-* apps, cezanne-base, cezanne-firmware, cezanne-pkgtools (timer

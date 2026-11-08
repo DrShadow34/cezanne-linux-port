@@ -340,7 +340,7 @@ lanes -> SENINF5 (dumps/uw-on*.bin). Depth/macro on i2c8 (not done).
   max 2.5 s). No strobe sync. A SIGTERM/SIGINT handler switches the LEDs
   off. AGC steps grow with the error (max 30 %) so the exposure follows the
   light switching on.
-- GNOME: rootfs/camera/cezanne-flashlight@arch-port, a Quick Settings
+- GNOME: extensions/cezanne-flashlight@arch-port, a Quick Settings
   toggle with Low / Medium / High.
 
 ## All rear cameras and concurrent capture (2026-10-25)
