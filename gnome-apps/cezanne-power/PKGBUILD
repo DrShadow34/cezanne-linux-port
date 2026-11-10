@@ -7,19 +7,25 @@
 # After installing: systemctl enable --now cezanne-standby-log
 pkgname=cezanne-power
 pkgver=1.0
-pkgrel=5
+pkgrel=7
 pkgdesc="Standby settings and measured battery use"
-arch=(any)
+arch=(aarch64)
 license=(MIT)
-depends=(python python-gobject gtk4 libadwaita)
+depends=(glib2 python python-gobject gtk4 libadwaita)
 optdepends=('cezanne-voice: microphone noise reduction (the Microphone switch)')
 source=(cezanne-power
-        cezanne-standby-log
+        cezanne-standby-log.c
         cezanne-standby-log.service
         org.cezanne.power.gschema.xml
         org.cezanne.Power.desktop
         org.cezanne.Power.svg)
 sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP)
+
+build() {
+  # the logger runs all the time: C, not Python (~2 instead of ~22 MiB)
+  cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -o cezanne-standby-log cezanne-standby-log.c \
+    $(pkg-config --cflags --libs gio-2.0) -lm
+}
 
 package() {
   install -Dm755 cezanne-power "$pkgdir/usr/bin/cezanne-power"

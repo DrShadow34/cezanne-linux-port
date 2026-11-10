@@ -42,7 +42,6 @@ struct rt_feature {
 
 /* CCB data (DHL, MD monitor, META users) for ccb_gear_id 12 */
 #define CCB_DATA_SIZE		0x178000
-#define DHL_RAW_SIZE		0x3e00000
 #define MD_MEM_SIZE		0x1e000000	/* MD bank 0 at AP 0xde000000 */
 #define MD_MEM_PHYS		0xde000000
 #define AP_CCMNI_MTU_VAL	(3584 - 16)	/* NET_RX_BUF - ccci_header */
@@ -108,9 +107,13 @@ static int feature_data(struct ccci_md *md, int id, u32 *d)
 		d[3] = CCB_DATA_SIZE;
 		return 16;
 	case DHL_RAW_SHARE_MEMORY:
-		d[0] = C_MD_VIEW + C_RAW_DHL;
-		d[1] = DHL_RAW_SIZE;
-		return 8;
+		/*
+		 * Declined: the MD's raw trace log (62 MiB, read only by the
+		 * vendor's modem logger), optional for the MD. Given, the MD
+		 * wrote sub-buffers across all of it; declined, nothing (a
+		 * pattern held over the whole window).
+		 */
+		return -1;
 	case DT_NETD_SHARE_MEMORY:
 		d[0] = NC_MD_VIEW + NC_NETD;
 		d[1] = 0x2000;
@@ -199,6 +202,7 @@ static int prepare(struct ccci_md *md, const struct md_query_ap_feature *q)
 			q->head_pattern, q->tail_pattern);
 		return -EINVAL;
 	}
+	dev_dbg(md->dev, "HS1: MD features %*phN\n", FEATURE_COUNT, q->feature_set);
 	for (i = 0; i < FEATURE_COUNT; i++) {
 		u8 sup;
 

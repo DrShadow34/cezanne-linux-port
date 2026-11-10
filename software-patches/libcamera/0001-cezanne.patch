@@ -1,3 +1,27 @@
+diff --git a/include/libcamera/internal/camera_lens.h b/include/libcamera/internal/camera_lens.h
+index f347c5e..28e0480 100644
+--- a/include/libcamera/internal/camera_lens.h
++++ b/include/libcamera/internal/camera_lens.h
+@@ -28,6 +28,7 @@ public:
+ 
+ 	int init();
+ 	int setFocusPosition(int32_t position);
++	void release();
+ 
+ 	const std::string &model() const { return model_; }
+ 
+diff --git a/include/libcamera/internal/egl.h b/include/libcamera/internal/egl.h
+index 1e31d49..e32cffa 100644
+--- a/include/libcamera/internal/egl.h
++++ b/include/libcamera/internal/egl.h
+@@ -103,6 +103,7 @@ public:
+ 	~eGL();
+ 
+ 	int initEGLContext();
++	void destroyContext();
+ 	static bool isAvailable();
+ 
+ 	int createInputDMABufTexture2D(eGLImage &eglImage, int fd);
 diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
 index 6772b43..00f5f8b 100644
 --- a/include/libcamera/internal/software_isp/debayer_params.h
@@ -444,32 +468,41 @@ index 49c1f26..ad2a2d9 100644
  } /* namespace ipa::soft::algorithms */
 diff --git a/src/ipa/simple/algorithms/af.cpp b/src/ipa/simple/algorithms/af.cpp
 new file mode 100644
-index 0000000..6e70d04
+index 0000000..6e069e5
 --- /dev/null
 +++ b/src/ipa/simple/algorithms/af.cpp
-@@ -0,0 +1,483 @@
+@@ -0,0 +1,565 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast-detection autofocus for the software ISP
 + *
 + * The statistics carry a grid of per-tile sharpness values (squared
 + * differences of neighbouring same-colour pixels) computed on every frame.
-+ * A scan moves the lens over its whole range in coarse steps, stops once the
-+ * sharpness has clearly passed a peak, then rescans around the best coarse
-+ * position in fine steps.  Every lens move waits kSettleFrames frames before
-+ * the next measurement: the move is issued after a frame was processed, so
-+ * the next frame is already being read out.
++ * A scan moves the lens over its whole range in coarse steps and keeps every
++ * tile's sharpness at every step.  Each metered tile whose sharpness clearly
++ * peaks votes for its sharpest step, weighted by how much it changed; the
++ * scan takes the nearest step with a fair share of the votes, then rescans
++ * around it in fine steps on the tiles that voted for it, each relative to
++ * its own peak.  A small, smooth subject in front of a busy background
++ * (a figure before blinds) has fewer and weaker tiles than the background,
++ * but it is what the tap or the centre of the frame meant, and the old
++ * single metric over the window peaked on the background.  Every lens move
++ * waits kSettleFrames frames before the next measurement: the move is issued
++ * after a frame was processed, so the next frame is already being read out.
 + *
-+ * The metric is normalised by the squared mean brightness of the metered
-+ * tiles so that exposure changes during a scan do not look like focus
-+ * changes.  Lens positions are reported in dioptres assuming a linear map of
-+ * the VCM range to 0 .. kMaxDioptres (uncalibrated).
++ * Sharpness is normalised by the squared mean brightness so that exposure
++ * changes during a scan do not look like focus changes.  The tuning file can
++ * give the lens codes of infinity focus ("infinity": where the lens lifts off
++ * its rest stop) and of the closest focus ("macro": its end stop); scans stay
++ * between them and lens positions are reported in dioptres on a linear map of
++ * that range to 0 .. kMaxDioptres (uncalibrated: no lens-specific scale).
 + */
 +
 +#include "af.h"
 +
 +#include <algorithm>
 +#include <cmath>
++#include <sstream>
 +
 +#include <libcamera/base/log.h>
 +
@@ -485,21 +518,23 @@ index 0000000..6e70d04
 +
 +constexpr unsigned int kSettleFrames = 4;
 +constexpr unsigned int kSettleFramesLong = 6;
-+constexpr unsigned int kCoarseSteps = 16;
++constexpr unsigned int kCoarseSteps = 12;
 +constexpr unsigned int kFineDivider = 4;
 +constexpr float kMaxDioptres = 12.0f;
 +/* stop the coarse scan after this many steps below kDropRatio * best */
 +constexpr unsigned int kDropSteps = 3;
 +constexpr double kDropRatio = 0.6;
-+/* a peak lower than this times the scan minimum: nothing to focus on */
-+constexpr double kMinPeakRatio = 1.15;
++/* a tile votes when its sharpness changed by this factor over the scan */
++constexpr double kMinTileRatio = 1.3;
++/* the nearest step with this share of the strongest (smoothed) vote wins */
++constexpr double kVoteShare = 0.3;
++/* tiles below this share of the average tile peak hold no detail */
++constexpr double kTileFloor = 0.02;
 +/* continuous mode: rescan after the metric stays this far off for a while */
 +constexpr double kChangeRatio = 0.5;
 +constexpr unsigned int kChangeFrames = 20;
 +/* first scan after start: let the AGC converge */
 +constexpr unsigned int kStartupFrames = 20;
-+/* local search: a step this much below the best counts as past the peak */
-+constexpr double kLocalDropRatio = 0.92;
 +/*
 + * The AGC raising the gain during a scan raises the noise in the sharpness
 + * measure: a dim macro scan climbed with the gain (9.8x -> 16x) to the far
@@ -510,21 +545,38 @@ index 0000000..6e70d04
 +constexpr double kEvSteady = 0.03;
 +constexpr unsigned int kEvStableFrames = 4;
 +constexpr unsigned int kEvMaxWaitFrames = 60;
-+/* window below this share of the frame's average contrast: whole frame */
-+constexpr double kMinWindowContrast = 0.25;
++
++/* a tile's sharpness over its squared brightness */
++double tileValue(const SwIspStats *stats, unsigned int i)
++{
++	double bright = static_cast<double>(stats->afBrightness[i]);
++	if (bright <= 0.0)
++		return 0.0;
++	return static_cast<double>(stats->afSharpness[i]) / (bright * bright) * 1e12;
++}
 +
 +} /* namespace */
 +
-+int Af::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningData)
++int Af::init(IPAContext &context, const ValueNode &tuningData)
 +{
 +	if (!context.lens.present) {
 +		LOG(IPASoftAf, Info) << "No focus lens, autofocus disabled";
 +		return 0;
 +	}
 +
-+	min_ = context.lens.min;
-+	max_ = context.lens.max;
-+	step_ = std::max<int32_t>((max_ - min_) / kCoarseSteps, 1);
++	/* the lens' travel: below and above it the codes do not move it */
++	min_ = std::clamp(tuningData["infinity"].get<int32_t>().value_or(context.lens.min),
++			  context.lens.min, context.lens.max);
++	max_ = std::clamp(tuningData["macro"].get<int32_t>().value_or(context.lens.max),
++			  context.lens.min, context.lens.max);
++	if (max_ <= min_) {
++		LOG(IPASoftAf, Error) << "Invalid lens range " << min_ << " .. " << max_;
++		min_ = context.lens.min;
++		max_ = context.lens.max;
++	}
++	/* rounded up: kCoarseSteps steps reach the end */
++	step_ = std::max<int32_t>((max_ - min_ + kCoarseSteps - 1) / kCoarseSteps, 1);
++	LOG(IPASoftAf, Debug) << "Lens range " << min_ << " .. " << max_;
 +
 +	context.ctrlMap[&controls::AfMode] =
 +		ControlInfo(controls::AfModeValues, controls::AfModeContinuous);
@@ -552,6 +604,7 @@ index 0000000..6e70d04
 +
 +	/* Same sensor mode (e.g. a still capture): keep the focus and mode */
 +	if (context.configuration.keepState) {
++		meterTiles();
 +		/* frame numbers restart with the new session */
 +		measureFrame_ = kSettleFramesLong;
 +		return 0;
@@ -561,6 +614,7 @@ index 0000000..6e70d04
 +	mode_ = controls::AfModeContinuous;
 +	windowsMetering_ = false;
 +	windows_.clear();
++	meterTiles();
 +
 +	context.activeState.af.position = context.lens.def;
 +	context.activeState.af.dirty = true;
@@ -604,9 +658,12 @@ index 0000000..6e70d04
 +				      << (windows_.empty() ? "" : " " + windows_[0].toString());
 +	}
 +
++	if (refocus)
++		meterTiles();
++
 +	/* a new metering area in continuous mode: refocus there */
 +	if (refocus && mode_ == controls::AfModeContinuous)
-+		startLocalScan(context);
++		startScan(context);
 +
 +	const auto &trigger = controls.get(controls::AfTrigger);
 +	if (trigger && mode_ == controls::AfModeAuto) {
@@ -623,14 +680,18 @@ index 0000000..6e70d04
 +	}
 +}
 +
-+/* Sharpness of the metered tiles, normalised by their mean brightness */
-+double Af::measure(const IPAContext &context, const SwIspStats *stats) const
++/*
++ * The metered tiles: a window's tiles and a ring of half weight around them
++ * (the window from a tap is small, the subject's outline is around it), else
++ * the centre third of the frame.
++ */
++void Af::meterTiles()
 +{
-+	constexpr unsigned int gw = SwIspStats::kAfGridWidth;
-+	constexpr unsigned int gh = SwIspStats::kAfGridHeight;
-+	std::vector<bool> use(SwIspStats::kAfGridSize, false);
++	constexpr int gw = SwIspStats::kAfGridWidth;
++	constexpr int gh = SwIspStats::kAfGridHeight;
 +	bool any = false;
 +
++	weights_.fill(0.0);
 +	if (windowsMetering_ && sensorSize_.width && sensorSize_.height) {
 +		for (const Rectangle &r : windows_) {
 +			if (r.width == 0 || r.height == 0)
@@ -639,42 +700,35 @@ index 0000000..6e70d04
 +			int y0 = std::clamp<int>(r.y * gh / sensorSize_.height, 0, gh - 1);
 +			int x1 = std::clamp<int>((r.x + r.width - 1) * gw / sensorSize_.width, 0, gw - 1);
 +			int y1 = std::clamp<int>((r.y + r.height - 1) * gh / sensorSize_.height, 0, gh - 1);
-+			for (int y = y0; y <= y1; y++)
-+				for (int x = x0; x <= x1; x++)
-+					use[y * gw + x] = any = true;
++			for (int y = std::max(y0 - 1, 0); y <= std::min(y1 + 1, gh - 1); y++) {
++				for (int x = std::max(x0 - 1, 0); x <= std::min(x1 + 1, gw - 1); x++) {
++					bool inside = x >= x0 && x <= x1 && y >= y0 && y <= y1;
++					double &w = weights_[y * gw + x];
++					w = std::max(w, inside ? 1.0 : 0.5);
++				}
++			}
++			any = true;
 +		}
 +	}
 +	if (!any) {
-+		/* centre third of the frame */
-+		for (unsigned int y = gh / 3; y < gh - gh / 3; y++)
-+			for (unsigned int x = gw / 3; x < gw - gw / 3; x++)
-+				use[y * gw + x] = true;
++		for (int y = gh / 3; y < gh - gh / 3; y++)
++			for (int x = gw / 3; x < gw - gw / 3; x++)
++				weights_[y * gw + x] = 1.0;
 +	}
++}
 +
-+	double sharp = 0.0, bright = 0.0, allSharp = 0.0, allBright = 0.0;
-+	unsigned int n = 0;
++/* Sharpness of the metered tiles, normalised by their mean brightness */
++double Af::measure(const SwIspStats *stats) const
++{
++	double sharp = 0.0, bright = 0.0;
++
 +	for (unsigned int i = 0; i < SwIspStats::kAfGridSize; i++) {
-+		allSharp += stats->afSharpness[i];
-+		allBright += stats->afBrightness[i];
-+		if (!use[i])
-+			continue;
-+		sharp += stats->afSharpness[i];
-+		bright += stats->afBrightness[i];
-+		n++;
-+	}
-+	/*
-+	 * A window with hardly any structure (plain surface in the middle of
-+	 * a close-up) measures noise: use the whole frame then.
-+	 */
-+	if (sharp < allSharp * n / SwIspStats::kAfGridSize * kMinWindowContrast) {
-+		sharp = allSharp;
-+		bright = allBright;
++		sharp += weights_[i] * stats->afSharpness[i];
++		bright += weights_[i] * stats->afBrightness[i];
 +	}
 +	if (bright <= 0.0)
 +		return 0.0;
 +
-+	/* relative within a scan: sharpness over the squared brightness */
-+	(void)context;
 +	return sharp / (bright * bright) * 1e12;
 +}
 +
@@ -686,37 +740,15 @@ index 0000000..6e70d04
 +	lastValue_ = 0.0;
 +	minValue_ = 0.0;
 +	drops_ = 0;
-+	local_ = false;
++	positions_.clear();
++	curves_.clear();
++	voters_.clear();
 +	remeasure_ = true;
 +	target_ = min_;
 +	measureFrame_ = 0;
 +	context.activeState.af.position = target_;
 +	context.activeState.af.dirty = true;
 +	LOG(IPASoftAf, Debug) << "Scan start";
-+}
-+
-+/*
-+ * A new metering window (tap to focus) usually needs a small lens move: climb
-+ * from the current position, towards infinity first, turn round if the first
-+ * step loses sharpness, and finish with a short fine scan.  About a third of a
-+ * full scan.
-+ */
-+void Af::startLocalScan(IPAContext &context)
-+{
-+	phase_ = Phase::Local;
-+	bestValue_ = 0.0;
-+	lastValue_ = 0.0;
-+	minValue_ = 0.0;
-+	drops_ = 0;
-+	localDrops_ = 0;
-+	local_ = true;
-+	reversed_ = false;
-+	dir_ = 1;
-+	target_ = std::clamp(context.activeState.af.position, min_, max_);
-+	localStart_ = target_;
-+	bestPos_ = target_;
-+	measureFrame_ = 0;
-+	LOG(IPASoftAf, Debug) << "Local scan from " << target_;
 +}
 +
 +void Af::moveTo(IPAContext &context, int32_t pos, uint32_t frame)
@@ -731,7 +763,7 @@ index 0000000..6e70d04
 +	measureFrame_ = frame + settle;
 +}
 +
-+void Af::scanStep(IPAContext &context, uint32_t frame, double value)
++void Af::scanStep(IPAContext &context, uint32_t frame, const SwIspStats *stats)
 +{
 +	/*
 +	 * The scan's first position comes from wherever the lens was (or from
@@ -745,78 +777,154 @@ index 0000000..6e70d04
 +		return;
 +	}
 +
++	if (phase_ == Phase::Coarse) {
++		TileValues values;
++		for (unsigned int i = 0; i < SwIspStats::kAfGridSize; i++)
++			values[i] = tileValue(stats, i);
++		positions_.push_back(target_);
++		curves_.push_back(values);
++		if (target_ < max_) {
++			moveTo(context, std::min(target_ + step_, max_), frame);
++			return;
++		}
++		vote(context, frame);
++		return;
++	}
++
++	/* Fine: the voters' sharpness, each relative to its own peak */
++	double value = 0.0;
++	for (const auto &[i, w] : voters_)
++		value += w * tileValue(stats, i);
++
 +	if (minValue_ == 0.0 || value < minValue_)
 +		minValue_ = value;
 +	if (value > bestValue_) {
 +		bestValue_ = value;
 +		bestPos_ = target_;
 +		drops_ = 0;
-+	} else if (value < bestValue_ * kDropRatio &&
-+		   !(phase_ == Phase::Fine && target_ < bestPos_)) {
-+		/* the fine scan climbs towards the coarse peak first */
++	} else if (value < bestValue_ * kDropRatio) {
 +		drops_++;
 +	}
 +	lastValue_ = value;
 +
-+	if (phase_ == Phase::Local) {
-+		bool worse = value < bestValue_ * kLocalDropRatio;
-+		if (worse)
-+			localDrops_++;
-+		else if (target_ == bestPos_)
-+			localDrops_ = 0;
-+		bool edge = (dir_ > 0 && target_ >= max_) ||
-+			    (dir_ < 0 && target_ <= min_);
-+		bool firstStepWorse = worse && bestPos_ == localStart_ && !reversed_;
-+		if (!(localDrops_ >= 2 || edge || firstStepWorse)) {
-+			moveTo(context, target_ + dir_ * step_, frame);
-+			return;
-+		}
-+		if (!reversed_ && bestPos_ == localStart_) {
-+			reversed_ = true;
-+			dir_ = -dir_;
-+			localDrops_ = 0;
-+			moveTo(context, localStart_ + dir_ * step_, frame);
-+			return;
-+		}
-+		/* fine scan over half a coarse step either side of the peak */
-+		phase_ = Phase::Fine;
-+		fineEnd_ = std::min(bestPos_ + step_ / 2, max_);
-+		drops_ = 0;
-+		moveTo(context, std::max(bestPos_ - step_ / 2, min_), frame);
-+		return;
-+	}
-+
-+	if (phase_ == Phase::Coarse) {
-+		bool done = target_ >= max_ || drops_ >= kDropSteps;
-+		if (!done) {
-+			moveTo(context, target_ + step_, frame);
-+			return;
-+		}
-+		/* fine scan around the coarse peak */
-+		phase_ = Phase::Fine;
-+		fineEnd_ = std::min(bestPos_ + step_, max_);
-+		drops_ = 0;
-+		moveTo(context, std::max(bestPos_ - step_, min_), frame);
-+		return;
-+	}
-+
-+	/* Fine */
 +	int32_t fineStep = std::max<int32_t>(step_ / kFineDivider, 1);
 +	if (target_ < fineEnd_ && drops_ < kDropSteps) {
-+		moveTo(context, target_ + fineStep, frame);
++		moveTo(context, std::min(target_ + fineStep, fineEnd_), frame);
 +		return;
 +	}
 +
-+	/* a local search only sees the top of the curve: no contrast check */
-+	phase_ = local_ || bestValue_ >= minValue_ * kMinPeakRatio
-+		 ? Phase::Focused : Phase::Failed;
++	phase_ = Phase::Focused;
 +	/* reference: measured once the lens is back at the peak */
 +	focusedValue_ = 0.0;
 +	changedFrames_ = 0;
 +	moveTo(context, bestPos_, frame);
-+	LOG(IPASoftAf, Debug)
-+		<< (phase_ == Phase::Focused ? "Focused" : "Failed")
-+		<< " at " << bestPos_ << ", value " << bestValue_;
++	LOG(IPASoftAf, Debug) << "Focused at " << bestPos_ << ", value " << bestValue_;
++}
++
++/*
++ * The coarse scan's vote: every metered tile whose sharpness peaked clearly
++ * (by kMinTileRatio over its lowest) votes for its sharpest step, with its
++ * metering weight times the log of that ratio; flat tiles (plain surfaces,
++ * noise) do not vote.  The nearest step (the highest code) that is a local
++ * maximum of the votes, smoothed over the neighbours, with kVoteShare of the
++ * strongest wins: a figure before a background gets fewer and weaker votes
++ * than the background but is in front of it.
++ */
++void Af::vote(IPAContext &context, uint32_t frame)
++{
++	const unsigned int n = positions_.size();
++	TileValues peak, low;
++	std::array<unsigned int, SwIspStats::kAfGridSize> at;
++	double mean = 0.0;
++
++	for (unsigned int i = 0; i < SwIspStats::kAfGridSize; i++) {
++		peak[i] = low[i] = curves_[0][i];
++		at[i] = 0;
++		for (unsigned int k = 1; k < n; k++) {
++			double v = curves_[k][i];
++			if (v > peak[i]) {
++				peak[i] = v;
++				at[i] = k;
++			}
++			low[i] = std::min(low[i], v);
++		}
++		mean += peak[i];
++	}
++	const double floor = std::max(kTileFloor * mean / SwIspStats::kAfGridSize, 1e-9);
++
++	TileValues strength{};
++	std::vector<double> votes(n, 0.0);
++	for (unsigned int i = 0; i < SwIspStats::kAfGridSize; i++) {
++		if (weights_[i] <= 0.0)
++			continue;
++		double ratio = (peak[i] + floor) / (low[i] + floor);
++		if (ratio < kMinTileRatio)
++			continue;
++		strength[i] = weights_[i] * std::log(ratio);
++		votes[at[i]] += strength[i];
++	}
++
++	std::vector<double> smooth(n);
++	double best = 0.0;
++	for (unsigned int k = 0; k < n; k++) {
++		smooth[k] = votes[k] + 0.5 * ((k > 0 ? votes[k - 1] : 0.0) +
++					      (k + 1 < n ? votes[k + 1] : 0.0));
++		best = std::max(best, smooth[k]);
++	}
++
++	std::ostringstream log;
++	for (unsigned int k = 0; k < n; k++)
++		log << " " << positions_[k] << ":" << votes[k];
++	LOG(IPASoftAf, Debug) << "Votes" << log.str();
++
++	if (best <= 0.0) {
++		/* nothing changed with the focus: the metered sum's best */
++		unsigned int top = 0;
++		double topValue = -1.0;
++		for (unsigned int k = 0; k < n; k++) {
++			double v = 0.0;
++			for (unsigned int i = 0; i < SwIspStats::kAfGridSize; i++)
++				v += weights_[i] * curves_[k][i];
++			if (v > topValue) {
++				topValue = v;
++				top = k;
++			}
++		}
++		phase_ = Phase::Failed;
++		bestPos_ = positions_[top];
++		focusedValue_ = 0.0;
++		changedFrames_ = 0;
++		moveTo(context, bestPos_, frame);
++		LOG(IPASoftAf, Debug) << "Failed, at " << bestPos_;
++		return;
++	}
++
++	unsigned int pick = 0;
++	for (unsigned int k = n; k-- > 0;) {
++		if (smooth[k] >= kVoteShare * best &&
++		    (k == 0 || smooth[k] >= smooth[k - 1]) &&
++		    (k + 1 == n || smooth[k] >= smooth[k + 1])) {
++			pick = k;
++			break;
++		}
++	}
++
++	voters_.clear();
++	for (unsigned int i = 0; i < SwIspStats::kAfGridSize; i++) {
++		if (strength[i] > 0.0 && at[i] + 1 >= pick && at[i] <= pick + 1)
++			voters_.emplace_back(i, strength[i] / std::max(peak[i], 1e-12));
++	}
++
++	/* fine scan over half a coarse step either side */
++	int32_t centre = positions_[pick];
++	phase_ = Phase::Fine;
++	bestValue_ = 0.0;
++	bestPos_ = centre;
++	minValue_ = 0.0;
++	drops_ = 0;
++	fineEnd_ = std::min(centre + step_ / 2, max_);
++	moveTo(context, std::max(centre - step_ / 2, min_), frame);
++	LOG(IPASoftAf, Debug) << "Picked " << centre << " (" << voters_.size() << " tiles)";
 +}
 +
 +void Af::process(IPAContext &context, const uint32_t frame,
@@ -827,8 +935,7 @@ index 0000000..6e70d04
 +		return;
 +
 +	/* a scan started from a request: let the first lens move settle */
-+	if (measureFrame_ == 0 &&
-+	    (phase_ == Phase::Local || phase_ == Phase::Coarse || phase_ == Phase::Fine))
++	if (measureFrame_ == 0 && (phase_ == Phase::Coarse || phase_ == Phase::Fine))
 +		measureFrame_ = frame + kSettleFramesLong;
 +
 +	double ev = frameContext.sensor.exposure * frameContext.sensor.gain;
@@ -838,8 +945,7 @@ index 0000000..6e70d04
 +		evStableFrames_ = 0;
 +	lastEv_ = ev;
 +
-+	bool scanning = phase_ == Phase::Local || phase_ == Phase::Coarse ||
-+			phase_ == Phase::Fine;
++	bool scanning = phase_ == Phase::Coarse || phase_ == Phase::Fine;
 +	if (scanning && frame >= measureFrame_ && bestValue_ == 0.0 &&
 +	    !context.activeState.af.holdAgc) {
 +		/* wait for the AGC (bounded) before the first step, then hold it */
@@ -854,7 +960,7 @@ index 0000000..6e70d04
 +		context.activeState.af.holdAgc = false;
 +
 +	if (stats->afValid && frame >= measureFrame_) {
-+		double value = measure(context, stats);
++		double value = measure(stats);
 +
 +		LOG(IPASoftAf, Debug)
 +			<< "pos " << target_ << " value " << value
@@ -862,10 +968,9 @@ index 0000000..6e70d04
 +			<< " gain " << frameContext.sensor.gain;
 +
 +		switch (phase_) {
-+		case Phase::Local:
 +		case Phase::Coarse:
 +		case Phase::Fine:
-+			scanStep(context, frame, value);
++			scanStep(context, frame, stats);
 +			break;
 +		case Phase::Focused:
 +		case Phase::Failed:
@@ -894,7 +999,6 @@ index 0000000..6e70d04
 +
 +	int32_t state;
 +	switch (phase_) {
-+	case Phase::Local:
 +	case Phase::Coarse:
 +	case Phase::Fine:
 +		state = controls::AfStateScanning;
@@ -917,7 +1021,9 @@ index 0000000..6e70d04
 +{
 +	if (max_ <= min_)
 +		return 0.0f;
-+	return static_cast<float>(pos - min_) * kMaxDioptres / (max_ - min_);
++	/* codes below the lens' travel focus at infinity as well */
++	return std::clamp(static_cast<float>(pos - min_) * kMaxDioptres / (max_ - min_),
++			  0.0f, kMaxDioptres);
 +}
 +
 +int32_t Af::position(float d) const
@@ -933,10 +1039,10 @@ index 0000000..6e70d04
 +} /* namespace libcamera */
 diff --git a/src/ipa/simple/algorithms/af.h b/src/ipa/simple/algorithms/af.h
 new file mode 100644
-index 0000000..3690e91
+index 0000000..9c1397f
 --- /dev/null
 +++ b/src/ipa/simple/algorithms/af.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,92 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Contrast-detection autofocus for the software ISP
@@ -944,6 +1050,8 @@ index 0000000..3690e91
 +
 +#pragma once
 +
++#include <array>
++#include <utility>
 +#include <vector>
 +
 +#include <libcamera/geometry.h>
@@ -971,20 +1079,22 @@ index 0000000..3690e91
 +		     ControlList &metadata) override;
 +
 +private:
++	using TileValues = std::array<double, SwIspStats::kAfGridSize>;
++
 +	enum class Phase {
 +		Idle,		/* manual, or auto mode before a trigger */
-+		Local,		/* hill climb from the current position */
-+		Coarse,		/* full range, large steps */
-+		Fine,		/* around the coarse peak, small steps */
++		Coarse,		/* whole range, large steps, every tile kept */
++		Fine,		/* around the voted position, small steps */
 +		Focused,
 +		Failed,
 +	};
 +
-+	double measure(const IPAContext &context, const SwIspStats *stats) const;
++	void meterTiles();
++	double measure(const SwIspStats *stats) const;
 +	void startScan(IPAContext &context);
-+	void startLocalScan(IPAContext &context);
 +	void moveTo(IPAContext &context, int32_t position, uint32_t frame);
-+	void scanStep(IPAContext &context, uint32_t frame, double value);
++	void scanStep(IPAContext &context, uint32_t frame, const SwIspStats *stats);
++	void vote(IPAContext &context, uint32_t frame);
 +	float dioptres(int32_t position) const;
 +	int32_t position(float dioptres) const;
 +
@@ -996,6 +1106,7 @@ index 0000000..3690e91
 +	bool windowsMetering_ = false;
 +	std::vector<Rectangle> windows_;
 +	Size sensorSize_;
++	TileValues weights_{};	/* metered tiles: window (+ a ring) or centre */
 +
 +	Phase phase_ = Phase::Idle;
 +	int32_t target_ = 0;
@@ -1010,12 +1121,12 @@ index 0000000..3690e91
 +	double minValue_ = 0.0;
 +	unsigned int drops_ = 0;
 +	int32_t fineEnd_ = 0;
-+	int32_t localStart_ = 0;
-+	int32_t dir_ = 1;
-+	bool reversed_ = false;
 +	bool remeasure_ = false;
-+	bool local_ = false;	/* the scan started as Local */
-+	unsigned int localDrops_ = 0;
++	/* coarse scan: positions and every tile's sharpness there */
++	std::vector<int32_t> positions_;
++	std::vector<TileValues> curves_;
++	/* fine scan: the voters for the chosen position, weight / own peak */
++	std::vector<std::pair<unsigned int, double>> voters_;
 +
 +	double focusedValue_ = 0.0;	/* continuous mode: reference after a scan */
 +	unsigned int changedFrames_ = 0;
@@ -1701,8 +1812,111 @@ index 629e1a3..a334732 100644
  	}
  
  	ControlList ctrls(sensorInfoMap_);
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index ccc2a6a..a2ac63b 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -73,6 +73,16 @@ int CameraLens::init()
+ 		return ret;
+ 
+ 	model_ = subdev_->model();
++
++	/*
++	 * Lens drivers power the actuator while their subdev is open
++	 * (dw9719: from open() to close()); a camera manager that only
++	 * enumerates (a PipeWire monitor, all the time) would keep it powered,
++	 * and system sleep then drives the lens down and back up on every
++	 * suspend. The subdev is opened again on the first move.
++	 */
++	subdev_->close();
++
+ 	return 0;
+ }
+ 
+@@ -81,11 +91,18 @@ int CameraLens::init()
+  * \param[in] position The focal point of the lens
+  *
+  * This function sets the value of focal point of the lens as in \a position.
++ * The lens subdev is opened (the actuator powered) if needed, until release().
+  *
+- * \return 0 on success or -EINVAL otherwise
++ * \return 0 on success or a negative error code otherwise
+  */
+ int CameraLens::setFocusPosition(int32_t position)
+ {
++	if (!subdev_->isOpen()) {
++		int ret = subdev_->open();
++		if (ret < 0)
++			return ret;
++	}
++
+ 	ControlList lensCtrls(subdev_->controls());
+ 	lensCtrls.set(V4L2_CID_FOCUS_ABSOLUTE, static_cast<int32_t>(position));
+ 
+@@ -95,6 +112,16 @@ int CameraLens::setFocusPosition(int32_t position)
+ 	return 0;
+ }
+ 
++/**
++ * \brief Close the lens subdev until the next setFocusPosition()
++ *
++ * Lets the driver power the actuator down once the camera stops.
++ */
++void CameraLens::release()
++{
++	subdev_->close();
++}
++
+ int CameraLens::validateLensDriver()
+ {
+ 	int ret = 0;
+diff --git a/src/libcamera/egl.cpp b/src/libcamera/egl.cpp
+index 7ec7a65..ff10a60 100644
+--- a/src/libcamera/egl.cpp
++++ b/src/libcamera/egl.cpp
+@@ -180,7 +180,14 @@ int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, bool output)
+ 		drm_format = DRM_FORMAT_R8;
+ 		break;
+ 	case GL_RG:
+-		drm_format = DRM_FORMAT_RG88;
++		/*
++		 * GL_RG: R is the first byte (the low byte of a 16-bit
++		 * sample), as the CPU upload gives it: DRM GR88. Panfrost
++		 * rejects RG88 at any pitch, which sent every 16-bit Bayer
++		 * frame through the CPU upload (a 32 MB copy per frame on
++		 * the main camera).
++		 */
++		drm_format = DRM_FORMAT_GR88;
+ 		break;
+ 	case GL_RGBA:
+ 		drm_format = DRM_FORMAT_ARGB8888;
+@@ -462,6 +469,24 @@ fail:
+ 	return -ENODEV;
+ }
+ 
++/**
++ * \brief Destroy the EGL context
++ *
++ * Releases the context from the calling thread and destroys it, with all the
++ * GL objects it still holds. initEGLContext() creates a new one.
++ */
++void eGL::destroyContext()
++{
++	if (context_ == EGL_NO_CONTEXT)
++		return;
++
++	ASSERT(tid_ == Thread::currentId());
++
++	eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++	eglDestroyContext(display_, context_);
++	context_ = EGL_NO_CONTEXT;
++}
++
+ /**
+  * \brief Make the EGL context current for the calling thread
+  *
 diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
-index e26f438..7c7ac9d 100644
+index e26f438..fb3a39c 100644
 --- a/src/libcamera/pipeline/simple/simple.cpp
 +++ b/src/libcamera/pipeline/simple/simple.cpp
 @@ -7,6 +7,7 @@
@@ -1957,7 +2171,18 @@ index e26f438..7c7ac9d 100644
  	}
  }
  
-@@ -1760,7 +1838,7 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+@@ -1731,6 +1809,10 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
+ 	data->clearIncompleteRequests();
+ 	data->conversionBuffers_.clear();
+ 
++	/* the focus actuator powers down while no camera streams */
++	if (CameraLens *lens = data->sensor_->focusLens())
++		lens->release();
++
+ 	releasePipeline(data);
+ }
+ 
+@@ -1760,7 +1842,7 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
  
  	data->frameInfo_.create(request, metadataRequired);
  	if (data->useConversion_) {
@@ -1966,7 +2191,7 @@ index e26f438..7c7ac9d 100644
  		if (data->swIsp_)
  			data->swIsp_->queueRequest(request->sequence(), request->controls());
  	}
-@@ -1880,16 +1958,6 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+@@ -1880,16 +1962,6 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
  		}
  	}
  
@@ -1983,7 +2208,7 @@ index e26f438..7c7ac9d 100644
  	swIspEnabled_ = info.swIspEnabled;
  	const GlobalConfiguration &configuration = cameraManager()->_d()->configuration();
  	for (const ValueNode &entry :
-@@ -1905,6 +1973,16 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+@@ -1905,6 +1977,16 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
  		}
  	}
  
@@ -2297,7 +2522,7 @@ index 28f1b85..425b579 100644
  private:
  	virtual Size patternSize(PixelFormat inputFormat) = 0;
 diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
-index 02651fe..ed4de86 100644
+index 02651fe..fef766f 100644
 --- a/src/libcamera/software_isp/debayer_egl.cpp
 +++ b/src/libcamera/software_isp/debayer_egl.cpp
 @@ -11,6 +11,7 @@
@@ -2492,6 +2717,25 @@ index 02651fe..ed4de86 100644
  		stats_->finishFrame(frame, 0);
  	} else {
  		if (!inMapped) {
+@@ -698,6 +786,18 @@ void DebayerEGL::stop()
+ 
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
++	programId_ = 0;
++
++	/*
++	 * start() creates a new context: destroy this one with whatever it
++	 * still holds, and forget its object names. One context leaked per
++	 * stream restart (~130 MB of GPU memory per picture, two restarts),
++	 * and after a few restarts the viewfinder showed old frames and
++	 * black bands.
++	 */
++	lscTexture_ = 0;
++	lscTexels_.clear();
++	egl_.destroyContext();
+ }
+ 
+ SizeRange DebayerEGL::sizes(PixelFormat inputFormat, const Size &inputSize)
 diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
 index d6223f3..17d8429 100644
 --- a/src/libcamera/software_isp/debayer_egl.h

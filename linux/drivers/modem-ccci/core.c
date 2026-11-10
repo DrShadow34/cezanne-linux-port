@@ -161,7 +161,8 @@ static int md_power_on(struct ccci_md *md)
  * BSP clear_smem_region() for a first boot: everything but the regions the
  * MD keeps (CCB control, audio, MD-CONSYS, USIP). Done on every boot: a
  * restart with only the vendor's restart set cleared times out in HS1. The
- * CCB control headers are written afresh by ccb_ctrl_init().
+ * CCB control headers are written afresh by ccb_ctrl_init(). DFD lies
+ * beyond the mapped part of the non-cached window: mapped for the clear.
  */
 static void clear_smem(struct ccci_md *md)
 {
@@ -170,18 +171,22 @@ static void clear_smem(struct ccci_md *md)
 		{ NC_NETD, NC_AUDIO - NC_NETD },	/* NETD, USB */
 		{ NC_CCISM_MCU, NC_CCISM_MCU_EXP + NC_CCISM_MCU_EXP_SIZE - NC_CCISM_MCU },
 		{ NC_WIFI_PROXY, 0x8000 },
-		{ NC_DFD, NC_DFD_SIZE },
 	}, c[] = {
 		{ C_NVRAM_CACHE, 0x700000 },
 		{ C_CCB_DHL, C_RAW_DHL - C_CCB_DHL },
-		{ C_RAW_DHL, C_USIP - C_RAW_DHL },
 	};
+	void *dfd;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(nc); i++)
 		memset(md->nc + nc[i].off, 0, nc[i].size);
 	for (i = 0; i < ARRAY_SIZE(c); i++)
 		memset(md->c + c[i].off, 0, c[i].size);
+	dfd = memremap(NC_PHYS + NC_DFD, NC_DFD_SIZE, MEMREMAP_WC);
+	if (dfd) {
+		memset(dfd, 0, NC_DFD_SIZE);
+		memunmap(dfd);
+	}
 	wmb();
 }
 
@@ -525,8 +530,8 @@ static int ccci_probe(struct platform_device *pdev)
 	md->pericfg = devm_ioremap(dev, PERICFG_PHYS, 0x1000);
 	md->ccif4 = devm_ioremap(dev, CCIF4_MD_PHYS, 0x1000);
 	md->ccif5 = devm_ioremap(dev, CCIF5_MD_PHYS, 0x1000);
-	md->nc = devm_memremap(dev, NC_PHYS, NC_SIZE, MEMREMAP_WC);
-	md->c = devm_memremap(dev, C_PHYS, C_SIZE, MEMREMAP_WC);
+	md->nc = devm_memremap(dev, NC_PHYS, NC_MAPPED, MEMREMAP_WC);
+	md->c = devm_memremap(dev, C_PHYS, C_MAPPED, MEMREMAP_WC);
 	if (!md->ccif_ap || !md->ccif_md || !md->infra || !md->spm ||
 	    !md->pericfg || !md->ccif4 || !md->ccif5 ||
 	    IS_ERR(md->nc) || IS_ERR(md->c))

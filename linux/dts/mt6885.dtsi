@@ -989,10 +989,15 @@
 			alloc-ranges = <0 0x40000000 0 0x80000000>;
 		};
 
+		/*
+		 * gen4m carves its rings and buffers out of it once at probe
+		 * (halAllocHifMem: 0x9fb2fc used on soc3_0, nothing later; the
+		 * BSP size was 0xf20000). Power-of-two chunks: 8 M + 2 M + 256 K.
+		 */
 		wifi_mem: wifi-reserve-memory {
 			compatible = "shared-dma-pool";
 			no-map;
-			size = <0 0xf20000>;
+			size = <0 0xa40000>;
 			alignment = <0 0x1000000>;
 			alloc-ranges = <0 0x40000000 0 0x80000000>;
 		};

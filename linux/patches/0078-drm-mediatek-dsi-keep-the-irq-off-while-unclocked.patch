@@ -1,0 +1,53 @@
+diff --git a/drivers/gpu/drm/mediatek/mtk_dsi.c b/drivers/gpu/drm/mediatek/mtk_dsi.c
+--- a/drivers/gpu/drm/mediatek/mtk_dsi.c
++++ b/drivers/gpu/drm/mediatek/mtk_dsi.c
+@@ -242,6 +242,8 @@
+ 	int refcount;
+ 	bool enabled;
+ 	bool lanes_ready;
++	/* enabled only while the engine is clocked (mtk_dsi_poweroff) */
++	int irq;
+ 	u32 irq_data;
+ 	wait_queue_head_t irq_wait_queue;
+ 	const struct mtk_dsi_driver_data *driver_data;
+@@ -899,6 +901,9 @@
+ 		mtk_dsi_set_vm_cmd(dsi);
+ 		mtk_dsi_config_vdo_timing(dsi);
+ 	}
++	/* the engine is clocked again: its interrupt can be acked */
++	writel(0, dsi->regs + DSI_INTSTA);
++	enable_irq(dsi->irq);
+ 	mtk_dsi_set_interrupt_enable(dsi);
+ 
+ 	return 0;
+@@ -941,6 +946,18 @@
+ 	/* set the lane number as 0 to pull down mipi */
+ 	writel(0, dsi->regs + DSI_TXRX_CTRL);
+ 
++	/*
++	 * Nothing may stay pending once the clocks go: the handler can't ack
++	 * an unclocked engine, and the level line then keeps CPU0 in
++	 * mtk_dsi_irq() (a TE latched just before the gate: ~900k IRQs/s
++	 * through system suspend until the noirq phase, or an RCU stall
++	 * panic after 21 s). Mask and ack it all, and keep the line off
++	 * until the next power on.
++	 */
++	writel(0, dsi->regs + DSI_INTEN);
++	writel(0, dsi->regs + DSI_INTSTA);
++	disable_irq(dsi->irq);
++
+ 	mtk_dsi_disable(dsi);
+ 
+ 	clk_disable_unprepare(dsi->engine_clk);
+@@ -1756,8 +1773,10 @@
+ 	if (ret < 0)
+ 		return dev_err_probe(dev, ret, "Failed to register DSI host\n");
+ 
++	dsi->irq = irq_num;
+ 	ret = devm_request_irq(&pdev->dev, irq_num, mtk_dsi_irq,
+-			       IRQF_TRIGGER_NONE, dev_name(&pdev->dev), dsi);
++			       IRQF_TRIGGER_NONE | IRQF_NO_AUTOEN,
++			       dev_name(&pdev->dev), dsi);
+ 	if (ret) {
+ 		mipi_dsi_host_unregister(&dsi->host);
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to request DSI irq\n");

@@ -1920,7 +1920,7 @@ index 7209cb5..56f3722 100644
      let bin = gst::Bin::new();
  
 diff --git a/data/org.gnome.Snapshot.gschema.xml.in b/data/org.gnome.Snapshot.gschema.xml.in
-index 21d605f..5fa7ae2 100644
+index 21d605f..a6b874d 100644
 --- a/data/org.gnome.Snapshot.gschema.xml.in
 +++ b/data/org.gnome.Snapshot.gschema.xml.in
 @@ -7,6 +7,7 @@
@@ -2010,7 +2010,7 @@ index 21d605f..5fa7ae2 100644
 +      <range min="0" max="12"/>
 +      <default>2.0</default>
 +      <summary>Manual Focus Position</summary>
-+      <description>The lens position for manual focus in dioptres, 0 being infinity (uncalibrated: a linear map of the focus motor's range)</description>
++      <description>The lens position for manual focus in dioptres, 0 being infinity and 12 the closest focus (approximate: a linear map of the lens' travel from the camera tuning)</description>
 +    </key>
 +    <key name="save-raw" type="b">
 +      <default>false</default>

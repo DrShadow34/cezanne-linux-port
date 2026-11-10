@@ -27,7 +27,7 @@
 pkgname=linux-cezanne
 _kver=7.3.1
 pkgver=$_kver
-pkgrel=15
+pkgrel=25
 pkgdesc="Mainline Linux for the Redmi K30 Ultra (cezanne, MT6885): kernel, modules, boot image"
 arch=(aarch64)
 url="https://github.com/DrShadow34/cezanne-linux-port"

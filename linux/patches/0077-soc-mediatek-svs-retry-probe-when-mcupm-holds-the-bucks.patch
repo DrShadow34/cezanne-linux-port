@@ -1,0 +1,55 @@
+diff --git a/drivers/soc/mediatek/mtk-svs.c b/drivers/soc/mediatek/mtk-svs.c
+--- a/drivers/soc/mediatek/mtk-svs.c
++++ b/drivers/soc/mediatek/mtk-svs.c
+@@ -3293,6 +3293,42 @@
+ };
+ MODULE_DEVICE_TABLE(of, svs_of_match);
+ 
++/*
++ * MT6885: early in boot MCUPM can keep the CPU bucks at lk's 1.0 V for
++ * seconds (init01 then reads the buck above vboot and fails with -EPERM);
++ * the same probe a few seconds later works. Retry it instead of leaving
++ * the banks untrimmed: 10, 20, 40 and 80 s after each failure.
++ */
++#define SVS_PROBE_RETRIES	4
++#define SVS_PROBE_RETRY_MS	10000
++
++static unsigned int svs_probe_retries;
++static struct device *svs_retry_dev;
++
++static void svs_probe_retry(struct work_struct *work)
++{
++	struct device *dev = svs_retry_dev;
++
++	svs_retry_dev = NULL;
++	if (device_attach(dev) > 0)
++		dev_info(dev, "probe retry %u succeeded\n", svs_probe_retries);
++	put_device(dev);
++}
++
++static DECLARE_DELAYED_WORK(svs_probe_retry_work, svs_probe_retry);
++
++static void svs_schedule_probe_retry(struct device *dev)
++{
++	unsigned int ms = SVS_PROBE_RETRY_MS << svs_probe_retries;
++
++	if (svs_retry_dev || svs_probe_retries >= SVS_PROBE_RETRIES)
++		return;
++	svs_retry_dev = get_device(dev);
++	svs_probe_retries++;
++	dev_info(dev, "retrying the probe in %u s\n", ms / 1000);
++	schedule_delayed_work(&svs_probe_retry_work, msecs_to_jiffies(ms));
++}
++
+ static int svs_probe(struct platform_device *pdev)
+ {
+ 	struct svs_platform *svsp;
+@@ -3375,6 +3411,8 @@
+ 	ret = svs_start(svsp);
+ 	if (ret) {
+ 		dev_err_probe(svsp->dev, ret, "svs start fail\n");
++		if (ret == -EPERM)
++			svs_schedule_probe_retry(svsp->dev);
+ 		goto svs_probe_iounmap;
+ 	}
+ 

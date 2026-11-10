@@ -3,7 +3,7 @@ Description=Panel high brightness mode in sunlight (cezanne)
 After=iio-sensor-proxy.service
 
 [Service]
-ExecStart=/usr/bin/python3 /usr/local/lib/cezanne/sunlight-boost.py
+ExecStart=/usr/local/lib/cezanne/sunlight-boost
 Restart=on-failure
 
 [Install]

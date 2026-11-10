@@ -3,28 +3,32 @@
 # GPS + BeiDou fixes served as NMEA to GeoClue. Needs the DSP images
 # gnss-l1.bin / gnss-l5.bin in /usr/lib/firmware/mediatek/cezanne
 # (mainline/gnss/tools/extract-dsp.py, from the stock firmware) and network
-# for the broadcast orbits (IGS, BKG mirror).
+# for the broadcast orbits (IGS, BKG mirror). The service is C (gnss*.c,
+# cezanne-gnssd.c); cezanne_gnss/ here is the Python reference the tools in
+# mainline/gnss/tools import (not installed).
 pkgname=cezanne-gnss
 pkgver=1.0
-pkgrel=20
+pkgrel=22
 pkgdesc="GNSS receiver for the cezanne (NMEA for GeoClue)"
-arch=(any)
+arch=(aarch64)
 license=(MIT)
-depends=(python python-numpy geoclue)
+depends=(glib2 json-glib curl zlib geoclue)
 backup=(etc/geoclue/conf.d/90-cezanne-gnss.conf etc/cezanne-gnss.conf)
-source=(cezanne-gnssd
+source=(cezanne-gnssd.c gnss.h gnss-orbits.c gnss-nav.c gnss-dsp.c gnss-receiver.c
         cezanne-gnss.service
         cezanne-gnss.conf
         90-cezanne-gnss.conf)
-sha256sums=(SKIP SKIP SKIP SKIP)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP)
+
+build() {
+  # resident: C, not Python + numpy (~2 instead of ~30 MiB)
+  cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -o cezanne-gnssd cezanne-gnssd.c gnss-orbits.c \
+    gnss-nav.c gnss-dsp.c gnss-receiver.c \
+    $(pkg-config --cflags --libs json-glib-1.0 libcurl zlib) -lpthread -lm
+}
 
 package() {
   install -Dm755 cezanne-gnssd "$pkgdir/usr/bin/cezanne-gnssd"
-  # the module directory sits next to this PKGBUILD (makepkg only takes
-  # local sources by their file name)
-  for f in "$startdir"/cezanne_gnss/*.py; do
-    install -Dm644 "$f" "$pkgdir/usr/lib/cezanne-gnss/cezanne_gnss/${f##*/}"
-  done
   install -Dm644 cezanne-gnss.service "$pkgdir/usr/lib/systemd/system/cezanne-gnss.service"
   install -Dm644 90-cezanne-gnss.conf "$pkgdir/etc/geoclue/conf.d/90-cezanne-gnss.conf"
   install -Dm644 cezanne-gnss.conf "$pkgdir/etc/cezanne-gnss.conf"

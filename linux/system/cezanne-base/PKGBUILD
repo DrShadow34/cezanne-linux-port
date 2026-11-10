@@ -6,18 +6,37 @@
 # 2026-11-08), firmware (cezanne-firmware), kernel modules (linux-cezanne),
 # installation-specific files (fstab, locale.conf), device state (/var/lib).
 # The version is the build time: cezanne-build rebuilds when the tree changes.
+# The resident daemons are C (c/, built here): ~1 MiB each instead of
+# 7-22 MiB for a Python interpreter.
 pkgname=cezanne-base
 pkgver=0
 pkgrel=1
 pkgdesc="Redmi K30 Ultra (cezanne) system integration: configs, units, udev rules, scripts"
-arch=(any)
+arch=(aarch64)
 url="https://github.com/DrShadow34/cezanne-linux-port"
 license=(GPL-2.0-or-later)
-depends=(systemd python dconf gnome-shell plymouth btrfs-progs compsize)
+depends=(systemd python dconf gnome-shell plymouth btrfs-progs compsize glib2 alsa-lib)
 install=cezanne-base.install
 
 pkgver() {
   date -u +%Y%m%d.%H%M%S
+}
+
+# c/NAME.c -> install path
+_cbins=(cezanne-popupd:usr/local/bin cezanne-dcharge:usr/local/bin
+        cezanne-amp-usecase:usr/local/bin sunlight-boost:usr/local/lib/cezanne)
+
+build() {
+  local b
+  for b in "${_cbins[@]}"; do
+    b=${b%%:*}
+    cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -o "$b" "$startdir/c/$b.c" \
+      $(case $b in
+          cezanne-amp-usecase) echo -lasound ;;
+          sunlight-boost) pkg-config --cflags --libs gio-2.0 ;;
+          *) echo -lm ;;
+        esac)
+  done
 }
 
 # installation-specific, owned by other packages, or not shipped
@@ -40,6 +59,10 @@ package() {
       install -Dm"$mode" "$f" "$pkgdir/$f"
     fi
   done < <(find ./etc ./usr \( -type f -o -type l \) -print0)
+
+  for b in "${_cbins[@]}"; do
+    install -Dm755 "$srcdir/${b%%:*}" "$pkgdir/${b#*:}/${b%%:*}"
+  done
 
   # units enabled on the first install (systemctl preset in the .install)
   install -d "$pkgdir/usr/lib/systemd/system-preset"

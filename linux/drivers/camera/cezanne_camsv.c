@@ -44,16 +44,20 @@
  */
 #include <linux/clk.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
+#include <linux/suspend.h>
 #include <media/media-device.h>
 #include <media/v4l2-async.h>
 #include <media/v4l2-device.h>
@@ -98,6 +102,9 @@ struct cam_reg { u32 ofs, val; };
 #define   INT_ERRORS		(INT_TG_ERR | INT_TG_GBERR | INT_IMGO_ERR | \
 				 INT_IMGO_OVERRUN)
 #define CAMSV_SW_CTL		0x0020
+#define   SW_RST_TRIG		BIT(0)	/* DMA reset request */
+#define   SW_RST_ST		BIT(1)	/* set: the DMA is idle (vendor kernel) */
+#define   SW_HW_RST		BIT(2)
 #define CAMSV_IMGO_FBC		0x002c	/* bit 0: RCNT_INC */
 #define CAMSV_CLK_EN		0x0030
 #define CAMSV_PAK		0x004c	/* [4:0] mode; [6:5] px mode */
@@ -110,6 +117,9 @@ struct cam_reg { u32 ofs, val; };
 #define CAMSV_TG_GRAB_PXL	0x0138
 #define CAMSV_TG_GRAB_LIN	0x013c
 #define CAMSV_TG_PATH_CFG	0x0140
+#define CAMSV_TG_INTER_ST	0x016c
+#define   TG_STATE		GENMASK(13, 8)
+#define   TG_STATE_IDLE		0x100
 #define CAMSV_IMGO_BASE		0x0420
 #define CAMSV_IMGO_BASE_MSB	0x0424
 #define CAMSV_IMGO_OFST		0x0428
@@ -230,6 +240,7 @@ struct cam_chan {
 	int irq;
 	bool powered;
 	bool raw8;		/* the 8-bit format is selected */
+	bool paused;		/* streaming, halted for system sleep */
 
 	struct video_device vdev;
 	struct media_pad vpad;
@@ -269,6 +280,8 @@ struct cezanne_cam {
 	int num_clks;
 	struct mutex power_lock;	/* power_count, engine_owner, seninf */
 	int power_count;
+	bool sleeping;			/* a system suspend is under way */
+	struct notifier_block pm_nb;
 	struct cam_chan *engine_owner[CAM_NUM_CAMSV];
 	struct dentry *debugfs;
 
@@ -549,13 +562,40 @@ static void cam_hw_setup(struct cam_chan *ch)
 	writel(FBC_EN | BIT(10) | FBC_MODE, sv + CAMSV_FBC_IMGO_CTL1);
 }
 
+/*
+ * The vendor's order (libimageio_plat_drv.so CAMSV_TG_CTRL / CAMSV_TOP_CTRL
+ * ::_disable): VF off, the TG idle once the frame in progress has ended
+ * (the sensor still streaming; 1-33 ms measured), then the DMA reset
+ * handshake (SW_RST_ST was always set at once: the DMA idle). Before, the
+ * sensor went off first and the enables were just cleared. Process
+ * context: the TG wait lasts up to a frame.
+ */
 static void cam_hw_stop(struct cam_chan *ch)
 {
 	void __iomem *sv = ch->camsv;
+	ktime_t t0 = ktime_get();
+	s64 tg_us;
+	u32 st, rst;
 
-	writel(0, sv + CAMSV_TG_VF_CON);
-	writel(0, sv + CAMSV_TG_SEN_MODE);
 	writel(0, sv + CAMSV_INT_EN);
+	readl(sv + CAMSV_INT_STATUS);
+	writel(0, sv + CAMSV_TG_VF_CON);
+	if (readl_poll_timeout(sv + CAMSV_TG_INTER_ST, st,
+			       (st & TG_STATE) == TG_STATE_IDLE, 1000, 500000))
+		dev_warn(ch->cam->dev, "%s: TG not idle (%#x)\n",
+			 ch->cfg->name, st);
+	tg_us = ktime_us_delta(ktime_get(), t0);
+	writel(0, sv + CAMSV_TG_SEN_MODE);
+	writel(0, sv + CAMSV_SW_CTL);
+	writel(SW_RST_TRIG, sv + CAMSV_SW_CTL);
+	rst = readl(sv + CAMSV_SW_CTL);
+	if (readl_poll_timeout(sv + CAMSV_SW_CTL, st, st & SW_RST_ST, 10, 10000))
+		dev_warn(ch->cam->dev, "%s: DMA reset timeout (%#x)\n",
+			 ch->cfg->name, st);
+	dev_dbg(ch->cam->dev, "%s: stop: TG idle after %lld us, SW_CTL %#x -> %#x\n",
+		ch->cfg->name, tg_us, rst, st);
+	writel(SW_HW_RST, sv + CAMSV_SW_CTL);
+	writel(0, sv + CAMSV_SW_CTL);
 	writel(MODULE_DEFAULT, sv + CAMSV_MODULE_EN);
 	writel(0, sv + CAMSV_FBC_IMGO_CTL1);
 	readl(sv + CAMSV_INT_STATUS);
@@ -674,30 +714,27 @@ static void cam_set_streaming(struct cam_chan *ch, bool on)
 	cam_notify_streaming(ch);
 }
 
-static int cam_start_streaming(struct vb2_queue *q, unsigned int count)
+/*
+ * CAMSV stopped (the frame in progress still arrives), the interrupt
+ * handler done with the channel, then the sensor off.
+ */
+static void cam_halt(struct cam_chan *ch)
 {
-	struct cam_chan *ch = vb2_get_drv_priv(q);
+	cam_set_streaming(ch, false);
+	cam_hw_stop(ch);
+	synchronize_irq(ch->irq);
+	v4l2_subdev_call(ch->sensor, video, s_stream, 0);
+}
+
+/* CAMSV set up with the first queued buffer, then the sensor; powered. */
+static int cam_run(struct cam_chan *ch)
+{
 	unsigned long flags;
 	int ret;
-
-	if (!ch->sensor) {
-		ret = -ENODEV;
-		goto err_return;
-	}
-	ret = cam_claim_engine(ch);
-	if (ret)
-		goto err_return;
-	ret = video_device_pipeline_start(&ch->vdev, &ch->pipe);
-	if (ret)
-		goto err_return;
-	ret = cam_power(ch, true);
-	if (ret)
-		goto err_pipeline;
 
 	cam_hw_setup(ch);
 	spin_lock_irqsave(&ch->irqlock, flags);
 	ch->wcnt = readl(ch->camsv + CAMSV_FBC_IMGO_CTL2) >> 8;
-	ch->sequence = 0;
 	ch->errors = 0;
 	ch->latch_pending = false;
 	ch->skip = 1;
@@ -711,16 +748,47 @@ static int cam_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret) {
 		dev_err(ch->cam->dev, "%s: sensor stream on: %d\n",
 			ch->cfg->name, ret);
-		goto err_hw;
+		cam_set_streaming(ch, false);
+		cam_hw_stop(ch);
 	}
+	return ret;
+}
+
+static int cam_start_streaming(struct vb2_queue *q, unsigned int count)
+{
+	struct cam_chan *ch = vb2_get_drv_priv(q);
+	int ret;
+
+	if (!ch->sensor) {
+		ret = -ENODEV;
+		goto err_return;
+	}
+	ret = cam_claim_engine(ch);
+	if (ret)
+		goto err_return;
+	ret = video_device_pipeline_start(&ch->vdev, &ch->pipe);
+	if (ret)
+		goto err_engine;
+
+	ch->sequence = 0;
+	if (READ_ONCE(ch->cam->sleeping)) {
+		/* a system suspend is starting: runs after the resume */
+		ch->paused = true;
+		return 0;
+	}
+	ret = cam_power(ch, true);
+	if (ret)
+		goto err_pipeline;
+	ret = cam_run(ch);
+	if (ret)
+		goto err_power;
 	return 0;
 
-err_hw:
-	cam_set_streaming(ch, false);
-	cam_hw_stop(ch);
+err_power:
 	cam_power(ch, false);
 err_pipeline:
 	video_device_pipeline_stop(&ch->vdev);
+err_engine:
 	cam_release_engine(ch);
 err_return:
 	cam_return_buffers(ch, VB2_BUF_STATE_QUEUED);
@@ -731,11 +799,13 @@ static void cam_stop_streaming(struct vb2_queue *q)
 {
 	struct cam_chan *ch = vb2_get_drv_priv(q);
 
-	v4l2_subdev_call(ch->sensor, video, s_stream, 0);
-	cam_set_streaming(ch, false);
-	cam_hw_stop(ch);
-	synchronize_irq(ch->irq);
-	cam_power(ch, false);
+	/* paused for system sleep: halted and unpowered already */
+	if (!ch->paused) {
+		cam_halt(ch);
+		cam_power(ch, false);
+	}
+	ch->paused = false;
+	cam_notify_streaming(ch);
 	video_device_pipeline_stop(&ch->vdev);
 	cam_release_engine(ch);
 	cam_return_buffers(ch, VB2_BUF_STATE_ERROR);
@@ -969,13 +1039,21 @@ static int cam_parse_endpoints(struct cezanne_cam *c)
  * sysfs / debugfs
  */
 
-/* "1" while frames are captured: cezanne-popupd raises the camera for it */
+/*
+ * "1" while frames are captured: cezanne-popupd raises the camera for it.
+ * A stream paused for system sleep counts: the camera stays up.
+ */
+static int cam_capturing(const struct cam_chan *ch)
+{
+	return READ_ONCE(ch->streaming) || READ_ONCE(ch->paused);
+}
+
 static ssize_t streaming_show(struct device *dev, struct device_attribute *a,
 			      char *buf)
 {
 	struct cezanne_cam *c = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "%d\n", READ_ONCE(c->ch[0].streaming));
+	return sysfs_emit(buf, "%d\n", cam_capturing(&c->ch[0]));
 }
 static DEVICE_ATTR_RO(streaming);
 
@@ -984,7 +1062,7 @@ static ssize_t streaming_main_show(struct device *dev,
 {
 	struct cezanne_cam *c = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "%d\n", READ_ONCE(c->ch[1].streaming));
+	return sysfs_emit(buf, "%d\n", cam_capturing(&c->ch[1]));
 }
 static DEVICE_ATTR_RO(streaming_main);
 
@@ -1138,6 +1216,91 @@ static int cam_init_chan(struct platform_device *pdev, struct cezanne_cam *c,
 	return 0;
 }
 
+/*
+ * System sleep. genpd only powers a domain off at runtime outside a system
+ * transition (prepared_count): a cam domain still on when the devices are
+ * prepared goes off in suspend_noirq, after the SMI larbs went down, and its
+ * bus protection never acks ("cam: bus protection step 3 ... no ack" at
+ * every s2idle entry; with the DMA still writing, a reset soon after). So
+ * running streams are paused before the transition, from the PM notifier:
+ * sensor off, CAMSV stopped, the programmed buffers back at the head of the
+ * queue, power released, and the domain goes off through runtime PM (the
+ * larb is its last user). Streams started meanwhile wait paused; after the
+ * resume they all run again. Userspace sees a gap in the frames.
+ */
+static void cam_pause(struct cam_chan *ch)
+{
+	struct cam_buf *buf;
+	unsigned long flags;
+
+	ch->paused = true;
+	cam_halt(ch);
+	/* partly written by the stopped frame: marked again */
+	spin_lock_irqsave(&ch->irqlock, flags);
+	list_for_each_entry(buf, &ch->inflight, list)
+		cam_mark_buf(ch, buf);
+	list_splice_init(&ch->inflight, &ch->queued);
+	spin_unlock_irqrestore(&ch->irqlock, flags);
+	cam_power(ch, false);
+	dev_dbg(ch->cam->dev, "%s: paused for suspend\n", ch->cfg->name);
+}
+
+static void cam_unpause(struct cam_chan *ch)
+{
+	int ret;
+
+	ret = cam_power(ch, true);
+	if (!ret) {
+		ret = cam_run(ch);
+		if (ret)
+			cam_power(ch, false);
+	}
+	if (ret) {
+		/* DQBUF fails from now on; STREAMOFF cleans up */
+		dev_err(ch->cam->dev, "%s: no restart after resume: %d\n",
+			ch->cfg->name, ret);
+		vb2_queue_error(&ch->queue);
+		return;
+	}
+	ch->paused = false;
+	dev_dbg(ch->cam->dev, "%s: resumed\n", ch->cfg->name);
+}
+
+static int cam_pm_notify(struct notifier_block *nb, unsigned long action,
+			 void *data)
+{
+	struct cezanne_cam *c = container_of(nb, struct cezanne_cam, pm_nb);
+	bool sleeping = action == PM_SUSPEND_PREPARE ||
+			action == PM_HIBERNATION_PREPARE;
+	unsigned int ms = 0;
+	int i;
+
+	if (!sleeping && action != PM_POST_SUSPEND &&
+	    action != PM_POST_HIBERNATION)
+		return NOTIFY_DONE;
+
+	WRITE_ONCE(c->sleeping, sleeping);
+	for (i = 0; i < CAM_NUM_CHANNELS; i++) {
+		struct cam_chan *ch = &c->ch[i];
+
+		mutex_lock(&ch->lock);
+		if (sleeping && vb2_start_streaming_called(&ch->queue) &&
+		    !ch->paused)
+			cam_pause(ch);
+		else if (!sleeping && ch->paused)
+			cam_unpause(ch);
+		mutex_unlock(&ch->lock);
+	}
+	/* the larb's runtime suspend, queued on pm_wq, takes it down */
+	while (sleeping && dev_pm_genpd_is_on(c->dev) && ms < 500) {
+		msleep(5);
+		ms += 5;
+	}
+	if (ms >= 500)
+		dev_warn_ratelimited(c->dev, "cam domain still on at suspend\n");
+	return NOTIFY_DONE;
+}
+
 static int cezanne_cam_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1211,6 +1374,14 @@ static int cezanne_cam_probe(struct platform_device *pdev)
 		snprintf(name, sizeof(name), "unwritten-%s", c->ch[i].cfg->name);
 		debugfs_create_u32(name, 0444, c->debugfs, &c->ch[i].unwritten);
 	}
+	c->pm_nb.notifier_call = cam_pm_notify;
+	/*
+	 * First, before other drivers prepare for the suspend: behind them
+	 * 4-25 of 50 cam power-offs still got no bus protection ack (then the
+	 * mdp domain's too, for minutes); first, none in 87.
+	 */
+	c->pm_nb.priority = INT_MAX;
+	register_pm_notifier(&c->pm_nb);
 	dev_info(dev, "camera front end, %d clocks\n", c->num_clks);
 	return 0;
 
@@ -1227,6 +1398,7 @@ static void cezanne_cam_remove(struct platform_device *pdev)
 	struct cezanne_cam *c = platform_get_drvdata(pdev);
 	int i;
 
+	unregister_pm_notifier(&c->pm_nb);
 	debugfs_remove_recursive(c->debugfs);
 	media_device_unregister(&c->mdev);
 	v4l2_async_nf_unregister(&c->notifier);

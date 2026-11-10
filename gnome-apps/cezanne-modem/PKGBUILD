@@ -6,30 +6,35 @@
 # the stock vendor image, mainline/modem/tools/install-mdota.sh).
 pkgname=cezanne-modem
 pkgver=1.0
-pkgrel=15
+pkgrel=17
 pkgdesc="Modem file service, RPC, boot and call audio for the cezanne"
-arch=(any)
+arch=(aarch64)
 license=(MIT)
-depends=(python e2fsprogs python-gobject alsa-lib alsa-utils util-linux glib2 libpulse)
+depends=(e2fsprogs alsa-lib util-linux glib2 json-glib libpulse)
 optdepends=('modemmanager: calls, SMS, mobile data (patched with the mtk-ccmni plugin, packaging/overlays/modemmanager)'
             'gnome-calls: phone calls'
             'chatty: SMS'
             'cezanne-voice: calls through the AP with echo cancelling and noise reduction')
-source=(cezanne-modemd
-        cezanne-speechd
+source=(cezanne-modemd.c
+        cezanne-speechd.c
         cezanne-modem-nvram-import
         cezanne-modem.service
         cezanne-speechd.service
         78-cezanne-modem.rules)
 sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP)
 
+build() {
+  # resident: C, not Python (~0.2 instead of ~11 MiB; speechd ~25 MiB)
+  cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -o cezanne-modemd cezanne-modemd.c
+  # shellcheck disable=SC2046
+  cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -o cezanne-speechd cezanne-speechd.c \
+    $(pkg-config --cflags --libs gio-unix-2.0 json-glib-1.0 alsa) -lm
+}
+
 package() {
   install -Dm755 cezanne-modemd "$pkgdir/usr/bin/cezanne-modemd"
   install -Dm755 cezanne-speechd "$pkgdir/usr/bin/cezanne-speechd"
   install -Dm755 cezanne-modem-nvram-import "$pkgdir/usr/bin/cezanne-modem-nvram-import"
-  for f in "$startdir"/cezanne_modem/*.py; do
-    install -Dm644 "$f" "$pkgdir/usr/lib/cezanne-modem/cezanne_modem/${f##*/}"
-  done
   install -Dm644 cezanne-modem.service "$pkgdir/usr/lib/systemd/system/cezanne-modem.service"
   install -Dm644 cezanne-speechd.service "$pkgdir/usr/lib/systemd/system/cezanne-speechd.service"
   install -Dm644 78-cezanne-modem.rules "$pkgdir/usr/lib/udev/rules.d/78-cezanne-modem.rules"

@@ -1,0 +1,11 @@
+diff --git a/arch/arm64/Kconfig.platforms b/arch/arm64/Kconfig.platforms
+--- a/arch/arm64/Kconfig.platforms
++++ b/arch/arm64/Kconfig.platforms
+@@ -184,6 +184,7 @@
+ 	select ARM_GIC
+ 	select PINCTRL
+ 	select MTK_TIMER
++	select HAVE_SHARED_GPIOS
+ 	help
+ 	  This enables support for MediaTek MT27xx, MT65xx, MT76xx
+ 	  & MT81xx ARMv8 SoCs

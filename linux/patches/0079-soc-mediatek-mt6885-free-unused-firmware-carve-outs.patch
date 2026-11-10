@@ -1,0 +1,110 @@
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index 16b6f32..bd926a2 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -10,4 +10,5 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
+ obj-$(CONFIG_ARCH_MEDIATEK) += mt6885-cpuhp.o mt6885-lpm.o mt6885-dram-info.o
++obj-$(CONFIG_ARCH_MEDIATEK) += mt6885-fw-reclaim.o
+ obj-$(CONFIG_MTK_DSI_CMD_KICK) += mtk-dsi-cmd-kick.o
+diff --git a/drivers/soc/mediatek/mt6885-fw-reclaim.c b/drivers/soc/mediatek/mt6885-fw-reclaim.c
+new file mode 100644
+index 0000000..78e9695
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6885-fw-reclaim.c
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6885: give firmware carve-outs nothing runs from back to the page
++ * allocator (cezanne port). lk loads the VPU and ADSP firmware on every
++ * boot and covers both carve-outs with EMI MPU regions that leave the AP
++ * read-only: its writes are dropped without a fault, so simply not
++ * reserving them would corrupt whatever the kernel puts there. The port
++ * starts neither processor. lk leaves both regions unlocked, and ATF's
++ * kernel SIP call may set an unlocked region (locking it until the next
++ * boot), as MIUI's VPU driver does for region 21 on every boot.
++ *
++ * A reserved-memory node with this driver's compatible (reserved but
++ * mapped, not no-map) names its MPU region. The region is opened to every
++ * domain, one word per page is written and read back from DRAM, and only
++ * when all of them stuck is the range freed. Any failure keeps it reserved.
++ */
++#include <linux/arm-smccc.h>
++#include <linux/init.h>
++#include <linux/mm.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/sizes.h>
++#include <asm/cacheflush.h>
++
++#define MTK_SIP_EMIMPU_CONTROL	0xc200050b
++#define EMIMPU_SET		0
++#define EMIMPU_DGROUPS		2	/* 8 domains each */
++
++static u64 fw_reclaim_pattern(phys_addr_t pa)
++{
++	return 0x5ac3a55a3ca5c35aULL ^ pa;
++}
++
++/* dropped writes leave the old DRAM contents behind the cleaned line */
++static bool fw_reclaim_writable(phys_addr_t base, phys_addr_t size)
++{
++	phys_addr_t off;
++
++	for (off = 0; off < size; off += PAGE_SIZE) {
++		u64 *p = phys_to_virt(base + off);
++
++		*p = fw_reclaim_pattern(base + off);
++		dcache_clean_inval_poc((unsigned long)p, (unsigned long)(p + 1));
++	}
++	for (off = 0; off < size; off += PAGE_SIZE)
++		if (*(u64 *)phys_to_virt(base + off) != fw_reclaim_pattern(base + off))
++			return false;
++	return true;
++}
++
++static int __init fw_reclaim_one(struct device_node *np)
++{
++	struct reserved_mem *rmem = of_reserved_mem_lookup(np);
++	struct arm_smccc_res res;
++	phys_addr_t end;
++	u32 region;
++	int g;
++
++	if (!rmem || of_property_read_u32(np, "mediatek,emi-mpu-region", &region) ||
++	    region > 31 || of_property_read_bool(np, "no-map") ||
++	    !IS_ALIGNED(rmem->base | rmem->size, SZ_64K) || !rmem->size)
++		return -EINVAL;
++	end = rmem->base + rmem->size;
++
++	/* dgroup 0 last: ATF locks the region on that write */
++	for (g = EMIMPU_DGROUPS - 1; g >= 0; g--) {
++		arm_smccc_smc(MTK_SIP_EMIMPU_CONTROL, EMIMPU_SET,
++			      (rmem->base >> 16) | ((unsigned long)region << 24),
++			      ((end - 1) >> 16) | ((unsigned long)g << 24),
++			      0, 0, 0, 0, &res);
++		if (res.a0) {
++			pr_err("%s: EMI MPU region %u dgroup %d: ATF says %#lx, kept\n",
++			       rmem->name, region, g, res.a0);
++			return -EIO;
++		}
++	}
++	if (!fw_reclaim_writable(rmem->base, rmem->size)) {
++		pr_err("%s: writes still dropped after opening region %u, kept\n",
++		       rmem->name, region);
++		return -EIO;
++	}
++	free_reserved_area(phys_to_virt(rmem->base), phys_to_virt(end), -1, rmem->name);
++	return 0;
++}
++
++static int __init fw_reclaim_init(void)
++{
++	struct device_node *np;
++
++	for_each_compatible_node(np, NULL, "mediatek,mt6885-emimpu-reclaim")
++		fw_reclaim_one(np);
++	return 0;
++}
++subsys_initcall(fw_reclaim_init);

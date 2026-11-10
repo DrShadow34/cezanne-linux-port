@@ -7,19 +7,21 @@
 # later); the TA files and the TEE's storage live in /var/lib/cezanne-tee.
 pkgname=cezanne-fp
 pkgver=1.0
-pkgrel=4
+pkgrel=5
 pkgdesc="Fingerprint (TEE service + fprintd-compatible daemon) for the cezanne"
 arch=(aarch64)
 license=(GPL-2.0-only)
-depends=(glibc python python-gobject fprintd)
+depends=(glibc glib2 json-glib fprintd)
 optdepends=('gnome-shell: the FOD spot (cezanne-fod extension)')
-source=(teei_daemon.c gfctl.c cezanne-fpd cezanne-tee.service cezanne-fpd.service
+source=(teei_daemon.c gfctl.c cezanne-fpd.c cezanne-tee.service cezanne-fpd.service
         60-cezanne-tee.conf)
 sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP)
 
 build() {
   cc $CFLAGS $LDFLAGS -Wall -o teei_daemon teei_daemon.c -lpthread
   cc $CFLAGS $LDFLAGS -Wall -Wno-format-truncation -o gfctl gfctl.c
+  cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -o cezanne-fpd cezanne-fpd.c \
+    $(pkg-config --cflags --libs gio-2.0 json-glib-1.0)
 }
 
 package() {

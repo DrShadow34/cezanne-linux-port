@@ -575,6 +575,45 @@ index 6ca1e19..37d01a4 100644
  				aucBssid, &rStationInfo, GFP_KERNEL);
  		}
  #if CFG_STAINFO_FEATURE
+diff --git a/os/linux/hif/common/hal_pdma.c b/os/linux/hif/common/hal_pdma.c
+index 60a43ee..0ef7660 100644
+--- a/os/linux/hif/common/hal_pdma.c
++++ b/os/linux/hif/common/hal_pdma.c
+@@ -608,7 +608,18 @@ u_int8_t halSetDriverOwn(struct ADAPTER *prAdapter,
+ 		kalUsleep_range(LP_OWN_BACK_LOOP_DELAY_MIN_US,
+ 				LP_OWN_BACK_LOOP_DELAY_MAX_US);
+ #else /* !CFG_SUPPORT_RX_WORK */
+-		kalUdelay(LP_OWN_BACK_LOOP_DELAY_MAX_US);
++		/*
++		 * Sleep when the caller can (hif_thread): while the system
++		 * suspends, the firmware may not hand the bus back, and the
++		 * real-time hif_thread busy-waiting here (2 s per attempt,
++		 * retried) kept RCU from completing a grace period: the
++		 * suspend stalled and the RCU stall check panicked.
++		 */
++		if (preemptible())
++			kalUsleep_range(LP_OWN_BACK_LOOP_DELAY_MIN_US,
++					LP_OWN_BACK_LOOP_DELAY_MAX_US);
++		else
++			kalUdelay(LP_OWN_BACK_LOOP_DELAY_MAX_US);
+ #endif /* !CFG_SUPPORT_RX_WORK */
+ 
+ #if IS_ENABLED(CFG_MTK_WIFI_DRV_OWN_INT_MODE)
+@@ -700,9 +711,12 @@ done:
+ 
+ 	if (fgIsDriverOwnTimeout) {
+ #if !CFG_SUPPORT_RX_WORK
+-		if (HAL_IS_TX_DIRECT(prAdapter) || HAL_IS_RX_DIRECT(prAdapter))
++		if (HAL_IS_TX_DIRECT(prAdapter) || HAL_IS_RX_DIRECT(prAdapter)) {
++			DBGLOG_LIMITED(INIT, WARN,
++			       "Driver own timeout (direct TRX, suspend %lu)\n",
++			       prAdapter->prGlueInfo->fgIsInSuspend);
+ 			goto end;
+-		else
++		} else
+ #endif /* !CFG_SUPPORT_RX_WORK */
+ 			halDriverOwnTimeout(prAdapter, u4CurrTick, fgTimeout);
+ 	}
 diff --git a/os/linux/include/gl_os.h b/os/linux/include/gl_os.h
 index 98fa30f..f787ce9 100644
 --- a/os/linux/include/gl_os.h

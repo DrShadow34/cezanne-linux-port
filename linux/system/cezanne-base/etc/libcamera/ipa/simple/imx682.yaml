@@ -43,4 +43,10 @@ algorithms:
       contrast: 1.15
   - Agc:
   - Af:
+      # The VCM codes (DW9800, 0..1023) the lens moves between: below 285
+      # it rests on its far stop (focused at infinity), above 910 on its
+      # near stop.  A manual sweep, 2026-11-08: nothing changed up to 277,
+      # the first change at 298; flat again from ~900.
+      infinity: 285
+      macro: 910
 ...

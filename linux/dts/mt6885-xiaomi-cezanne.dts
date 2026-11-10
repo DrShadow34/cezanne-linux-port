@@ -36,8 +36,16 @@
 	};
 
 	chosen {
-		/* initrd range is filled in by mkboot-mainline.sh at build time */
-		bootargs = "watchdog.handle_boot_enabled=0 printk.devkmsg=on console=tty0 quiet splash loglevel=3 vt.global_cursor_default=0 panic=5 clk_ignore_unused fw_devlink.sync_state=timeout mem_sleep_default=s2idle cma=512M";
+		/*
+		 * initrd range is filled in by mkboot-mainline.sh at build time.
+		 * swiotlb: 4 MiB instead of 64. Only the 32-bit devices without
+		 * an IOMMU bounce (GCE packets, SCP, BTIF: ~16 KiB in use; Wi-Fi
+		 * copies into its own pool); track_hiwater keeps the peak in
+		 * debugfs swiotlb/io_tlb_used_hiwater. Dentry / inode hash
+		 * tables at a quarter of the 8 GiB default (8 + 4 MiB): a phone's
+		 * dcache stays far below 256 Ki entries.
+		 */
+		bootargs = "watchdog.handle_boot_enabled=0 printk.devkmsg=on console=tty0 quiet splash loglevel=3 vt.global_cursor_default=0 panic=5 clk_ignore_unused fw_devlink.sync_state=timeout mem_sleep_default=s2idle cma=512M swiotlb=2048,track_hiwater dhash_entries=262144 ihash_entries=131072";
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
@@ -676,10 +684,17 @@
 		 * loads the modem, VPU, SPM, SCP and ADSP firmware (read from
 		 * MIUI's /sys/firmware/fdt; SPM and SCP are reserved elsewhere).
 		 * The modem's are EMI MPU protected: touching them resets the SoC.
+		 * The VPU's and ADSP's EMI MPU regions (21, 28) leave the AP
+		 * read-only, but lk doesn't lock them and nothing here runs either
+		 * processor: mt6885-fw-reclaim opens both through ATF, checks that
+		 * writes reach DRAM and frees them (54.7 MiB), else they stay
+		 * reserved. Mapped, not no-map, so the freed pages are in the
+		 * linear map.
 		 */
 		vpu-binary@bd380000 {
+			compatible = "mediatek,mt6885-emimpu-reclaim";
 			reg = <0x0 0xbd380000 0x0 0x2880000>;
-			no-map;
+			mediatek,emi-mpu-region = <21>;
 		};
 		ccci-tag-mem@bff70000 {
 			reg = <0x0 0xbff70000 0x0 0x10000>;
@@ -701,17 +716,34 @@
 			reg = <0x0 0xf81d0000 0x0 0x3e30000>;
 			no-map;
 		};
+		/*
+		 * AP-MD shared memory (LK's carve-outs: 24 MiB non-cached at
+		 * 0x8e000000, 73.4 MiB cached at 0x88000000; the MD's MPU
+		 * windows stay that size). cezanne_ccci uses only these parts
+		 * (mainline/modem/ccci/ccci.h NC_MAPPED, C_MAPPED): the BSP's
+		 * alignment padding before DFD and the declined 62 MiB DHL raw
+		 * buffer are RAM.
+		 */
 		ap-md-nc-smem@8e000000 {
-			reg = <0x0 0x8e000000 0x0 0x1800000>;
+			reg = <0x0 0x8e000000 0x0 0x108000>;
+			no-map;
+		};
+		ap-md-nc-dfd@8f000000 {
+			reg = <0x0 0x8f000000 0x0 0x800000>;
 			no-map;
 		};
 		ap-md-c-smem@88000000 {
-			reg = <0x0 0x88000000 0x0 0x4960000>;
+			reg = <0x0 0x88000000 0x0 0xb00000>;
+			no-map;
+		};
+		ap-md-c-usip@8c900000 {
+			reg = <0x0 0x8c900000 0x0 0x60000>;
 			no-map;
 		};
 		adsp-reserved@78000000 {
+			compatible = "mediatek,mt6885-emimpu-reclaim";
 			reg = <0x0 0x78000000 0x0 0xe30000>;
-			no-map;
+			mediatek,emi-mpu-region = <28>;
 		};
 	};
 };

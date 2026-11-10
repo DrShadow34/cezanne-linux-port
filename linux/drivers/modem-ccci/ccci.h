@@ -161,13 +161,25 @@ struct ap_query_md_feature_v2_1 {
 #define NC_WIFI_PROXY		0x100000
 #define NC_DFD			0x1000000
 #define NC_DFD_SIZE		0x800000
-#define NC_SIZE			0x1800000
+#define NC_SIZE			0x1800000	/* the MD's window (LK's MPU) */
+/*
+ * What the AP keeps of it: up to the Wi-Fi proxy, and DFD. The rest is
+ * BSP alignment padding (RAW_DFD "padding size: ef8000"), nothing in it
+ * is given to the MD: Linux RAM (the DT reserves only these parts).
+ */
+#define NC_MAPPED		(NC_WIFI_PROXY + 0x8000)
 #define C_MD_CONSYS		0x000000
 #define C_NVRAM_CACHE		0x180000
 #define C_CCB_DHL		0x900000
 #define C_RAW_DHL		0xb00000
 #define C_USIP			0x4900000
-#define C_SIZE			0x4960000
+#define C_SIZE			0x4960000	/* the MD's window (LK's MPU) */
+/*
+ * What the AP keeps: MD-CONSYS, NVRAM cache, CCB; and USIP at the end,
+ * which the AP never touches. The 62 MiB DHL raw buffer between them is
+ * declined (the MD asks for it as optional) and is Linux RAM.
+ */
+#define C_MAPPED		C_RAW_DHL
 #define RUNTIME_AP_SIZE		0x800
 #define RUNTIME_MD_SIZE		0x800
 

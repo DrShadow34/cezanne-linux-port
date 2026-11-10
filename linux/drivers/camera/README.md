@@ -665,14 +665,96 @@ manual + lens-position on libcamerasrc; the soft-ISP AF keeps both over the
 picture's reconfiguration (same sensor mode) and libcamerasrc replays them
 when the camera restarts. Taps do not refocus in manual mode.
 
-The scale is the AF's uncalibrated linear map of the VCM range: the lowest
-quarter (0..4) does not move the lens (all far focus); a close-up at ~15 cm
-is around 7. Autofocus fails on low-texture subjects: a tap window with
-little structure falls back to the whole frame (af.cpp measure()), so a
-smooth figure in front of blinds loses to the blinds.
+The scale is a linear map of the lens' travel: the tuning file gives the
+VCM codes where the lens lifts off its far stop and reaches its near stop
+(imx682.yaml Af: infinity 285, macro 910, from a manual sweep; before that
+0..4 and 10.7..12 of the slider did nothing). A close-up at ~15 cm is
+around 7.
+
+### Autofocus on small subjects, lens power (2026-11-08, libcamera 0.7.2-4.3)
+
+The soft-ISP AF (src/ipa/simple/algorithms/af.cpp) scanned far to near on
+one metric over the metered window and stopped a few steps after a peak:
+with a smooth figure in front of blinds the window's metric peaked on the
+blinds (3.7 M against 1.6 M for the figure, a 0.87 M valley between) and
+the scan ended in the valley; a tap ran a hill climb from the current
+position (stuck on the background), and a window with little structure fell
+back to the whole frame frame by frame. Now a scan covers the lens' travel
+in 12 steps keeping every tile of the 16x12 statistics grid; each metered
+tile (the tap window plus a ring of half weight, else the centre third)
+whose sharpness changed by 1.3x votes for its sharpest step, weighted by the
+log of that change; the nearest step with 30 % of the strongest smoothed
+vote wins, and a fine scan over half a step either side uses the voters,
+each relative to its own peak. An offline run of the same vote on the sweep
+picked the figure (661, its peak ~670) for the tap and for the centre third.
+
+Lens power: libcamera opened each lens subdev when it enumerated the
+cameras and kept it open; wireplumber's libcamera monitor enumerates all the
+time, and dw9719 powers the VCM from open to close. So both VCMs were
+always on, and every system suspend (the AOD suspends every few seconds)
+ramped the lens down to 0 and back up to its last code: audible "focusing"
+with no camera app open. CameraLens now closes the subdev after init, opens
+it on the first move and the simple pipeline releases it when the camera
+stops (the driver's 1 s autosuspend bridges a picture's restart).
+
+The macro camera (S5K5E9) has a DW9800 too (lifts off around 260); its
+direction and end stop need a scene within its range, so it stays
+uncalibrated.
+
+### Viewfinder bands after pictures (2026-11-09, libcamera 0.7.2-4.6)
+
+The user's viewfinder (main camera, 64MP + HDR) showed the scene, a black
+vertical band and a strip of an older picture. Two soft-ISP bugs, both in
+upstream v0.7.2:
+
+- The GPU debayer created a new EGL context at every stream start and never
+  destroyed the old one, with all it held. A picture restarts the stream
+  twice (full size, then preview): the process's GPU memory grew ~132 MB
+  per picture and never shrank, and after 2-6 pictures the viewfinder
+  showed frozen old frames and black bands (identical frames from
+  different output buffers, edges stepped like GPU tiles; the raw frames
+  of the same requests were fine for the CPU). DebayerEGL::stop() now
+  destroys the context (eGL::destroyContext()) and forgets the lens-shading
+  texture, whose name belonged to the old context.
+- 16-bit Bayer input was imported as DRM_FORMAT_RG88, which Panfrost
+  rejects at any pitch (EGL_BAD_MATCH): every frame took the CPU upload
+  path, a 32 MB copy per frame on the main camera. GL_RG wants GR88 (R =
+  the first byte = the sample's low byte, as the upload gave it); with that
+  the camera buffers are sampled directly (the 64-byte CAM_STRIDE pitch is
+  enough; "Input buffer stride ignored by the driver" is harmless).
+
+Reproduced and checked with tools/vf_check.py --switches N (Snapshot's
+shutter without the app; with `cezanne-mono` running as for HDR): before,
+bands after 2-6 switches and +132 MB GPU memory per switch; after, 0 bands
+in 20+ switches with the raw stream, GPU memory flat.
+
+### Streams across system suspend (2026-11-09, linux-cezanne 7.3.1-24)
+
+A stream running when the phone suspends (the AOD suspends every few
+seconds with the screen off) is paused by cezanne_camsv's PM notifier
+before the transition starts (its notifier runs first, priority INT_MAX):
+CAMSV stopped in the vendor's order (VF off, TG idle after the frame in
+progress, DMA reset handshake), then the sensor off, the programmed buffers
+back in the queue, power released, and the driver waits for the cam domain
+to go off through runtime PM. After the resume it runs again;
+userspace sees a gap in the frames, and `streaming` / `streaming_main` stay
+1 (the pop-up camera stays up). Without this the sensor and DMA kept
+running, genpd cut the domain in suspend_noirq after the SMI larb, the bus
+protection never acked ("cam: bus protection step 3 ... no ack") and the
+phone reset soon after. A rare no-ack remains (about 1 in 45-90
+suspends with a stream running; the system and the streams carry on).
+Details: NOTES "Camera streams across system suspend".
 
 ### Tools (mainline/camera/tools)
 
-lens_tuning.py (EEPROM shading -> tuning), calibrate_distortion.py
+vf_check.py (the main camera's viewfinder + raw streams as Snapshot runs
+them: black bands, frozen / torn raw rows, GPU memory across
+--switches shutter restarts), lens_tuning.py (EEPROM shading -> tuning), calibrate_distortion.py
 (checkerboard DNGs -> distortion), checkerboard-19x11.png, colour_chart.py
 + colour-chart.png (chart, sampling, camera-to-camera colour fit).
+Focus (run as root on the phone under `systemd-inhibit --what=sleep`, the
+AOD honours it): focus_sweep.py (manual lens sweep through libcamerasrc,
+grey frames per position: the lens travel for the tuning), af_check.py
+(continuous AF on the centre or a window, with
+LIBCAMERA_LOG_LEVELS="*:WARN,IPASoftAf:DEBUG" for the votes),
+af_vote_sim.py (the AF's per-tile vote on a sweep, offline).

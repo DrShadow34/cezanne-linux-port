@@ -34,11 +34,13 @@ Not in the patches:
 | 0033 | PSCI cpuidle states and CPU hotplug through the SPM (`mt6885-cpuhp.c`) |
 | 0059 | SVS / EEM voltage trimming for the CPU clusters, CCI and GPU |
 | 0064 | SVS: complete init02 after a temperature read error, keep the clock |
+| 0077 | SVS: retry the probe while the MCUPM still holds the CPU bucks at lk's voltage (otherwise the CPU banks stay untrimmed) |
 | 0012 | LVTS thermal sensors and controllers for MT6885 |
 | 0062 | LVTS: wait a full measurement cycle before trusting the first reading |
 | 0063 | LVTS: reprogram the controllers after deep suspend (it wipes them) |
 | 0045 | Arm the MCUPM low-power control for the SPM (`mt6885-lpm.c`); without it deep suspend ends in an SPM watchdog reset |
 | 0047 | `/proc/cpuinfo` model name and DRAM information (`mt6885-dram-info.c`) |
+| 0079 | Give the unused VPU and ADSP firmware carve-outs back to Linux: open their EMI MPU regions through the ATF, check that writes reach DRAM, free them (`mt6885-fw-reclaim.c`, +54.7 MiB) |
 | 0015 | RTC: the MediaTek BSP's year encoding (years since 1968) |
 | 0016 | Watchdog: stop a watchdog left running by the bootloader across suspend |
 | 0019 | I2C: the AP channel offset of the multi-channel controllers |
@@ -46,6 +48,7 @@ Not in the patches:
 | 0043 | IOMMU: camera larb 13 in region 0 |
 | 0071 | SoC AUXADC: MT6885 compatible with its efuse gain / offset calibration (board thermistors) |
 | 0072 | Hardware RNG through the phone ATF's SMC (`MTK_SIP_KERNEL_GET_RND`) |
+| 0076 | `ARCH_MEDIATEK` selects `HAVE_SHARED_GPIOS` (the board shares GPIOs between consumers) |
 | 0003 | `earlycon=ramlog`: early console into a RAM buffer that survives a reset (the phone has no UART) |
 | 9999 | Debug only: early ramlog markers in `head.S` (only with the ramlog earlycon configured) |
 
@@ -69,6 +72,7 @@ Not in the patches:
 | 0065 | Keep the boot logo on screen until plymouth takes over |
 | 0066 | `dirtyfb` for command mode (damage-driven updates) |
 | 0075 | Command-mode frames through the GCE command queue (configure, wait for TE, trigger in one packet; CPU fallback), CMDQ physical-address writes |
+| 0078 | DSI: keep the interrupt masked while the engine is unclocked (an unackable TE stormed CPU0 and hung suspend entry) |
 | 0010 | panfrost: Mali-G77 MC9 on MT6885 (GPU id, power domains, clocks, devfreq) |
 | 0054 | panfrost: unprepare the clocks in system suspend (the MFGPLL only stops when unprepared) |
 | 0061 | panfrost devfreq: follow OPPs enabled / disabled by SVS |
