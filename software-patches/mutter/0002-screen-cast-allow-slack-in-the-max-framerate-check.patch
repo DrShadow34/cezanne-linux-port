@@ -1,0 +1,18 @@
+diff --git a/src/backends/meta-stream-source.c b/src/backends/meta-stream-source.c
+index 263a05d..f91846e 100644
+--- a/src/backends/meta-stream-source.c
++++ b/src/backends/meta-stream-source.c
+@@ -1623,6 +1623,13 @@ meta_stream_source_maybe_record_frame_with_timestamp (MetaStreamSource     *sour
+       min_interval_us =
+         ((G_USEC_PER_SEC * ((int64_t) priv->video_format.max_framerate.denom)) /
+          ((int64_t) priv->video_format.max_framerate.num));
++      /*
++       * Frames come at the frame clock's pace, a whole number of refresh
++       * intervals apart: one that is a few microseconds short of the limit
++       * (30 fps = 4 refreshes at 120 Hz, 2 at 60 Hz) would be skipped until
++       * the next refresh, giving 24 or 20 fps. Allow an eighth of slack.
++       */
++      min_interval_us -= min_interval_us / 8;
+ 
+       time_since_last_frame_us =
+         frame_timestamp_us - priv->last_frame_timestamp_us;

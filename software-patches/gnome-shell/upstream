@@ -1,4 +1,4 @@
 # Arch's gnome-shell + an index for St's CSS matching (first opens after a
 # shell start spent ~45 % of their time matching ~1400 rules)
 UPSTREAM=gnome-shell
-SUFFIX=1
+SUFFIX=2

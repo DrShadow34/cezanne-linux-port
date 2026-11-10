@@ -34,6 +34,7 @@
 #define ENC_CAP		4	/* bitstream buffers = encodes in flight */
 #define ENC_SLOTS	16	/* OUTPUT indices, each kept for one surface */
 #define ENC_TIMEOUT_MS	2000
+#define ENC_FENCE_MS	200	/* longest wait for the input's GPU writers */
 
 struct enc_job {
 	VASurfaceID surface;
@@ -577,6 +578,20 @@ VAStatus cvd_enc_end(struct cvd_driver *d, struct cvd_context *c)
 		goto out;
 	}
 	e->cap_queued[cap] = true;
+	/*
+	 * Implicit sync: mutter queues a screen-cast buffer right after
+	 * flushing its GPU copy into it, and V4L2 does not wait for a
+	 * dma-buf's fences, so the encoder could read a half-written frame (a
+	 * band of the new picture over an old one). A dma-buf is readable
+	 * once its writers are done.
+	 */
+	{
+		struct pollfd p = { .fd = s->fd, .events = POLLIN };
+
+		if (poll(&p, 1, ENC_FENCE_MS) == 0)
+			cvd_log("surface %#x: still being written after %d ms\n",
+				s->base.id, ENC_FENCE_MS);
+	}
 	memset(&b, 0, sizeof(b));
 	memset(&pl, 0, sizeof(pl));
 	b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;

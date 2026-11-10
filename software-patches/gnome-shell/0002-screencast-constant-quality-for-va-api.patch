@@ -1,0 +1,33 @@
+diff --git a/js/dbusServices/screencast/screencastService.js b/js/dbusServices/screencast/screencastService.js
+index e3b745b..01ef72c 100644
+--- a/js/dbusServices/screencast/screencastService.js
++++ b/js/dbusServices/screencast/screencastService.js
+@@ -29,6 +29,10 @@ const DEFAULT_DRAW_CURSOR = true;
+ 
+ const PIPELINE_BLOCKLIST_FILENAME = 'gnome-shell-screencast-pipeline-blocklist';
+ 
++// VA-API: constant quality (QP 26, as the openh264 pipelines below), not
++// VBR at 2 Mbit/s: at the phone's 2400x1080 that starved moving scenes
++// (whole regions left unchanged for frames, smeared blocks), while a
++// still screen costs next to nothing either way.
+ const PIPELINES = [
+     {
+         id: 'hwenc-dmabuf-h264-vaapi-lp',
+@@ -36,7 +40,7 @@ const PIPELINES = [
+         pipelineString:
+             'capsfilter caps=video/x-raw(memory:DMABuf),format=DMA_DRM,max-framerate=%F/1 ! \
+              vapostproc ! \
+-             vah264lpenc rate-control=vbr bitrate=2048 target-percentage=50 ! \
++             vah264lpenc rate-control=cqp qpi=26 qpp=26 ! \
+              queue ! \
+              h264parse ! \
+              mp4mux fragment-duration=500 fragment-mode=first-moov-then-finalise',
+@@ -47,7 +51,7 @@ const PIPELINES = [
+         pipelineString:
+             'capsfilter caps=video/x-raw(memory:DMABuf),format=DMA_DRM,max-framerate=%F/1 ! \
+              vapostproc ! \
+-             vah264enc rate-control=vbr bitrate=2048 target-percentage=50 ! \
++             vah264enc rate-control=cqp qpi=26 qpp=26 ! \
+              queue ! \
+              h264parse ! \
+              mp4mux fragment-duration=500 fragment-mode=first-moov-then-finalise',

@@ -5,7 +5,7 @@
 # to it. Built from this directory (src/, meson.build); old/ is reference only.
 pkgname=cezanne-va
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="VA-API driver for the Redmi K30 Ultra (MT6885) V4L2 video decoders and encoder"
 arch=(aarch64)
 url="https://localhost/arch-port"
