@@ -40,7 +40,6 @@ Not in the patches:
 | 0063 | LVTS: reprogram the controllers after deep suspend (it wipes them) |
 | 0045 | Arm the MCUPM low-power control for the SPM (`mt6885-lpm.c`); without it deep suspend ends in an SPM watchdog reset |
 | 0047 | `/proc/cpuinfo` model name and DRAM information (`mt6885-dram-info.c`) |
-| 0079 | Give the unused VPU and ADSP firmware carve-outs back to Linux: open their EMI MPU regions through the ATF, check that writes reach DRAM, free them (`mt6885-fw-reclaim.c`, +54.7 MiB) |
 | 0015 | RTC: the MediaTek BSP's year encoding (years since 1968) |
 | 0016 | Watchdog: stop a watchdog left running by the bootloader across suspend |
 | 0019 | I2C: the AP channel offset of the multi-channel controllers |

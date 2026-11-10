@@ -685,16 +685,14 @@
 		 * MIUI's /sys/firmware/fdt; SPM and SCP are reserved elsewhere).
 		 * The modem's are EMI MPU protected: touching them resets the SoC.
 		 * The VPU's and ADSP's EMI MPU regions (21, 28) leave the AP
-		 * read-only, but lk doesn't lock them and nothing here runs either
-		 * processor: mt6885-fw-reclaim opens both through ATF, checks that
-		 * writes reach DRAM and frees them (54.7 MiB), else they stay
-		 * reserved. Mapped, not no-map, so the freed pages are in the
-		 * linear map.
+		 * read-only. Opening them through ATF and freeing them (7.3.1-25,
+		 * NOTES "VPU and ADSP carve-outs back to Linux") made the CPU's
+		 * writes stick but the GPU still faulted on pages there: keep them
+		 * reserved.
 		 */
 		vpu-binary@bd380000 {
-			compatible = "mediatek,mt6885-emimpu-reclaim";
 			reg = <0x0 0xbd380000 0x0 0x2880000>;
-			mediatek,emi-mpu-region = <21>;
+			no-map;
 		};
 		ccci-tag-mem@bff70000 {
 			reg = <0x0 0xbff70000 0x0 0x10000>;
@@ -741,9 +739,8 @@
 			no-map;
 		};
 		adsp-reserved@78000000 {
-			compatible = "mediatek,mt6885-emimpu-reclaim";
 			reg = <0x0 0x78000000 0x0 0xe30000>;
-			mediatek,emi-mpu-region = <28>;
+			no-map;
 		};
 	};
 };
