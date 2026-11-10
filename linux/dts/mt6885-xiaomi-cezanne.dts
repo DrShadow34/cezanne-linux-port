@@ -685,14 +685,16 @@
 		 * MIUI's /sys/firmware/fdt; SPM and SCP are reserved elsewhere).
 		 * The modem's are EMI MPU protected: touching them resets the SoC.
 		 * The VPU's and ADSP's EMI MPU regions (21, 28) leave the AP
-		 * read-only. Opening them through ATF and freeing them (7.3.1-25,
-		 * NOTES "VPU and ADSP carve-outs back to Linux") made the CPU's
-		 * writes stick but the GPU still faulted on pages there: keep them
-		 * reserved.
+		 * read-only and shut out the GPU, but lk doesn't lock them and
+		 * nothing here runs either processor: mt6885-fw-reclaim opens both
+		 * through ATF, checks that writes reach DRAM and frees them
+		 * (54.7 MiB), else they stay reserved. Mapped, not no-map, so the
+		 * freed pages are in the linear map.
 		 */
 		vpu-binary@bd380000 {
+			compatible = "mediatek,mt6885-emimpu-reclaim";
 			reg = <0x0 0xbd380000 0x0 0x2880000>;
-			no-map;
+			mediatek,emi-mpu-region = <21>;
 		};
 		ccci-tag-mem@bff70000 {
 			reg = <0x0 0xbff70000 0x0 0x10000>;
@@ -720,7 +722,8 @@
 		 * windows stay that size). cezanne_ccci uses only these parts
 		 * (mainline/modem/ccci/ccci.h NC_MAPPED, C_MAPPED): the BSP's
 		 * alignment padding before DFD and the declined 62 MiB DHL raw
-		 * buffer are RAM.
+		 * buffer are RAM. That RAM lies in lk's EMI MPU regions 25 and 24,
+		 * which only four domains may use: emi-mpu below opens them.
 		 */
 		ap-md-nc-smem@8e000000 {
 			reg = <0x0 0x8e000000 0x0 0x108000>;
@@ -739,9 +742,23 @@
 			no-map;
 		};
 		adsp-reserved@78000000 {
+			compatible = "mediatek,mt6885-emimpu-reclaim";
 			reg = <0x0 0x78000000 0x0 0xe30000>;
-			no-map;
+			mediatek,emi-mpu-region = <28>;
 		};
+	};
+
+	/*
+	 * lk's AP-MD shared memory windows (EMI MPU regions 24, 25 as its log
+	 * prints them) cover RAM, see above. As lk sets them only the AP, MD
+	 * and two more domains may use them: GPU buffers there faulted
+	 * (7.3.1-16 .. 24). mt6885-fw-reclaim opens them to every domain
+	 * before any device probes. <region start end>, end exclusive.
+	 */
+	emi-mpu {
+		compatible = "mediatek,mt6885-emimpu-open";
+		mediatek,open-regions = <24 0x88000000 0x8c960000>,
+					<25 0x8e000000 0x8f800000>;
 	};
 };
 

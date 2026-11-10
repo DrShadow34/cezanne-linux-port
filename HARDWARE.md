@@ -196,7 +196,7 @@ Ordered roughly by how much they matter day to day.
 - Display: the 2026-10-22 stalls under memory load (kick-driver era) were
   not reproduced since mediatek-drm, not re-tested on purpose.
 - GPU: no tessellation (D3D11 games at feature level 10_1); Drag'n Wash
-  renders black (open).
+  renders, with texture artefacts at native resolution only (open).
 - Hardware limits, not fixable: FM has no antenna path; no HDMI /
   DisplayPort out (USB 2.0 board) and no microSD slot ("Not on this
   board"); GPU PLL capped at ~854 MHz; the panel's vendor tables only have
