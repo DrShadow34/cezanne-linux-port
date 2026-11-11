@@ -76,6 +76,9 @@ Not in the patches:
 | 0010 | panfrost: Mali-G77 MC9 on MT6885 (GPU id, power domains, clocks, devfreq) |
 | 0054 | panfrost: unprepare the clocks in system suspend (the MFGPLL only stops when unprepared) |
 | 0061 | panfrost devfreq: follow OPPs enabled / disabled by SVS |
+| 0080 | panfrost: report the G77 as a G57 (same Valhall v9 core) only to clients in a container, whose Mesa lacks the G77 (Waydroid's Android, Flatpak runtimes); `panfrost.g77_as_g57=0/1/2` |
+| 0081 | panfrost: `PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC` submit flag (param `DRM_PANFROST_PARAM_SHARED_IMPLICIT_SYNC`): implicit dependencies only on dma-buf shared BOs, userspace orders its own; lets PanVK run vertex/tiler and fragment chains in parallel (Mesa 0018) |
+| 0082 | panfrost: the address-space refcount warning allows two jobs per slot (running + `JS_*_NEXT`) plus perfcnt; one process with vertex/tiler and fragment jobs queued in parallel (0081) tripped the old one-per-slot bound |
 
 ## Multimedia
 

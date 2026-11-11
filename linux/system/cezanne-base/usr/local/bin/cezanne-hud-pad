@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+# cezanne-hud-pad: hide / show MangoHud from a gamepad button. Holding the
+# trigger (L3; a GameSir back paddle mapped to L3) for CEZANNE_HUD_PAD_HOLD
+# seconds (default 0.4, so a quick L3 click in a game doesn't toggle) sends
+# ":hud;" to every MangoHud control socket (control=mangohud-%p in
+# MangoHud.conf; mangohudctl only talks to gamescope's mangoapp). The pads are
+# read without a grab; Steam's virtual pad (28de) is skipped so a press counts
+# once. CEZANNE_HUD_PAD_DEBUG=1 logs every button.
+import errno, fcntl, os, select, socket, struct, sys, time
+
+HOLD = float(os.environ.get('CEZANNE_HUD_PAD_HOLD', '0.4'))
+DEBUG = os.environ.get('CEZANNE_HUD_PAD_DEBUG') == '1'
+# BTN_THUMBL; BTN_BASE5 is L3 of a PS4-layout pad on hid-generic (button 11)
+TRIGGERS = {0x13d, 0x12a}
+EV_KEY = 1
+EVIOCGID = 0x80084502
+EVIOCGBIT_KEY = 0x80604521
+EVENT = struct.Struct('llHHi')
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def is_pad(fd):
+    vendor = struct.unpack('HHHH', fcntl.ioctl(fd, EVIOCGID, bytes(8)))[1]
+    if vendor == 0x28de:
+        return False
+    keys = fcntl.ioctl(fd, EVIOCGBIT_KEY, bytes(96))
+    # BTN_JOYSTICK / BTN_GAMEPAD ranges (0x120 - 0x13f)
+    return any(keys[0x120 // 8:0x140 // 8])
+
+
+def toggle():
+    names = []
+    try:
+        for line in open('/proc/net/unix').readlines()[1:]:
+            f = line.split()
+            if len(f) >= 8 and f[7].startswith('@mangohud-'):
+                names.append(f[7][1:])
+    except OSError:
+        return
+    socks = []
+    for n in sorted(set(names)):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect('\0' + n)
+            s.sendall(b':hud;')
+            socks.append(s)
+        except OSError:
+            s.close()
+    # MangoHud reads its socket once per frame: keep the connection open
+    # until it has
+    time.sleep(0.25)
+    for s in socks:
+        s.close()
+    log('toggled', len(socks), 'hud(s)')
+
+
+def main():
+    pads = {}      # fd -> path
+    pressed = {}   # fd -> (press time, fired)
+    rescan = 0.0
+    while True:
+        now = time.monotonic()
+        if now >= rescan:
+            rescan = now + 3
+            open_paths = set(pads.values())
+            for e in os.listdir('/dev/input'):
+                p = '/dev/input/' + e
+                if not e.startswith('event') or p in open_paths:
+                    continue
+                try:
+                    fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+                except OSError:
+                    continue
+                try:
+                    ok = is_pad(fd)
+                except OSError:
+                    ok = False
+                if ok:
+                    pads[fd] = p
+                    log('pad', p)
+                else:
+                    os.close(fd)
+        timeout = 3.0
+        for fd, (t, fired) in pressed.items():
+            if not fired:
+                timeout = min(timeout, max(0, t + HOLD - now))
+        r = select.select(list(pads), [], [], timeout)[0] if pads else (time.sleep(timeout) or [])
+        now = time.monotonic()
+        for fd in r:
+            try:
+                data = os.read(fd, EVENT.size * 64)
+            except OSError as e:
+                if e.errno in (errno.ENODEV, errno.EIO):
+                    log('gone', pads[fd])
+                    os.close(fd)
+                    del pads[fd]
+                    pressed.pop(fd, None)
+                continue
+            for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, typ, code, val = EVENT.unpack_from(data, i)
+                if typ != EV_KEY:
+                    continue
+                if DEBUG:
+                    log(pads[fd], f'button {code:#x} {val}')
+                if code not in TRIGGERS:
+                    continue
+                if val == 1:
+                    pressed[fd] = (now, False)
+                elif val == 0:
+                    pressed.pop(fd, None)
+        for fd, (t, fired) in list(pressed.items()):
+            if not fired and now - t >= HOLD:
+                pressed[fd] = (t, True)
+                toggle()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

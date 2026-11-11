@@ -1,0 +1,13 @@
+# libinput reads this one file from /etc (/usr/share/libinput holds the
+# stock quirks); libinput-tools: `libinput quirks list /dev/input/eventN`.
+# Quirks load when a libinput context starts: GNOME Shell picks up changes
+# at the next login.
+
+# MCHOSE Mix 87-III: the keys of interface 2 come with an AC Pan axis
+# (REL_HWHEEL). libinput makes a keyboard with a wheel a pointer too, and
+# mutter then leaves touch mode (no auto-rotation, no automatic on-screen
+# keyboard), as for the receiver's mouse (udev rule
+# 68-cezanne-keyboard-mouse.rules). Dropping the axis keeps every key.
+[MCHOSE Mix 87-III keys without horizontal scroll]
+MatchName=MCHOSE Mix 87-III Keyboard
+AttrEventCode=-REL_HWHEEL;-REL_HWHEEL_HI_RES;

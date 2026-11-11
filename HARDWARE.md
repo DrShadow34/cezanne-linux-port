@@ -27,13 +27,13 @@ not started).
 
 | Hardware | Driver / stack | Origin | Status | Firmware |
 |---|---|---|---|---|
-| CPU 4x Cortex-A55 2.0 GHz + 4x Cortex-A77 2.6 GHz | cpufreq through MCUPM (0013, 0060), energy model (0032), PSCI cpuidle + hotplug (0033), uclamp touch boost | new (cpufreq), mainline (idle) | works; sustained big-core clocks limited by thermals | MCUPM firmware (`mcupm` partition, loaded by lk) |
+| CPU 4x Cortex-A55 2.0 GHz + 4x Cortex-A77 2.6 GHz | cpufreq through MCUPM (0013, 0060), energy model (0032), PSCI cpuidle + hotplug (0033), uclamp touch boost | new (cpufreq), mainline (idle) | works; under sustained game load the big cores hold 1.75-1.93 GHz (power_allocator, see thermal sensors) | MCUPM firmware (`mcupm` partition, loaded by lk) |
 | Voltage trimming (EEM / SVS: CPU clusters, CCI, GPU) | mtk-svs + MT6885 data (0059), MCUPM OPP tables (0060), panfrost OPP notifier (0061), init02 on a temp error (0064) | adapted (MT8192 / MT8186 SVS) | works: per-chip voltages, 30-90 mV below the signoff tables, re-run on every resume | none (per-chip efuse data) |
 | Clocks, resets (topckgen, apmixed, subsystems) | clk-mt6885 (0002, 0008, 0042, 0044) | adapted (MT8192) | works | none |
 | Pin control / GPIO | pinctrl-mt6885 (0006) | adapted (MediaTek paris) | works | none |
 | Power domains (SCPSYS) | mtk-pm-domains + MT6885 domains (0009, 0020, 0022, 0026, 0046, 0050, 0052, 0056) | adapted | works | none |
 | IOMMU / SMI larbs | mtk_iommu, mtk-smi + MT6885 data (0043) | adapted | works | none |
-| Thermal sensors (LVTS) | lvts_thermal + MT6885 (0012, 0062), reprogrammed after deep suspend (0063), DT trips | adapted | works (before 0063 every zone was dead after the first deep standby until reboot); step_wise with wide hysteresis on the big cores; no LVTS hardware protection (RGU) | none (efuse calibration) |
+| Thermal sensors (LVTS) | lvts_thermal + MT6885 (0012, 0062), reprogrammed after deep suspend (0063), DT trips | adapted | works (before 0063 every zone was dead after the first deep standby until reboot); big-core zones on power_allocator (switch-on 55 C, control 80 C, 1.1 W; cezanne-base udev rule 69-cezanne-thermal.rules, 7.3.1-32), step_wise on the others; no LVTS hardware protection (RGU) | none (efuse calibration) |
 | PMIC MT6359 (regulators, keys, RTC, ADC) | mt6359 regulators / keys / auxadc, rtc-mt6397 (0015) | mainline | works | none |
 | Fuel gauge (MT6359) | mt6359 gauge (0014) | new | works | none |
 | Watchdog | mtk_wdt (0016) | mainline | works | none |
@@ -53,9 +53,9 @@ not started).
 
 | Hardware | Driver / stack | Origin | Status | Firmware |
 |---|---|---|---|---|
-| GPU Mali-G77 MC9 (kernel) | panfrost + Mali-G77 / MT6885 (0010, 0054, 0061) | adapted | works; 350-836 MHz; MFGPLL is hardware-capped at ~854 MHz, CON1 and FHCTL alike (no overclock) | none |
+| GPU Mali-G77 MC9 (kernel) | panfrost + Mali-G77 / MT6885 (0010, 0054, 0061), G57 id for containers (0080), implicit sync only on shared BOs for render-pass overlap (0081, 0082) | adapted | works; 350-836 MHz; MFGPLL is hardware-capped at ~854 MHz, CON1 and FHCTL alike (no overclock) | none |
 | GPU OpenGL ES / OpenGL | Mesa panfrost + G77 (mesa-g77 0001) | adapted | works (GL 3.1, GLES 3.1) | none |
-| GPU Vulkan | Mesa PanVK for Valhall on the job manager (mesa-g77 0002) + DXVK features 0004-0015 (geometry shaders through Mesa's poly from Asahi, clip / cull, wireframe, robustness2) | new (v9 JM), adapted (poly) | works (Vulkan 1.4, DXVK); gaps in software-patches/mesa/DXVK.md | none |
+| GPU Vulkan | Mesa PanVK for Valhall on the job manager (mesa-g77 0002) + DXVK features 0004-0015 (geometry shaders through Mesa's poly from Asahi, clip / cull, wireframe, robustness2), compressed textures (0017), render-pass overlap (0018, on by default) | new (v9 JM), adapted (poly) | works (Vulkan 1.4, DXVK); gaps in software-patches/mesa/DXVK.md | none |
 | Display pipeline (OVL, RDMA, DSC, DSI command mode, dual pipe 120 Hz) | mediatek-drm + MT6885 (0005, 0011, 0021-0027, 0029-0031, 0034) | adapted | works (120 Hz, HDR10, AOD, DC dimming + MIUI colour schemes via cezanne-dc-dimming); CRTC has CTM / GAMMA_LUT (GNOME Night Light untested); AAL (content-adaptive brightness) and the display resizer unused | none |
 | Panel 6.67" AMOLED 1080x2400 (j10) | panel-xiaomi-j10 (0028) | new (vendor panel tables) | works; 60 / 120 Hz only | none (init tables in the driver) |
 | Touchscreen Goodix GT9896 | goodix-yellowstone (0007, 0057, 0058) | new | works; no gestures / double-tap wake | none (the GT9896 runs from its own flash) |

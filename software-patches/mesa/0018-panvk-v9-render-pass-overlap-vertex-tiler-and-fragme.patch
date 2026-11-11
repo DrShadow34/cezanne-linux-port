@@ -1,0 +1,1047 @@
+From 4aa6ac3700c7a880bd022f810a98da35f185dcec Mon Sep 17 00:00:00 2001
+From: DrShadow34 <26345330+DrShadow34@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:23:08 +0100
+Subject: [PATCH] panvk: v9 render-pass overlap (vertex/tiler and fragment
+ chains in parallel)
+
+Every batch's vertex/tiler/compute submit waited for the queue's last
+submit, the previous batch's fragment chain, and the kernel added an
+implicit write dependency on every BO of a submit (device-wide ones like
+the sample positions are in all of them): JS1 and JS0 never ran at the
+same time. A frame's GPU time was the sum of its vertex/tiler and fragment
+work instead of about the larger of the two.
+
+On kernels with linux-cezanne's PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC
+(patch 0081, DRM_PANFROST_PARAM_SHARED_IMPLICIT_SYNC; PANVK_JM_OVERLAP=0
+turns it off): the kernel only takes implicit
+dependencies on dma-buf shared BOs and the queue orders its own chains:
+- each slot runs its chains in order; a vertex/tiler/compute chain waits
+  for the previous one, a fragment chain for the last vertex/tiler/compute
+  chain and the previous fragment chain;
+- two device tiler heaps (the second only with overlap), alternating per
+  batch that tiles (polygon lists and the IDVS varyings live there): a
+  batch tiles while the previous one's fragment job still reads the other
+  heap, and waits for the last fragment chain that read its own;
+- a vertex/tiler/compute chain waits for all earlier fragment chains when
+  a query command (reset, end, copy) or a timestamp whose stage may run in
+  fragment jobs asks for it, or after a pipeline barrier whose source may
+  run in fragment jobs and whose destination in vertex/tiler/compute jobs
+  (transfers count on both sides: vk_meta blits, clears, resolves and MSAA
+  copies are fragment jobs) - but then only if it can see what those jobs
+  touched: it has compute jobs (dispatches, copies, helper kernels), a
+  vertex shader accessing memory (textures, images, storage / texel
+  buffers, global: vs.reads_memory, scanned at compile time and kept in
+  the pipeline cache), or earlier fragment shaders wrote memory (vertex /
+  index / indirect buffers). A skipped barrier stays pending for the
+  chains after it. DXVK's broad barriers (all graphics + compute +
+  transfer stages) between render passes no longer serialise them;
+- queue->sync (fences, semaphores, vkQueueWaitIdle) and event signals are
+  the merge of the last chain of each kind (sync_file merge).
+
+Not covered: memory aliasing between an image a fragment job wrote and a
+vertex / index buffer read after a barrier (only fragment shader stores
+make those wait).
+
+v9 only: Bifrost's indirect draws keep varyings in one device buffer the
+fragment jobs read. PANVK_JM_OVERLAP=0 and older kernels: the previous
+fully serial submission. PANVK_DEBUG=startup logs the mode.
+
+Tests (tests/vkoverlap: slow fragment pass, then the dependent access on
+the vertex/tiler/compute side: vertex shader texture read, compute read,
+copy, occlusion query copy, write after read, a barrier skipped by a pass
+without memory access and the dispatch after it, a fragment shader store
+read as a vertex buffer): no failures with or without overlap, one submit
+per frame or one for all; each insufficient-barrier control (BAD, BAD2,
+BAD3) reads stale data in 40/40 frames with overlap and 0 without.
+Synthetic heavy vertex + heavy fragment passes 59 -> 49 ms per frame, also
+with DXVK-style broad barriers.
+VK-GL-CTS 1.4.6.2 with overlap: the ordering groups in full (654k cases:
+synchronization, synchronization2, memory, query_pool, renderpasses,
+draw, compute, multiview, copy_and_blit, image_clearing, ...) and a 1/5
+sample of vk-default: every failure also fails without overlap. Dark Souls
+Remastered (DXVK): 27.9 -> 26.2 ms per frame.
+---
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h     |  49 +++
+ src/panfrost/vulkan/jm/panvk_queue.h          |  28 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c  |  68 +++-
+ .../vulkan/jm/panvk_vX_cmd_dispatch.c         |   2 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c |   6 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c |   1 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_query.c   |  13 +-
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   | 305 +++++++++++++-----
+ src/panfrost/vulkan/panvk_device.h            |  15 +-
+ src/panfrost/vulkan/panvk_shader.h            |   5 +
+ src/panfrost/vulkan/panvk_vX_device.c         |  33 +-
+ src/panfrost/vulkan/panvk_vX_shader.c         |  50 ++-
+ 12 files changed, 475 insertions(+), 100 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index fcad5d2..ab06b41 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -102,8 +102,53 @@ struct panvk_batch {
+    /* has timestamp writes: run with the GPU cycle/timestamp counters on */
+    bool needs_cycle_count;
+    bool issued;
++   /* v9 render-pass overlap (jm/panvk_vX_gpu_queue.c): the vertex/tiler/
++    * compute jobs wait for every earlier fragment job (query commands,
++    * timestamps) */
++   bool wait_frag;
++   /* a pipeline barrier from work that may run in fragment jobs to work that
++    * may run in vertex/tiler/compute jobs precedes the batch's commands: they
++    * wait for the earlier fragment jobs if they can access what those wrote
++    * or read (vtc_reads_mem, or fragment jobs that wrote memory) */
++   bool barrier_frag;
++   /* the vertex/tiler/compute chain accesses memory beyond vertex / index
++    * buffers and UBOs: compute jobs (dispatches, copies, helper kernels) or
++    * vertex shaders with textures, images, storage / texel buffers */
++   bool vtc_reads_mem;
++   /* a fragment shader of the batch writes memory (storage buffers, images,
++    * atomics) */
++   bool frag_writes_mem;
++   /* device tiler heap the batch tiles into */
++   uint8_t tiler_heap;
+ };
+ 
++/* Pipeline stages whose work only runs in vertex/tiler/compute jobs (JS1) /
++ * only in fragment jobs (JS0), for the v9 render-pass overlap. Transfers are
++ * in neither: vk_meta blits, clears, resolves and MSAA copies are fragment
++ * jobs, the other copies compute jobs. TOP_OF_PIPE / BOTTOM_OF_PIPE /
++ * HOST: no device work in a first / second synchronization scope. */
++#define PANVK_JM_VTC_ONLY_STAGES                                               \
++   (VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_HOST_BIT |       \
++    VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |                                    \
++    VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |                                     \
++    VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |                                      \
++    VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |                           \
++    VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |                        \
++    VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |                                    \
++    VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |                      \
++    VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |                   \
++    VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |                                  \
++    VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT |                           \
++    VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT |                        \
++    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
++#define PANVK_JM_FRAG_ONLY_STAGES                                              \
++   (VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_HOST_BIT |    \
++    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |                                  \
++    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |                             \
++    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |                              \
++    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |                          \
++    VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
++
+ enum panvk_cmd_event_op_type {
+    PANVK_EVENT_OP_SET,
+    PANVK_EVENT_OP_RESET,
+@@ -125,6 +170,10 @@ struct panvk_cmd_buffer {
+    struct list_head push_sets;
+    struct panvk_batch *cur_batch;
+    VkCommandBufferUsageFlags flags;
++   /* a barrier since the last batch: the next one gets barrier_frag */
++   bool barrier_frag;
++   /* tiler heap of the next batch that tiles (alternating) */
++   uint8_t next_tiler_heap;
+ 
+    struct {
+       struct panvk_cmd_graphics_state gfx;
+diff --git a/src/panfrost/vulkan/jm/panvk_queue.h b/src/panfrost/vulkan/jm/panvk_queue.h
+index 89b63a2..664e24a 100644
+--- a/src/panfrost/vulkan/jm/panvk_queue.h
++++ b/src/panfrost/vulkan/jm/panvk_queue.h
+@@ -18,7 +18,35 @@
+ 
+ struct panvk_gpu_queue {
+    struct vk_queue vk;
++   /* everything submitted so far */
+    uint32_t sync;
++#if PAN_ARCH == 9
++   /* Render-pass overlap: the kernel takes implicit dependencies on shared
++    * BOs only (PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC) and the queue orders
++    * its chains itself, so the vertex/tiler/compute jobs of a batch (JS1)
++    * run while earlier fragment jobs (JS0) still do. Off: every chain
++    * waits for the previous one. */
++   bool overlap;
++   /* last vertex/tiler/compute chain */
++   uint32_t vtc_sync;
++   /* last fragment chain of a batch tiling into heap 0 / 1, or without a
++    * tiler (2): the next batch tiling into a heap waits for its reader */
++   uint32_t frag_sync[3];
++   /* frag_sync slot of the last fragment chain; fragment chains run in
++    * order, so it stands for all of them */
++   unsigned last_frag;
++   /* a wait_frag batch had no vertex/tiler/compute chain: the next one
++    * waits instead */
++   bool carry_wait_frag;
++   /* a barrier from fragment to vertex/tiler/compute work whose wait was
++    * skipped (the chains after it didn't access memory): the first chain
++    * that does still waits */
++   bool barrier_pending;
++   /* fragment jobs not waited for yet wrote memory (storage buffers,
++    * images): after a barrier, vertex / index / indirect buffer reads count
++    * too */
++   bool frag_dirty;
++#endif
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(panvk_gpu_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index bc5fe87..d6743c5 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -33,6 +33,7 @@
+ 
+ #include "vk_descriptor_update_template.h"
+ #include "vk_format.h"
++#include "vk_synchronization.h"
+ 
+ static VkResult
+ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
+@@ -78,7 +79,9 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
+    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
+       if (util_dynarray_num_elements(&batch->event_ops,
+                                      struct panvk_cmd_event_op) == 0) {
+-         /* Content-less batch, let's drop it */
++         /* Content-less batch, let's drop it; a barrier it carried goes
++          * to the next batch */
++         cmdbuf->barrier_frag |= batch->barrier_frag;
+          vk_free(&cmdbuf->vk.pool->alloc, batch);
+       } else {
+          /* Batch has no jobs but is needed for synchronization, let's add a
+@@ -272,6 +275,11 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
+ 
+    const struct pan_fb_layout *fb = &cmdbuf->state.gfx.render.fb.layout;
+    uint32_t layer_count = cmdbuf->state.gfx.render.layer_count;
++   if (dev->jm_overlap) {
++      batch->tiler_heap = cmdbuf->next_tiler_heap;
++      cmdbuf->next_tiler_heap ^= 1;
++   }
++   const struct panvk_priv_bo *heap = dev->tiler_heap[batch->tiler_heap];
+    batch->tiler.heap_desc = panvk_cmd_alloc_desc(cmdbuf, TILER_HEAP);
+    batch->tiler.ctx_descs =
+       panvk_cmd_alloc_desc_array(cmdbuf, layer_count, TILER_CONTEXT);
+@@ -282,15 +290,15 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
+       batch->tiler.ctx_descs.gpu + (pan_size(TILER_CONTEXT) * layer_idx);
+ 
+    pan_pack(&batch->tiler.heap_templ, TILER_HEAP, cfg) {
+-      cfg.size = pan_kmod_bo_size(dev->tiler_heap->bo);
+-      cfg.base = dev->tiler_heap->addr.dev;
+-      cfg.bottom = dev->tiler_heap->addr.dev;
++      cfg.size = pan_kmod_bo_size(heap->bo);
++      cfg.base = heap->addr.dev;
++      cfg.bottom = heap->addr.dev;
+       cfg.top = cfg.base + cfg.size;
+    }
+ 
+    pan_pack(&batch->tiler.ctx_templ, TILER_CONTEXT, cfg) {
+       cfg.hierarchy_mask = panvk_select_tiler_hierarchy_mask(
+-         phys_dev, &cmdbuf->state.gfx, pan_kmod_bo_size(dev->tiler_heap->bo));
++         phys_dev, &cmdbuf->state.gfx, pan_kmod_bo_size(heap->bo));
+       cfg.fb_width = fb->width_px;
+       cfg.fb_height = fb->height_px;
+ 
+@@ -351,6 +359,8 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+    cmdbuf->cur_batch->compute_job_copies = UTIL_DYNARRAY_INIT;
+ #endif
+    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
++   cmdbuf->cur_batch->barrier_frag = cmdbuf->barrier_frag;
++   cmdbuf->barrier_frag = false;
+    assert(cmdbuf->cur_batch);
+    return cmdbuf->cur_batch;
+ }
+@@ -367,11 +377,47 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+    return vk_command_buffer_end(&cmdbuf->vk);
+ }
+ 
++/* Whether a barrier orders work that may run in fragment jobs (src) before
++ * work that may run in vertex/tiler/compute jobs (dst). The queue runs the
++ * two kinds of chains on their own slots, in order within each slot: only
++ * such a barrier needs the later vertex/tiler/compute jobs to wait for the
++ * earlier fragment ones. Transfers count on both sides (vk_meta blits,
++ * clears, resolves and MSAA copies are fragment jobs, the other copies
++ * compute jobs). */
++static bool
++barrier_waits_frag(const VkDependencyInfo *info)
++{
++   VkPipelineStageFlags2 src = 0, dst = 0;
++
++   for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
++      src |= info->pMemoryBarriers[i].srcStageMask;
++      dst |= info->pMemoryBarriers[i].dstStageMask;
++   }
++   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
++      src |= info->pBufferMemoryBarriers[i].srcStageMask;
++      dst |= info->pBufferMemoryBarriers[i].dstStageMask;
++   }
++   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
++      src |= info->pImageMemoryBarriers[i].srcStageMask;
++      dst |= info->pImageMemoryBarriers[i].dstStageMask;
++   }
++
++   /* BOTTOM_OF_PIPE as source / TOP_OF_PIPE as destination mean all
++    * commands; ALL_COMMANDS / ALL_GRAPHICS / ALL_TRANSFER stay set and
++    * count on both sides */
++   src = vk_expand_src_stage_flags2(src);
++   dst = vk_expand_dst_stage_flags2(dst);
++
++   return (src & ~PANVK_JM_VTC_ONLY_STAGES) &&
++          (dst & ~PANVK_JM_FRAG_ONLY_STAGES);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+                                     const VkDependencyInfo *pDependencyInfo)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++   bool frag = PAN_ARCH == 9 && barrier_waits_frag(pDependencyInfo);
+ 
+    /* Caches are flushed/invalidated at batch boundaries for now, nothing to do
+     * for memory barriers assuming we implement barriers with the creation of a
+@@ -379,12 +425,18 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+     */
+ #if PAN_ARCH == 9
+    /* Compute-only batch: keep the chain, the next dispatch gets a cache
+-    * flush job with the barrier flag (jobs in a chain already run in order). */
+-   if (cmdbuf->cur_batch && cmdbuf->cur_batch->compute_only) {
++    * flush job with the barrier flag (jobs in a chain already run in order).
++    * No fragment job can come between the batch's start and the barrier: a
++    * batch that already waits for them (compute jobs access memory) needs no
++    * new one. */
++   if (cmdbuf->cur_batch && cmdbuf->cur_batch->compute_only &&
++       (!frag || cmdbuf->cur_batch->barrier_frag ||
++        cmdbuf->cur_batch->wait_frag)) {
+       cmdbuf->cur_batch->needs_cache_flush = true;
+       return;
+    }
+ #endif
++   cmdbuf->barrier_frag |= frag;
+    if (cmdbuf->cur_batch) {
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
+       panvk_per_arch(cmd_open_batch)(cmdbuf);
+@@ -418,6 +470,8 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
+    panvk_cmd_buffer_obj_list_reset(cmdbuf, push_sets);
+ 
+    memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
++   cmdbuf->barrier_frag = false;
++   cmdbuf->next_tiler_heap = 0;
+ }
+ 
+ static void
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
+index 3ade843..8530c4d 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
+@@ -300,6 +300,7 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+    pan_jc_add_job(&batch->vtc_jc,
+                   indirect ? MALI_JOB_TYPE_NOT_STARTED : MALI_JOB_TYPE_COMPUTE,
+                   chained, false, 0, indirect_dep, &job, false);
++   batch->vtc_reads_mem = true;
+ 
+    /* the batch stays open for the next dispatch */
+    clear_dirty_after_dispatch(cmdbuf);
+@@ -457,6 +458,7 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+    pan_jc_add_job(&batch->vtc_jc,
+                   indirect ? MALI_JOB_TYPE_NOT_STARTED : MALI_JOB_TYPE_COMPUTE,
+                   false, false, 0, copy_desc_dep, &job, false);
++   batch->vtc_reads_mem = true;
+ 
+    panvk_per_arch(cmd_close_batch)(cmdbuf);
+    clear_dirty_after_dispatch(cmdbuf);
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+index 5d5884c..3aa778c 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+@@ -853,6 +853,11 @@ emit_idvs_job(struct panvk_cmd_buffer *cmdbuf,
+    enum mesa_prim prim = cmdbuf->state.gfx.idvs.prim;
+    bool secondary = vs->info.vs.secondary_enable && fs != NULL;
+ 
++   /* render-pass overlap: what the batch's chains access */
++   batch->vtc_reads_mem |= vs->vs.reads_memory;
++   if (fs)
++      batch->frag_writes_mem |= fs->info.writes_global;
++
+    /* No polygon modes in the tiler. VK_POLYGON_MODE_POINT: the vertices of
+     * the triangles as a point list (each vertex once, not once per
+     * triangle; no face culling). */
+@@ -1105,6 +1110,7 @@ add_poly_compute_job(struct panvk_cmd_buffer *cmdbuf, struct pan_ptr *job,
+       &batch->vtc_jc,
+       gpu_patched ? MALI_JOB_TYPE_NOT_STARTED : MALI_JOB_TYPE_COMPUTE, false,
+       false, dep, 0, job, false);
++   batch->vtc_reads_mem = true;
+ 
+    if (gpu_patched) {
+       struct panvk_compute_job_copy copy = {.job = job->cpu};
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
+index 9ca327d..7103468 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
+@@ -137,4 +137,5 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
+    pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, job_barrier,
+                   suppress_prefetch, grid.jm.local_dep, grid.jm.global_dep,
+                   &job, false);
++   batch->vtc_reads_mem = true;
+ }
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+index 1bde643..16b9509 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+@@ -24,6 +24,7 @@
+ #include "panvk_query_pool.h"
+ 
+ #include "libpan.h"
++#include "vk_synchronization.h"
+ 
+ static nir_def *
+ panvk_nir_query_report_dev_addr(nir_builder *b, nir_def *pool_addr,
+@@ -95,7 +96,9 @@ panvk_emit_clear_queries(struct panvk_cmd_buffer *cmd,
+    };
+ 
+    bool had_batch;
+-   open_batch(cmd, &had_batch);
++   /* query commands run in submission order, with the fragment jobs that
++    * count into the queries */
++   open_batch(cmd, &had_batch)->wait_frag = true;
+    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
+    panlib_clear_query_result_struct(&precomp_ctx, panlib_1d(query_count),
+                                     PANLIB_BARRIER_NONE, push);
+@@ -133,6 +136,10 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
+ 
+    struct panvk_batch *batch = panvk_per_arch(cmd_open_batch)(cmd);
+    batch->needs_cycle_count = true;
++   /* after the fragment jobs too, unless the stage only runs in vertex/
++    * tiler/compute jobs (that chain runs in order) */
++   batch->wait_frag =
++      (vk_expand_src_stage_flags2(stage) & ~PANVK_JM_VTC_ONLY_STAGES) != 0;
+ 
+    /* Inside a multiview render pass a timestamp takes one query per view;
+     * the extra ones may be zero. */
+@@ -238,6 +245,8 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
+    bool had_batch;
+    struct panvk_batch *batch = open_batch(cmd, &had_batch);
+    had_batch |= end_sync;
++   /* the availability write follows the fragment jobs that counted */
++   batch->wait_frag = true;
+ 
+    switch (pool->vk.query_type) {
+    case VK_QUERY_TYPE_OCCLUSION: {
+@@ -285,7 +294,7 @@ panvk_meta_copy_query_pool_results(struct panvk_cmd_buffer *cmd,
+    };
+ 
+    bool had_batch;
+-   open_batch(cmd, &had_batch);
++   open_batch(cmd, &had_batch)->wait_frag = true;
+    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
+    panlib_copy_query_result_struct(&precomp_ctx, panlib_1d(query_count),
+                                    PANLIB_BARRIER_NONE, push);
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 6fd184a..3563a3c 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -28,6 +28,96 @@
+ #include "vk_framebuffer.h"
+ 
+ #include "drm-uapi/panfrost_drm.h"
++#include "util/libsync.h"
++#include "util/log.h"
++#include "util/u_debug.h"
++
++static void
++panvk_queue_submit_jc(struct panvk_gpu_queue *queue,
++                      struct panvk_cmd_buffer *cmdbuf, uint64_t jc,
++                      uint32_t requirements, uint32_t *bos, unsigned nr_bos,
++                      uint32_t *in_syncs, unsigned nr_in_syncs,
++                      uint32_t out_sync)
++{
++   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
++   struct panvk_physical_device *phys_dev =
++      to_panvk_physical_device(dev->vk.physical);
++   struct drm_panfrost_submit submit = {
++      .bo_handles = (uintptr_t)bos,
++      .bo_handle_count = nr_bos,
++      .in_syncs = (uintptr_t)in_syncs,
++      .in_sync_count = nr_in_syncs,
++      .out_sync = out_sync,
++      .jc = jc,
++      .requirements = requirements,
++   };
++   ASSERTED int ret;
++
++   ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
++   assert(!ret);
++
++   if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
++      ret = drmSyncobjWait(dev->drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
++                           NULL);
++      assert(!ret);
++
++      /* If we want to read the descriptors back, we need to invalidate the
++       * whole desc pool, otherwise we might end up with stale data. */
++      panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
++      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
++   }
++
++   if (PANVK_DEBUG(TRACE))
++      pandecode_jc(dev->debug.decode_ctx, jc,
++                   phys_dev->kmod.dev->props.gpu_id);
++
++   if (PANVK_DEBUG(DUMP))
++      pandecode_dump_mappings(dev->debug.decode_ctx);
++
++   if (PANVK_DEBUG(SYNC))
++      pandecode_abort_on_fault(dev->debug.decode_ctx, jc,
++                               phys_dev->kmod.dev->props.gpu_id);
++}
++
++#if PAN_ARCH == 9
++/* queue->sync = the last vertex/tiler/compute chain and the last fragment
++ * chain, i.e. everything submitted so far */
++static void
++panvk_queue_join(struct panvk_gpu_queue *queue)
++{
++   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
++   uint32_t src[2] = {queue->vtc_sync, queue->frag_sync[queue->last_frag]};
++   int fd[2] = {-1, -1};
++   ASSERTED int ret;
++
++   for (unsigned i = 0; i < 2; i++) {
++      struct drm_syncobj_handle handle = {
++         .handle = src[i],
++         .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
++         .fd = -1,
++      };
++
++      ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD,
++                           &handle);
++      assert(!ret);
++      fd[i] = handle.fd;
++   }
++
++   struct drm_syncobj_handle handle = {
++      .handle = queue->sync,
++      .flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
++      .fd = sync_merge("panvk", fd[0], fd[1]),
++   };
++
++   assert(handle.fd >= 0);
++   ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &handle);
++   assert(!ret);
++
++   close(handle.fd);
++   close(fd[0]);
++   close(fd[1]);
++}
++#endif
+ 
+ static void
+ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+@@ -37,8 +127,6 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+                          unsigned nr_in_fences)
+ {
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+-   struct panvk_physical_device *phys_dev =
+-      to_panvk_physical_device(dev->vk.physical);
+    ASSERTED int ret;
+ 
+    /* Reset the batch if it's already been issued */
+@@ -48,8 +136,17 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+        * submitted twice in one vkQueueSubmit): wait for the queue so the
+        * GPU isn't running the previous instance while we rewrite it. */
+       if (cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) {
+-         ret = drmSyncobjWait(dev->drm_fd, &queue->sync, 1, INT64_MAX, 0,
+-                              NULL);
++#if PAN_ARCH == 9
++         if (queue->overlap) {
++            uint32_t syncs[2] = {queue->vtc_sync,
++                                 queue->frag_sync[queue->last_frag]};
++
++            ret = drmSyncobjWait(dev->drm_fd, syncs, 2, INT64_MAX,
++                                 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
++         } else
++#endif
++            ret = drmSyncobjWait(dev->drm_fd, &queue->sync, 1, INT64_MAX, 0,
++                                 NULL);
+          assert(!ret);
+       }
+ 
+@@ -101,86 +198,82 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+     * make sure things are GPU-visible. */
+    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+ 
+-   if (batch->vtc_jc.first_job) {
+-      struct drm_panfrost_submit submit = {
+-         .bo_handles = (uintptr_t)bos,
+-         .bo_handle_count = nr_bos,
+-         .in_syncs = (uintptr_t)in_fences,
+-         .in_sync_count = nr_in_fences,
+-         .out_sync = queue->sync,
+-         .jc = batch->vtc_jc.first_job,
+-         .requirements =
+-            batch->needs_cycle_count ? PANFROST_JD_REQ_CYCLE_COUNT : 0,
+-      };
+-
+-      ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
+-      assert(!ret);
+-
+-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
+-         ret = drmSyncobjWait(dev->drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
+-                              NULL);
+-         assert(!ret);
+-
+-         /* If we want to read the descriptors back, we need to invalidate the
+-          * whole desc pool, otherwise we might end up with stale data. */
+-         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+-         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+-      }
+-
+-      if (PANVK_DEBUG(TRACE)) {
+-         pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
+-                      phys_dev->kmod.dev->props.gpu_id);
+-      }
+-
+-      if (PANVK_DEBUG(DUMP))
+-         pandecode_dump_mappings(dev->debug.decode_ctx);
++   uint32_t cycle_count =
++      batch->needs_cycle_count ? PANFROST_JD_REQ_CYCLE_COUNT : 0;
+ 
+-      if (PANVK_DEBUG(SYNC))
+-         pandecode_abort_on_fault(dev->debug.decode_ctx, submit.jc,
+-                                  phys_dev->kmod.dev->props.gpu_id);
+-   }
+-
+-   if (batch->frag_jc.first_job) {
+-      struct drm_panfrost_submit submit = {
+-         .bo_handles = (uintptr_t)bos,
+-         .bo_handle_count = nr_bos,
+-         .out_sync = queue->sync,
+-         .jc = batch->frag_jc.first_job,
+-         .requirements = PANFROST_JD_REQ_FS |
+-            (batch->needs_cycle_count ? PANFROST_JD_REQ_CYCLE_COUNT : 0),
+-      };
++#if PAN_ARCH == 9
++   if (queue->overlap) {
++      /* JS1 and JS0 each run their chains in order. The vertex/tiler/compute
++       * chain waits for the previous one, for the last fragment chain that
++       * read its tiler heap (polygon lists, varyings), and for all fragment
++       * chains when a query or a timestamp asks for it (wait_frag), or after
++       * a barrier from fragment work when it can see what those jobs
++       * touched: its compute jobs or vertex shaders access memory, or the
++       * fragment jobs wrote memory (vertex / index / indirect buffers). A
++       * skipped barrier stays pending for the chains after it. The fragment
++       * chain waits for the last vertex/tiler/compute chain (its own, or
++       * what a load reads) and the previous fragment chain. The submit's
++       * semaphores and event waits go to the first chain of the batch. */
++      uint32_t reqs = cycle_count | PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC;
++      bool tiles = batch->tiler.heap_desc.gpu != 0;
++      unsigned frag_slot = tiles ? batch->tiler_heap : 2;
++      bool barrier = batch->barrier_frag || queue->barrier_pending;
++      bool forced = batch->wait_frag || queue->carry_wait_frag;
++      bool wait_frag =
++         forced || (barrier && (batch->vtc_reads_mem || queue->frag_dirty));
++      unsigned n = nr_in_fences;
++
++      queue->carry_wait_frag = false;
+ 
+       if (batch->vtc_jc.first_job) {
+-         submit.in_syncs = (uintptr_t)(&queue->sync);
+-         submit.in_sync_count = 1;
++         in_fences[n++] = queue->vtc_sync;
++         if (tiles)
++            in_fences[n++] = queue->frag_sync[batch->tiler_heap];
++         if (wait_frag)
++            in_fences[n++] = queue->frag_sync[queue->last_frag];
++
++         panvk_queue_submit_jc(queue, cmdbuf, batch->vtc_jc.first_job, reqs,
++                               bos, nr_bos, in_fences, n, queue->vtc_sync);
++         n = 0;
++
++         /* waited: every earlier fragment chain is done before it starts */
++         queue->barrier_pending = barrier && !wait_frag;
++         if (wait_frag)
++            queue->frag_dirty = false;
+       } else {
+-         submit.in_syncs = (uintptr_t)in_fences;
+-         submit.in_sync_count = nr_in_fences;
++         queue->carry_wait_frag = forced;
++         queue->barrier_pending = barrier;
+       }
+ 
+-      ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
+-      assert(!ret);
+-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
+-         ret = drmSyncobjWait(dev->drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
+-                              NULL);
+-         assert(!ret);
++      if (batch->frag_jc.first_job) {
++         in_fences[n++] = queue->vtc_sync;
++         in_fences[n++] = queue->frag_sync[queue->last_frag];
+ 
+-         /* If we want to read the descriptors back, we need to invalidate the
+-          * whole desc pool, otherwise we might end up with stale data. */
+-         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+-         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
++         panvk_queue_submit_jc(queue, cmdbuf, batch->frag_jc.first_job,
++                               reqs | PANFROST_JD_REQ_FS, bos, nr_bos,
++                               in_fences, n, queue->frag_sync[frag_slot]);
++         queue->last_frag = frag_slot;
++         queue->frag_dirty |= batch->frag_writes_mem;
++      }
++   } else
++#endif
++   {
++      if (batch->vtc_jc.first_job)
++         panvk_queue_submit_jc(queue, cmdbuf, batch->vtc_jc.first_job,
++                               cycle_count, bos, nr_bos, in_fences,
++                               nr_in_fences, queue->sync);
++
++      if (batch->frag_jc.first_job) {
++         if (batch->vtc_jc.first_job)
++            panvk_queue_submit_jc(queue, cmdbuf, batch->frag_jc.first_job,
++                                  cycle_count | PANFROST_JD_REQ_FS, bos,
++                                  nr_bos, &queue->sync, 1, queue->sync);
++         else
++            panvk_queue_submit_jc(queue, cmdbuf, batch->frag_jc.first_job,
++                                  cycle_count | PANFROST_JD_REQ_FS, bos,
++                                  nr_bos, in_fences, nr_in_fences,
++                                  queue->sync);
+       }
+-
+-      if (PANVK_DEBUG(TRACE))
+-         pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
+-                      phys_dev->kmod.dev->props.gpu_id);
+-
+-      if (PANVK_DEBUG(DUMP))
+-         pandecode_dump_mappings(dev->debug.decode_ctx);
+-
+-      if (PANVK_DEBUG(SYNC))
+-         pandecode_abort_on_fault(dev->debug.decode_ctx, submit.jc,
+-                                  phys_dev->kmod.dev->props.gpu_id);
+    }
+ 
+    if (PANVK_DEBUG(TRACE))
+@@ -242,6 +335,10 @@ panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
+    util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
+       switch (op->type) {
+       case PANVK_EVENT_OP_SET: {
++#if PAN_ARCH == 9
++         if (queue->overlap)
++            panvk_queue_join(queue);
++#endif
+          panvk_queue_transfer_sync(queue, op->event->syncobj);
+          break;
+       }
+@@ -272,8 +369,14 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+ 
+-   unsigned nr_semaphores = submit->wait_count + 1;
+-   uint32_t semaphores[nr_semaphores];
++   bool overlap = false;
++#if PAN_ARCH == 9
++   overlap = queue->overlap;
++#endif
++   /* without overlap every batch waits for all earlier work */
++   unsigned first_wait = overlap ? 0 : 1;
++   unsigned nr_semaphores = submit->wait_count + first_wait;
++   uint32_t semaphores[nr_semaphores + 1];
+ 
+    semaphores[0] = queue->sync;
+    for (unsigned i = 0; i < submit->wait_count; i++) {
+@@ -281,7 +384,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+       struct vk_drm_syncobj *syncobj =
+          vk_sync_as_drm_syncobj(submit->waits[i].sync);
+ 
+-      semaphores[i + 1] = syncobj->syncobj;
++      semaphores[i + first_wait] = syncobj->syncobj;
+    }
+ 
+    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
+@@ -318,7 +421,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+             bos[bo_idx++] = pan_kmod_bo_handle(batch->blit.dst);
+ 
+          if (batch->vtc_jc.first_tiler)
+-            bos[bo_idx++] = pan_kmod_bo_handle(dev->tiler_heap->bo);
++            bos[bo_idx++] =
++               pan_kmod_bo_handle(dev->tiler_heap[batch->tiler_heap]->bo);
+ 
+          bos[bo_idx++] = pan_kmod_bo_handle(dev->sample_positions->bo);
+          assert(bo_idx == nr_bos);
+@@ -336,7 +440,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+          unsigned nr_in_fences = 0;
+          unsigned max_wait_event_syncobjs = util_dynarray_num_elements(
+             &batch->event_ops, struct panvk_cmd_event_op);
+-         uint32_t in_fences[nr_semaphores + max_wait_event_syncobjs];
++         /* + the queue's own syncobjs (overlap) */
++         uint32_t in_fences[nr_semaphores + max_wait_event_syncobjs + 3];
+          memcpy(in_fences, semaphores, nr_semaphores * sizeof(*in_fences));
+          nr_in_fences += nr_semaphores;
+ 
+@@ -349,6 +454,11 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+       }
+    }
+ 
++#if PAN_ARCH == 9
++   if (overlap)
++      panvk_queue_join(queue);
++#endif
++
+    /* Transfer the out fence to signal semaphores */
+    for (unsigned i = 0; i < submit->signal_count; i++) {
+       assert(vk_sync_type_is_drm_syncobj(submit->signals[i].sync->type));
+@@ -395,10 +505,36 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
+       goto err_finish_queue;
+    }
+ 
++#if PAN_ARCH == 9
++   queue->overlap = device->jm_overlap;
++   queue->last_frag = 2;
++   if (PANVK_DEBUG(STARTUP))
++      mesa_logi("panvk: queue %u: render-pass overlap %s", queue_idx,
++                queue->overlap ? "on" : "off");
++
++   uint32_t *syncs[] = {&queue->vtc_sync, &queue->frag_sync[0],
++                        &queue->frag_sync[1], &queue->frag_sync[2]};
++   for (unsigned i = 0; queue->overlap && i < ARRAY_SIZE(syncs); i++) {
++      ret = drmSyncobjCreate(device->drm_fd, DRM_SYNCOBJ_CREATE_SIGNALED,
++                             syncs[i]);
++      if (ret) {
++         result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++         goto err_destroy_syncs;
++      }
++   }
++#endif
++
+    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
+    *out_queue = &queue->vk;
+    return VK_SUCCESS;
+ 
++#if PAN_ARCH == 9
++err_destroy_syncs:
++   for (unsigned i = 0; i < ARRAY_SIZE(syncs) && *syncs[i]; i++)
++      drmSyncobjDestroy(device->drm_fd, *syncs[i]);
++   drmSyncobjDestroy(device->drm_fd, queue->sync);
++#endif
++
+ err_finish_queue:
+    vk_queue_finish(&queue->vk);
+ 
+@@ -414,6 +550,13 @@ void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
+ 
+    vk_queue_finish(&queue->vk);
+    drmSyncobjDestroy(dev->drm_fd, queue->sync);
++#if PAN_ARCH == 9
++   if (queue->overlap) {
++      drmSyncobjDestroy(dev->drm_fd, queue->vtc_sync);
++      for (unsigned i = 0; i < ARRAY_SIZE(queue->frag_sync); i++)
++         drmSyncobjDestroy(dev->drm_fd, queue->frag_sync[i]);
++   }
++#endif
+    vk_free(&dev->vk.alloc, queue);
+ }
+ 
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 63f24bc..11eb524 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -27,6 +27,13 @@
+ #include "util/u_printf.h"
+ #include "util/vma.h"
+ 
++/* linux-cezanne patch 0081: implicit dependencies only on dma-buf shared
++ * BOs, the submitter orders the rest */
++#ifndef PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC
++#define PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC    (1 << 16)
++#define DRM_PANFROST_PARAM_SHARED_IMPLICIT_SYNC 0x10000
++#endif
++
+ /* On JM hardware, we need to allocate a buffer depending on vertex count.
+  *
+  * As a result, for indirect and indexed draw we allocate a large buffer with
+@@ -72,7 +79,13 @@ struct panvk_device {
+       struct pan_kmod_allocator allocator;
+    } kmod;
+ 
+-   struct panvk_priv_bo *tiler_heap;
++   /* JM: with jm_overlap, v9 batches alternate between two heaps so a batch
++    * can tile while the previous one's fragment job still reads its polygon
++    * lists and varyings (jm/panvk_vX_gpu_queue.c); otherwise [0] only */
++   struct panvk_priv_bo *tiler_heap[2];
++   /* v9 render-pass overlap, on kernels with
++    * PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC unless PANVK_JM_OVERLAP=0 */
++   bool jm_overlap;
+    struct panvk_priv_bo *indirect_varying_buffer;
+    struct panvk_priv_bo *sample_positions;
+    /* v9: zeroed index buffer bound for a null index buffer (maintenance6),
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index cb7569b..86a2b87 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -443,6 +443,11 @@ struct panvk_shader_variant {
+       struct {
+          /* clip (bits 0-7) and cull (8-15) distances written */
+          uint16_t clip_cull_mask;
++         /* accesses memory a fragment job may have written (textures,
++          * images, storage / texel buffers, global memory): the JM queue's
++          * render-pass overlap waits for earlier fragment jobs after a
++          * barrier only for such vertex/tiler work */
++         bool reads_memory;
+       } vs;
+    };
+ 
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 1060677..4272250 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -10,6 +10,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "drm-uapi/panfrost_drm.h"
+ #include "drm-uapi/panthor_drm.h"
+ 
+ #include "vk_cmd_enqueue_entrypoints.h"
+@@ -36,6 +37,7 @@
+ 
+ #include "kmod/pan_kmod.h"
+ #include "util/os_file.h"
++#include "util/u_debug.h"
+ #include "util/u_printf.h"
+ #include "pan_props.h"
+ #include "pan_samples.h"
+@@ -499,12 +501,25 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+     * also holds the IDVS varyings: give v9 a bigger heap. It's grown on
+     * fault so only what's used is backed, and the kernel maps heaps above
+     * 4G (all VkDevices share one DRM file and its address space). */
+-   result = panvk_priv_bo_create(
+-      device, (PAN_ARCH == 9 ? 512 : 128) * 1024 * 1024,
+-      PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
+-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
+-   if (result != VK_SUCCESS)
+-      goto err_free_priv_bos;
++#if PAN_ARCH == 9
++   struct drm_panfrost_get_param overlap_param = {
++      .param = DRM_PANFROST_PARAM_SHARED_IMPLICIT_SYNC,
++   };
++
++   device->jm_overlap =
++      debug_get_bool_option("PANVK_JM_OVERLAP", true) &&
++      !pan_kmod_ioctl(device->kmod.dev->fd, DRM_IOCTL_PANFROST_GET_PARAM,
++                      &overlap_param) &&
++      overlap_param.value;
++#endif
++   for (unsigned i = 0; i < (device->jm_overlap ? 2 : 1); i++) {
++      result = panvk_priv_bo_create(
++         device, (PAN_ARCH == 9 ? 512 : 128) * 1024 * 1024,
++         PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
++         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap[i]);
++      if (result != VK_SUCCESS)
++         goto err_free_priv_bos;
++   }
+ 
+    result = panvk_priv_bo_create(
+       device,
+@@ -641,7 +656,8 @@ err_free_priv_bos:
+    panvk_priv_bo_unref(device->poly_heap);
+ #endif
+    panvk_priv_bo_unref(device->indirect_varying_buffer);
+-   panvk_priv_bo_unref(device->tiler_heap);
++   panvk_priv_bo_unref(device->tiler_heap[0]);
++   panvk_priv_bo_unref(device->tiler_heap[1]);
+    panvk_device_cleanup_mempools(device);
+    vk_free(&device->vk.alloc, device->dump_region_size);
+ err_free_heaps:
+@@ -693,7 +709,8 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
+    panvk_priv_bo_unref(device->printf.bo);
+    panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
+    panvk_priv_bo_unref(device->indirect_varying_buffer);
+-   panvk_priv_bo_unref(device->tiler_heap);
++   panvk_priv_bo_unref(device->tiler_heap[0]);
++   panvk_priv_bo_unref(device->tiler_heap[1]);
+    panvk_priv_bo_unref(device->sample_positions);
+ #if PAN_ARCH == 9
+    panvk_priv_bo_unref(device->null_index_buffer);
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 1cb6ccf..ea42617 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -1144,6 +1144,48 @@ panvk_lower_nir_io(nir_shader *nir)
+    NIR_PASS(_, nir, nir_opt_constant_folding);
+ }
+ 
++/* See panvk_shader_variant::vs.reads_memory. Conservative: any texture
++ * instruction, any image / SSBO / global / buffer intrinsic, any deref
++ * access that may be one of those; UBOs, push constants and vertex
++ * attributes don't count. */
++static bool
++vs_reads_memory(nir_shader *nir)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_tex)
++               return true;
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            const char *name = nir_intrinsic_infos[intr->intrinsic].name;
++
++            if (strstr(name, "image") || strstr(name, "ssbo") ||
++                strstr(name, "global") || strstr(name, "buf"))
++               return true;
++
++            switch (intr->intrinsic) {
++            case nir_intrinsic_load_deref:
++            case nir_intrinsic_store_deref:
++            case nir_intrinsic_deref_atomic:
++            case nir_intrinsic_deref_atomic_swap:
++            case nir_intrinsic_copy_deref:
++               if (nir_deref_mode_may_be(nir_src_as_deref(intr->src[0]),
++                                         nir_var_mem_ssbo | nir_var_mem_global |
++                                            nir_var_image | nir_var_uniform))
++                  return true;
++               break;
++            default:
++               break;
++            }
++         }
++      }
++   }
++   return false;
++}
++
+ static VkResult
+ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+                   VkShaderCreateFlagsEXT shader_flags,
+@@ -1159,9 +1201,11 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+    /* We're going to modify this so make our own copy to be nicer to callers */
+    struct pan_compile_inputs input = *compile_input;
+ 
+-   if (nir->info.stage == MESA_SHADER_VERTEX)
++   if (nir->info.stage == MESA_SHADER_VERTEX) {
++      shader->vs.reads_memory = vs_reads_memory(nir);
+       NIR_PASS(_, nir, nir_shader_intrinsics_pass, panvk_lower_load_vs_input,
+                nir_metadata_control_flow, NULL);
++   }
+ 
+    pan_postprocess_nir(nir, &input, &shader->info);
+ 
+@@ -2321,6 +2365,8 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
+    case MESA_SHADER_VERTEX:
+       blob_copy_bytes(blob, &shader->vs.clip_cull_mask,
+                       sizeof(shader->vs.clip_cull_mask));
++      blob_copy_bytes(blob, &shader->vs.reads_memory,
++                      sizeof(shader->vs.reads_memory));
+       break;
+ 
+    case MESA_SHADER_FRAGMENT:
+@@ -2482,6 +2528,8 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
+    case MESA_SHADER_VERTEX:
+       blob_write_bytes(blob, &shader->vs.clip_cull_mask,
+                        sizeof(shader->vs.clip_cull_mask));
++      blob_write_bytes(blob, &shader->vs.reads_memory,
++                       sizeof(shader->vs.reads_memory));
+       break;
+ 
+    case MESA_SHADER_FRAGMENT:
+-- 
+2.56.0
+

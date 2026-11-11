@@ -1,7 +1,8 @@
-# Mesa for the phone: ALARM's mesa with the Mali-G77 work (patches 0001-0017 =
+# Mesa for the phone: ALARM's mesa with the Mali-G77 work (patches 0001-0018 =
 # src/mesa/mesa-g77, mainline/mesa-g77/README.md): G77 in Panfrost, PanVK on
 # the v9 job manager with the DXVK features, Wayland WSI pre-rotation, perf
-# counters. Upstream's prepare() applies every *.patch of source=() in order.
+# counters, render-pass overlap (default on, PANVK_JM_OVERLAP=0: off).
+# Upstream's prepare() applies every *.patch of source=() in order.
 cz_source 00*.patch
 
 # only the drivers this SoC uses (the full ALARM set takes hours on the phone)

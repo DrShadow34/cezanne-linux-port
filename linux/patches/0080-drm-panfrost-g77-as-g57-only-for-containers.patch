@@ -1,0 +1,48 @@
+diff --git a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+index d4d0cf5..be4439f 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -10,6 +10,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
++#include <linux/pid_namespace.h>
+ #include <linux/pagemap.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+@@ -95,10 +96,22 @@ static void panfrost_timestamp_release(struct panfrost_device *pfdev,
+ 	pm_runtime_put_autosuspend(pfdev->base.dev);
+ }
+ 
+-/* fallback for Mesa builds without the G77 model (upstream Mesa <= 26.2) */
+-static bool g77_as_g57;
+-module_param(g77_as_g57, bool, 0644);
+-MODULE_PARM_DESC(g77_as_g57, "report Mali-G77 as G57 to userspace, for Mesa without G77 support");
++/*
++ * Mesa builds without the G77 model (upstream Mesa <= 26.2) refuse the GPU.
++ * Containers bring such a Mesa (Waydroid's Android image, Flatpak runtimes)
++ * while the host's has the model: they get the G57's ID, the same Valhall
++ * v9 JM core. 0: never, 1: every client, 2: clients outside the initial PID
++ * namespace.
++ */
++static int g77_as_g57 = 2;
++module_param(g77_as_g57, int, 0644);
++MODULE_PARM_DESC(g77_as_g57, "report Mali-G77 as G57: 0 never, 1 always, 2 to containers (default)");
++
++static bool panfrost_report_g57(void)
++{
++	return g77_as_g57 == 1 ||
++	       (g77_as_g57 == 2 && task_active_pid_ns(current) != &init_pid_ns);
++}
+ 
+ static int panfrost_ioctl_get_param(struct drm_device *ddev, void *data, struct drm_file *file)
+ {
+@@ -124,7 +137,7 @@ static int panfrost_ioctl_get_param(struct drm_device *ddev, void *data, struct
+ 	case DRM_PANFROST_PARAM_GPU_PROD_ID:
+ 		param->value = pfdev->features.id;
+ 		/* G77 (0x9000) -> G57 (0x9001), same Valhall v9 JM architecture */
+-		if (g77_as_g57 && (param->value & 0xf00f) == 0x9000)
++		if ((param->value & 0xf00f) == 0x9000 && panfrost_report_g57())
+ 			param->value |= 0x1;
+ 		break;
+ 		PANFROST_FEATURE(GPU_REVISION, revision);

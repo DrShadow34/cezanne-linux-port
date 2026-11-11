@@ -148,6 +148,9 @@
 	/*
 	 * Trips: passive at 85 C (CPU zones throttle their cluster through the
 	 * MCUPM cpufreq policy, GPU zones through Panfrost devfreq), critical at 115 C.
+	 * The big zones run power_allocator instead (switch-on 55 C, control
+	 * 80 C): step_wise with a 75 C trip held the A77s at 730 MHz under game
+	 * load (NOTES "Dark Souls II stutters").
 	 */
 	/*
 	 * TRNG (0x1020f000) is secure: read through the ATF (the BSP's
@@ -163,21 +166,29 @@
 			polling-delay-passive = <100>;
 			thermal-sensors = <&lvts_mcu MT8192_MCU_BIG_CPU0>;
 
+			/* power_allocator (cezanne-base udev rule): 1.1 W for the cluster */
+			sustainable-power = <1100>;
+
 			trips {
-				/* wide hysteresis: releasing all of it means a 2.6 GHz spike */
+				/*
+				 * power_allocator switch-on, below the temperature
+				 * the cluster settles at under load: below it the
+				 * governor drops its limit at once (2.6 GHz, the
+				 * hotspot +25 C within a second), so it must stay
+				 * engaged while a game runs
+				 */
 				cpu_big0_alert: trip-alert {
-					temperature = <75000>;
-					hysteresis = <15000>;
+					temperature = <55000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				/*
-				 * Untrimmed (no EEM) A77 voltages: the hotspot
-				 * goes +45 C within 0.5 s at 2.6 GHz, faster than
-				 * step_wise ramps. Clamp to state 5 (1.93 GHz) here.
+				 * power_allocator control temperature; the A77s
+				 * stay at or below state 5 (1.93 GHz) under it
 				 */
 				cpu_big0_hot: trip-hot {
-					temperature = <90000>;
+					temperature = <80000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -191,11 +202,6 @@
 
 			cooling-maps {
 				map0 {
-					trip = <&cpu_big0_alert>;
-					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map1 {
 					trip = <&cpu_big0_hot>;
 					cooling-device = <&cpu4 5 THERMAL_NO_LIMIT>;
 				};
@@ -207,21 +213,29 @@
 			polling-delay-passive = <100>;
 			thermal-sensors = <&lvts_mcu MT8192_MCU_BIG_CPU1>;
 
+			/* power_allocator (cezanne-base udev rule): 1.1 W for the cluster */
+			sustainable-power = <1100>;
+
 			trips {
-				/* wide hysteresis: releasing all of it means a 2.6 GHz spike */
+				/*
+				 * power_allocator switch-on, below the temperature
+				 * the cluster settles at under load: below it the
+				 * governor drops its limit at once (2.6 GHz, the
+				 * hotspot +25 C within a second), so it must stay
+				 * engaged while a game runs
+				 */
 				cpu_big1_alert: trip-alert {
-					temperature = <75000>;
-					hysteresis = <15000>;
+					temperature = <55000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				/*
-				 * Untrimmed (no EEM) A77 voltages: the hotspot
-				 * goes +45 C within 0.5 s at 2.6 GHz, faster than
-				 * step_wise ramps. Clamp to state 5 (1.93 GHz) here.
+				 * power_allocator control temperature; the A77s
+				 * stay at or below state 5 (1.93 GHz) under it
 				 */
 				cpu_big1_hot: trip-hot {
-					temperature = <90000>;
+					temperature = <80000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -235,11 +249,6 @@
 
 			cooling-maps {
 				map0 {
-					trip = <&cpu_big1_alert>;
-					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map1 {
 					trip = <&cpu_big1_hot>;
 					cooling-device = <&cpu4 5 THERMAL_NO_LIMIT>;
 				};
@@ -251,21 +260,29 @@
 			polling-delay-passive = <100>;
 			thermal-sensors = <&lvts_mcu MT8192_MCU_BIG_CPU2>;
 
+			/* power_allocator (cezanne-base udev rule): 1.1 W for the cluster */
+			sustainable-power = <1100>;
+
 			trips {
-				/* wide hysteresis: releasing all of it means a 2.6 GHz spike */
+				/*
+				 * power_allocator switch-on, below the temperature
+				 * the cluster settles at under load: below it the
+				 * governor drops its limit at once (2.6 GHz, the
+				 * hotspot +25 C within a second), so it must stay
+				 * engaged while a game runs
+				 */
 				cpu_big2_alert: trip-alert {
-					temperature = <75000>;
-					hysteresis = <15000>;
+					temperature = <55000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				/*
-				 * Untrimmed (no EEM) A77 voltages: the hotspot
-				 * goes +45 C within 0.5 s at 2.6 GHz, faster than
-				 * step_wise ramps. Clamp to state 5 (1.93 GHz) here.
+				 * power_allocator control temperature; the A77s
+				 * stay at or below state 5 (1.93 GHz) under it
 				 */
 				cpu_big2_hot: trip-hot {
-					temperature = <90000>;
+					temperature = <80000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -279,11 +296,6 @@
 
 			cooling-maps {
 				map0 {
-					trip = <&cpu_big2_alert>;
-					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map1 {
 					trip = <&cpu_big2_hot>;
 					cooling-device = <&cpu4 5 THERMAL_NO_LIMIT>;
 				};
@@ -295,21 +307,29 @@
 			polling-delay-passive = <100>;
 			thermal-sensors = <&lvts_mcu MT8192_MCU_BIG_CPU3>;
 
+			/* power_allocator (cezanne-base udev rule): 1.1 W for the cluster */
+			sustainable-power = <1100>;
+
 			trips {
-				/* wide hysteresis: releasing all of it means a 2.6 GHz spike */
+				/*
+				 * power_allocator switch-on, below the temperature
+				 * the cluster settles at under load: below it the
+				 * governor drops its limit at once (2.6 GHz, the
+				 * hotspot +25 C within a second), so it must stay
+				 * engaged while a game runs
+				 */
 				cpu_big3_alert: trip-alert {
-					temperature = <75000>;
-					hysteresis = <15000>;
+					temperature = <55000>;
+					hysteresis = <2000>;
 					type = "passive";
 				};
 
 				/*
-				 * Untrimmed (no EEM) A77 voltages: the hotspot
-				 * goes +45 C within 0.5 s at 2.6 GHz, faster than
-				 * step_wise ramps. Clamp to state 5 (1.93 GHz) here.
+				 * power_allocator control temperature; the A77s
+				 * stay at or below state 5 (1.93 GHz) under it
 				 */
 				cpu_big3_hot: trip-hot {
-					temperature = <90000>;
+					temperature = <80000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -323,11 +343,6 @@
 
 			cooling-maps {
 				map0 {
-					trip = <&cpu_big3_alert>;
-					cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-
-				map1 {
 					trip = <&cpu_big3_hot>;
 					cooling-device = <&cpu4 5 THERMAL_NO_LIMIT>;
 				};

@@ -1,0 +1,11 @@
+#version 450
+/* T = iters (the write of the write-after-read test) */
+layout(local_size_x = 1) in;
+layout(push_constant) uniform PC { uint frame; uint iters; } pc;
+layout(set = 0, binding = 2, r32ui) uniform writeonly uimage2D T;
+
+void main()
+{
+   imageStore(T, ivec2(0, 0), uvec4(pc.iters));
+   imageStore(T, ivec2(1, 0), uvec4(pc.iters));
+}

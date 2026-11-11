@@ -1,0 +1,5 @@
+# Big-core thermal zones on power_allocator: the DT gives them a switch-on
+# (55 C) and a control (80 C) trip plus sustainable-power; with the default
+# step_wise the A77s sat at 730 MHz under game load, and a release jumped
+# straight to 2.6 GHz. The DT has no governor property.
+ACTION=="add", SUBSYSTEM=="thermal", KERNEL=="thermal_zone*", ATTR{type}=="cpu-big[0-3]-thermal", ATTR{policy}="power_allocator"

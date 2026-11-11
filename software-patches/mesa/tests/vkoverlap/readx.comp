@@ -1,0 +1,15 @@
+#version 450
+/* reads X's corners in a compute shader: min / max into R[2 frame] */
+layout(local_size_x = 1) in;
+layout(push_constant) uniform PC { uint frame; uint iters; } pc;
+layout(set = 0, binding = 0) uniform usampler2D X;
+layout(set = 0, binding = 1) buffer B { uint r[]; };
+
+void main()
+{
+   ivec2 s = textureSize(X, 0) - 1;
+   uint a = texelFetch(X, ivec2(0, 0), 0).r, b = texelFetch(X, s, 0).r;
+   uint c = texelFetch(X, ivec2(s.x, 0), 0).r, d = texelFetch(X, ivec2(0, s.y), 0).r;
+   r[pc.frame * 2u] = min(min(a, b), min(c, d));
+   r[pc.frame * 2u + 1u] = max(max(a, b), max(c, d));
+}

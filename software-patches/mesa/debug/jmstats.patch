@@ -1,0 +1,313 @@
+diff --git a/src/panfrost/vulkan/jm/panvk_jm_stats.h b/src/panfrost/vulkan/jm/panvk_jm_stats.h
+new file mode 100644
+index 0000000..bac34d8
+--- /dev/null
++++ b/src/panfrost/vulkan/jm/panvk_jm_stats.h
+@@ -0,0 +1,178 @@
++/*
++ * Debug only (mainline/mesa-g77/debug/jmstats.patch, not in the package):
++ * render-pass overlap statistics. PANVK_JM_STATS=<file> appends every 3 s:
++ * batches by kind, which vertex/tiler/compute chains waited for fragment
++ * chains and why, skipped barrier waits, and the stage masks of the barriers
++ * from fragment work. While /tmp/panvk-serial exists, submission is serial
++ * (A/B in one session; needs PANVK_JM_OVERLAP=1).
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef PANVK_JM_STATS_H
++#define PANVK_JM_STATS_H
++
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "util/os_time.h"
++#include "util/simple_mtx.h"
++
++#include <vulkan/vulkan_core.h>
++
++#define JM_STATS_PAIRS 64
++
++struct panvk_jm_stats {
++   simple_mtx_t lock;
++   int state; /* 0 unknown, 1 on, -1 off */
++   FILE *f;
++   uint64_t last_ns;
++   bool serial;
++   /* submit side */
++   uint64_t vk_submits, batches, vtc, frag, tiling;
++   uint64_t wait_forced, wait_barrier_reads, wait_barrier_dirty, skipped,
++      heap_prev;
++   /* record side */
++   uint64_t barriers, barriers_frag, draws, draws_vs_mem, draws_fs_writes;
++   struct {
++      VkPipelineStageFlags2 src, dst;
++      uint64_t count;
++      bool frag;
++   } pairs[JM_STATS_PAIRS];
++};
++
++/* one instance for every translation unit (and per-arch copy) of the .so */
++__attribute__((weak)) struct panvk_jm_stats panvk_jm_stats = {
++   .lock = SIMPLE_MTX_INITIALIZER,
++};
++
++static inline bool
++panvk_jm_stats_on(void)
++{
++   if (panvk_jm_stats.state == 0) {
++      const char *path = getenv("PANVK_JM_STATS");
++      panvk_jm_stats.f = path ? fopen(path, "a") : NULL;
++      panvk_jm_stats.state = panvk_jm_stats.f ? 1 : -1;
++   }
++   return panvk_jm_stats.state > 0;
++}
++
++static inline void
++panvk_jm_stats_barrier(const VkDependencyInfo *info, bool frag)
++{
++   if (!panvk_jm_stats_on())
++      return;
++
++   VkPipelineStageFlags2 src = 0, dst = 0;
++   for (uint32_t i = 0; i < info->memoryBarrierCount; i++) {
++      src |= info->pMemoryBarriers[i].srcStageMask;
++      dst |= info->pMemoryBarriers[i].dstStageMask;
++   }
++   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; i++) {
++      src |= info->pBufferMemoryBarriers[i].srcStageMask;
++      dst |= info->pBufferMemoryBarriers[i].dstStageMask;
++   }
++   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
++      src |= info->pImageMemoryBarriers[i].srcStageMask;
++      dst |= info->pImageMemoryBarriers[i].dstStageMask;
++   }
++
++   simple_mtx_lock(&panvk_jm_stats.lock);
++   panvk_jm_stats.barriers++;
++   panvk_jm_stats.barriers_frag += frag;
++   for (unsigned i = 0; frag && i < JM_STATS_PAIRS; i++) {
++      if (!panvk_jm_stats.pairs[i].count) {
++         panvk_jm_stats.pairs[i].src = src;
++         panvk_jm_stats.pairs[i].dst = dst;
++      }
++      if (panvk_jm_stats.pairs[i].src == src &&
++          panvk_jm_stats.pairs[i].dst == dst) {
++         panvk_jm_stats.pairs[i].count++;
++         break;
++      }
++   }
++   simple_mtx_unlock(&panvk_jm_stats.lock);
++}
++
++static inline void
++panvk_jm_stats_draw(bool vs_mem, bool fs_writes)
++{
++   if (!panvk_jm_stats_on())
++      return;
++   simple_mtx_lock(&panvk_jm_stats.lock);
++   panvk_jm_stats.draws++;
++   panvk_jm_stats.draws_vs_mem += vs_mem;
++   panvk_jm_stats.draws_fs_writes += fs_writes;
++   simple_mtx_unlock(&panvk_jm_stats.lock);
++}
++
++static inline void
++panvk_jm_stats_count(uint64_t *counter)
++{
++   if (!panvk_jm_stats_on())
++      return;
++   simple_mtx_lock(&panvk_jm_stats.lock);
++   (*counter)++;
++   simple_mtx_unlock(&panvk_jm_stats.lock);
++}
++
++/* one submitted batch; forced / barrier / reads / dirty as the queue saw
++ * them, waited = its vertex/tiler/compute chain waited for fragment chains */
++static inline void
++panvk_jm_stats_batch(bool vtc, bool frag, bool tiling, bool waited,
++                     bool forced, bool barrier, bool reads, bool dirty,
++                     bool heap_prev)
++{
++   if (!panvk_jm_stats_on())
++      return;
++
++   struct panvk_jm_stats *s = &panvk_jm_stats;
++   simple_mtx_lock(&s->lock);
++   s->batches++;
++   s->vtc += vtc;
++   s->frag += frag;
++   s->tiling += tiling;
++   if (vtc && waited) {
++      if (forced)
++         s->wait_forced++;
++      else if (reads)
++         s->wait_barrier_reads++;
++      else if (dirty)
++         s->wait_barrier_dirty++;
++   }
++   s->skipped += vtc && barrier && !waited;
++   s->heap_prev += vtc && heap_prev;
++
++   uint64_t now = os_time_get_nano();
++   if (now - s->last_ns > 3000000000ull) {
++      fprintf(s->f,
++              "%.1f s %s: %" PRIu64 " vkQueueSubmit, %" PRIu64
++              " batches (vtc %" PRIu64 ", frag %" PRIu64 ", tiling %" PRIu64
++              "); vtc waited for frag: forced %" PRIu64
++              ", barrier+access %" PRIu64 ", barrier+frag stores %" PRIu64
++              "; barrier waits skipped %" PRIu64 "; heap of the previous frag %" PRIu64
++              "; recorded: %" PRIu64 " barriers (%" PRIu64 " frag->vtc), %" PRIu64
++              " draws (vs memory %" PRIu64 ", fs stores %" PRIu64 ")\n",
++              now / 1e9, s->serial ? "SERIAL" : "overlap", s->vk_submits,
++              s->batches, s->vtc, s->frag, s->tiling, s->wait_forced,
++              s->wait_barrier_reads, s->wait_barrier_dirty, s->skipped,
++              s->heap_prev, s->barriers, s->barriers_frag, s->draws,
++              s->draws_vs_mem, s->draws_fs_writes);
++      for (unsigned i = 0; i < JM_STATS_PAIRS && s->pairs[i].count; i++)
++         fprintf(s->f, "  barrier src 0x%" PRIx64 " dst 0x%" PRIx64 ": %" PRIu64 "\n",
++                 (uint64_t)s->pairs[i].src, (uint64_t)s->pairs[i].dst,
++                 s->pairs[i].count);
++      fflush(s->f);
++      s->last_ns = now;
++      s->vk_submits = s->batches = s->vtc = s->frag = s->tiling = 0;
++      s->wait_forced = s->wait_barrier_reads = s->wait_barrier_dirty = 0;
++      s->skipped = s->heap_prev = 0;
++      s->barriers = s->barriers_frag = s->draws = s->draws_vs_mem = 0;
++      s->draws_fs_writes = 0;
++      for (unsigned i = 0; i < JM_STATS_PAIRS; i++)
++         s->pairs[i].count = 0;
++   }
++   simple_mtx_unlock(&s->lock);
++}
++
++#endif
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index d6743c5..1a8e8dc 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -35,6 +35,8 @@
+ #include "vk_format.h"
+ #include "vk_synchronization.h"
+ 
++#include "panvk_jm_stats.h"
++
+ static VkResult
+ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
+ {
+@@ -419,6 +421,8 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    bool frag = PAN_ARCH == 9 && barrier_waits_frag(pDependencyInfo);
+ 
++   panvk_jm_stats_barrier(pDependencyInfo, frag);
++
+    /* Caches are flushed/invalidated at batch boundaries for now, nothing to do
+     * for memory barriers assuming we implement barriers with the creation of a
+     * new batch.
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+index 3aa778c..ad845f7 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw_v9.c
+@@ -17,6 +17,7 @@
+ #include "panvk_buffer.h"
+ #include "panvk_cmd_alloc.h"
+ #include "panvk_cmd_buffer.h"
++#include "panvk_jm_stats.h"
+ #include "panvk_cmd_desc_state.h"
+ #include "panvk_cmd_draw.h"
+ #include "panvk_cmd_meta.h"
+@@ -857,6 +858,7 @@ emit_idvs_job(struct panvk_cmd_buffer *cmdbuf,
+    batch->vtc_reads_mem |= vs->vs.reads_memory;
+    if (fs)
+       batch->frag_writes_mem |= fs->info.writes_global;
++   panvk_jm_stats_draw(vs->vs.reads_memory, fs && fs->info.writes_global);
+ 
+    /* No polygon modes in the tiler. VK_POLYGON_MODE_POINT: the vertices of
+     * the triangles as a point list (each vertex once, not once per
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 3563a3c..b4b4c94 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -23,6 +23,9 @@
+ #include "panvk_physical_device.h"
+ #include "panvk_priv_bo.h"
+ #include "panvk_queue.h"
++#include "panvk_jm_stats.h"
++
++#include <unistd.h>
+ 
+ #include "vk_drm_syncobj.h"
+ #include "vk_framebuffer.h"
+@@ -223,6 +226,11 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+          forced || (barrier && (batch->vtc_reads_mem || queue->frag_dirty));
+       unsigned n = nr_in_fences;
+ 
++      panvk_jm_stats_batch(batch->vtc_jc.first_job, batch->frag_jc.first_job,
++                           tiles, wait_frag, forced, barrier,
++                           batch->vtc_reads_mem, queue->frag_dirty,
++                           tiles && batch->tiler_heap == queue->last_frag);
++
+       queue->carry_wait_frag = false;
+ 
+       if (batch->vtc_jc.first_job) {
+@@ -258,6 +266,9 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+    } else
+ #endif
+    {
++      panvk_jm_stats_batch(batch->vtc_jc.first_job, batch->frag_jc.first_job,
++                           batch->tiler.heap_desc.gpu, true, true, false,
++                           false, false, false);
+       if (batch->vtc_jc.first_job)
+          panvk_queue_submit_jc(queue, cmdbuf, batch->vtc_jc.first_job,
+                                cycle_count, bos, nr_bos, in_fences,
+@@ -363,6 +374,38 @@ panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
+    }
+ }
+ 
++#if PAN_ARCH == 9
++/* debug (jmstats.patch): while /tmp/panvk-serial exists, submit serially;
++ * checked once a second, for A/B runs in one session (the device must have
++ * overlap on: two tiler heaps, the queue's syncobjs) */
++static void
++panvk_jm_stats_toggle(struct panvk_gpu_queue *queue)
++{
++   static uint64_t last;
++   uint64_t now = os_time_get_nano();
++   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
++
++   if (!dev->jm_overlap || now - last < 1000000000ull)
++      return;
++   last = now;
++
++   bool serial = access("/tmp/panvk-serial", F_OK) == 0;
++
++   if (serial && queue->overlap) {
++      panvk_queue_join(queue);
++      queue->overlap = false;
++   } else if (!serial && !queue->overlap) {
++      panvk_queue_transfer_sync(queue, queue->vtc_sync);
++      for (unsigned i = 0; i < ARRAY_SIZE(queue->frag_sync); i++)
++         panvk_queue_transfer_sync(queue, queue->frag_sync[i]);
++      queue->carry_wait_frag = queue->barrier_pending = false;
++      queue->frag_dirty = false;
++      queue->overlap = true;
++   }
++   panvk_jm_stats.serial = !queue->overlap;
++}
++#endif
++
+ VkResult
+ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+ {
+@@ -371,8 +414,11 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+ 
+    bool overlap = false;
+ #if PAN_ARCH == 9
++   if (panvk_jm_stats_on())
++      panvk_jm_stats_toggle(queue);
+    overlap = queue->overlap;
+ #endif
++   panvk_jm_stats_count(&panvk_jm_stats.vk_submits);
+    /* without overlap every batch waits for all earlier work */
+    unsigned first_wait = overlap ? 0 : 1;
+    unsigned nr_semaphores = submit->wait_count + first_wait;

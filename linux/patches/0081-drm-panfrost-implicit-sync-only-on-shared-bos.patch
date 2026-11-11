@@ -1,0 +1,95 @@
+diff --git a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+index be4439f..2b6cc46 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -30,7 +30,8 @@
+ #include "panfrost_gpu.h"
+ #include "panfrost_perfcnt.h"
+ 
+-#define JOB_REQUIREMENTS (PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT)
++#define JOB_REQUIREMENTS (PANFROST_JD_REQ_FS | PANFROST_JD_REQ_CYCLE_COUNT | \
++			  PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC)
+ 
+ static bool unstable_ioctls;
+ module_param_unsafe(unstable_ioctls, bool, 0600);
+@@ -192,6 +193,10 @@ static int panfrost_ioctl_get_param(struct drm_device *ddev, void *data, struct
+ 			param->value |= BIT(PANFROST_JM_CTX_PRIORITY_HIGH);
+ 		break;
+ 
++	case DRM_PANFROST_PARAM_SHARED_IMPLICIT_SYNC:
++		param->value = 1;
++		break;
++
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index 6cde30b..9f1e109 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -291,7 +291,8 @@ err_hwsubmit:
+ 
+ static int panfrost_acquire_object_fences(struct drm_gem_object **bos,
+ 					  int bo_count,
+-					  struct drm_sched_job *job)
++					  struct drm_sched_job *job,
++					  bool shared_only)
+ {
+ 	int i, ret;
+ 
+@@ -300,6 +301,14 @@ static int panfrost_acquire_object_fences(struct drm_gem_object **bos,
+ 		if (ret)
+ 			return ret;
+ 
++		/*
++		 * PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC: the submitter orders
++		 * its own BOs; dma_buf is set for imported and exported ones
++		 * (and stays set while the object has handles).
++		 */
++		if (shared_only && !READ_ONCE(bos[i]->dma_buf))
++			continue;
++
+ 		/* panfrost always uses write mode in its current uapi */
+ 		ret = drm_sched_job_add_implicit_dependencies(job, bos[i],
+ 							      true);
+@@ -337,7 +346,9 @@ int panfrost_job_push(struct panfrost_job *job)
+ 	job->render_done_fence = dma_fence_get(&job->base.s_fence->finished);
+ 
+ 	ret = panfrost_acquire_object_fences(job->bos, job->bo_count,
+-					     &job->base);
++					     &job->base,
++					     job->requirements &
++					     PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC);
+ 	if (ret) {
+ 		mutex_unlock(&pfdev->sched_lock);
+ 		goto unlock;
+diff --git a/include/uapi/drm/panfrost_drm.h b/include/uapi/drm/panfrost_drm.h
+index 50d5337..0f1d6a7 100644
+--- a/include/uapi/drm/panfrost_drm.h
++++ b/include/uapi/drm/panfrost_drm.h
+@@ -51,6 +51,15 @@ extern "C" {
+ 
+ #define PANFROST_JD_REQ_FS (1 << 0)
+ #define PANFROST_JD_REQ_CYCLE_COUNT (1 << 1)
++/*
++ * Implicit dependencies only on BOs shared through dma-buf (imported or
++ * exported); userspace orders the jobs touching its own BOs with syncobjs.
++ * Without it every BO of a submit is a write dependency, and as a client's
++ * submits share BOs (descriptor pools, the tiler heap) its vertex/tiler and
++ * fragment jobs never overlap. Fences are still attached to every BO.
++ * Downstream (cezanne), advertised by DRM_PANFROST_PARAM_SHARED_IMPLICIT_SYNC.
++ */
++#define PANFROST_JD_REQ_SHARED_IMPLICIT_SYNC (1 << 16)
+ /**
+  * struct drm_panfrost_submit - ioctl argument for submitting commands to the 3D
+  * engine.
+@@ -236,6 +245,9 @@ enum drm_panfrost_param {
+ 	DRM_PANFROST_PARAM_SYSTEM_TIMESTAMP_FREQUENCY,
+ 	DRM_PANFROST_PARAM_ALLOWED_JM_CTX_PRIORITIES,
+ 	DRM_PANFROST_PARAM_SELECTED_COHERENCY,
++
++	/* downstream (cezanne), clear of upstream's numbering */
++	DRM_PANFROST_PARAM_SHARED_IMPLICIT_SYNC = 0x10000,
+ };
+ 
+ enum drm_panfrost_gpu_coherency {

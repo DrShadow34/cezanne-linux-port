@@ -1,0 +1,11 @@
+# Keyboards whose receiver also registers a mouse (a macro / mouse-key
+# collection nobody moves). mutter counts any pointer as "not touch mode"
+# (this phone has no tablet-mode switch), and outside touch mode it gives up
+# auto-rotation (the panel snaps back to portrait, the rotation toggle goes)
+# and the automatic on-screen keyboard. libinput ignores these mice; the
+# keyboard's own devices stay.
+# MCHOSE Mix 87-III: 2.4 GHz receiver 3837:300d, interface 2 carries
+# "Keyboard", "Mouse" and "Wireless Radio Control"; its "Keyboard" has a
+# horizontal wheel that makes it a pointer too: /etc/libinput/
+# local-overrides.quirks drops that axis
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="MCHOSE Mix 87-III Mouse", ENV{LIBINPUT_IGNORE_DEVICE}="1"
