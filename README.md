@@ -1,5 +1,6 @@
 # About:
 
+
 ### What this?
 
 Vibecoded port of mainline linux to Redmi K30 Ultra. That's it.
@@ -7,6 +8,8 @@ Vibecoded port of mainline linux to Redmi K30 Ultra. That's it.
 ### Current status?
 
 Most of it works. All drivers at least ported and confirmed working. There are few missing non-priority features, like wired headset's buttons support. And some things are implemented, but not tested: bi-directional calls for example - I have no one to call, so yeah. 
+
+[Here the link to DEMO](https://youtu.be/NuuQxx-V-Gs)
 
 <details> 
   <summary>Images</summary>
@@ -18,6 +21,9 @@ Most of it works. All drivers at least ported and confirmed working. There are f
 2. Screenshot from running vkQuake with [Brutalist Jam 3](https://www.slipseer.com/index.php?resources/quake-brutalist-jam-iii.549/). Have in mind that running windowed roughly halfs performance, probably due to mutter compositing.
    
   ![](test-screenshot.png)
+
+
+
 </details>
 
 
