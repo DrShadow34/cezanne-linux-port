@@ -1,0 +1,8 @@
+#!/bin/sh
+# fbcli-dummy: fbcli for the sandbox (no light, no vibration): logs each
+# event to out/fb.log; a looping one (-t 0) runs until it reads a RETURN
+L=/var/tmp/cezsb/out/fb.log
+echo "$(date +%T.%N | cut -c1-12) start $*" >>$L
+case " $* " in
+*" -t 0 "*) read -r _; echo "$(date +%T.%N | cut -c1-12) end $*" >>$L ;;
+esac

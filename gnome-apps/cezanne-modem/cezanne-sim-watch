@@ -1,0 +1,26 @@
+#!/bin/sh
+# cezanne-sim-watch: the calls and SMS daemons (gnome-calls, chatty, and the
+# contacts / online accounts services they pull in, ~186 MB) only once the
+# modem has a SIM. In niri they come from XDG autostart; their autostart
+# units wait for $XDG_RUNTIME_DIR/cezanne-sim (drop-ins). This watches
+# ModemManager (at login, and for a SIM inserted later), creates the flag
+# and starts them, then exits.
+F=$XDG_RUNTIME_DIR/cezanne-sim
+UNITS='app-org.gnome.Calls\x2ddaemon@autostart.service app-sm.puri.Chatty\x2ddaemon@autostart.service'
+
+found() {
+	mmcli -m any -K 2>/dev/null | grep -q '^modem\.generic\.sim  *: /'
+}
+start() {
+	echo "SIM present: starting the calls and SMS daemons"
+	: >"$F"
+	systemctl --user start $UNITS
+}
+
+[ -e "$F" ] && { systemctl --user start $UNITS; exit 0; }
+found && { start; exit 0; }
+echo "no SIM: calls and SMS daemons not started"
+# any ModemManager signal (a new modem object, state or SIM changes): look again
+gdbus monitor --system --dest org.freedesktop.ModemManager1 | while read -r _; do
+	found && { start; exit 0; }
+done

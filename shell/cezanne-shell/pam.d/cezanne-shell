@@ -1,0 +1,16 @@
+#%PAM-1.0
+# cezanne: the cezanne-shell lock screen (Quickshell PamContext). The auth
+# part of cezanne-greetd: a cancelled prompt (the lock screen dropping its
+# password field) does not count for pam_faillock, a wrong password does.
+
+auth       required                    pam_shells.so
+auth       requisite                   pam_nologin.so
+auth       required                    pam_faillock.so      preauth
+-auth      [success=4 default=ignore]  pam_systemd_home.so
+auth       [success=2 conv_err=1 authtok_err=1 default=bad] pam_unix.so try_first_pass nullok
+auth       [default=die]               pam_faillock.so      authfail
+auth       requisite                   pam_deny.so
+auth       optional                    pam_permit.so
+auth       required                    pam_faillock.so      authsucc
+
+account    include                     system-local-login

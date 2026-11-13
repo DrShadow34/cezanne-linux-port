@@ -33,7 +33,9 @@
 # mode (charge only).
 #
 # Runs as cezanne-usb-stream.service (user), started by the cezanne-usb
-# extension; exits when the mode ends.
+# extension or cezanne-shell (niri: the Mutter ScreenCast API is niri's,
+# which wants the monitor's name; the shell holds the idle inhibitor);
+# exits when the mode ends.
 import errno
 import fcntl
 import glob
@@ -465,6 +467,17 @@ class Stream:
             log('unlocked: screen stream again')
             self._screencast()
 
+    def _connector(self):
+        """The panel's connector: mutter takes '' for the primary monitor,
+        niri (which serves the same API) only a name: the first monitor of
+        DisplayConfig's state."""
+        try:
+            monitors = call(self.bus, ('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                                       'org.gnome.Mutter.DisplayConfig'), 'GetCurrentState').unpack()[1]
+            return monitors[0][0][0] if monitors else ''
+        except (GLib.Error, IndexError, TypeError):
+            return ''
+
     def _screencast(self):
         try:
             path = call(self.bus, (SCREENCAST, '/org/gnome/Mutter/ScreenCast', SCREENCAST),
@@ -477,7 +490,7 @@ class Stream:
         self.session = path
         session = (SCREENCAST, path, f'{SCREENCAST}.Session')
         stream = call(self.bus, session, 'RecordMonitor',
-                      GLib.Variant('(sa{sv})', ('', {'cursor-mode': GLib.Variant('u', 1)})),
+                      GLib.Variant('(sa{sv})', (self._connector(), {'cursor-mode': GLib.Variant('u', 1)})),
                       '(o)').unpack()[0]
 
         def added(_conn, _sender, _path, _iface, _signal, params):
@@ -524,10 +537,15 @@ class Stream:
     def _inhibit_idle(self, on):
         """No blanking / locking while the screen streams: that would end it."""
         if on and not self.cookie:
-            self.cookie = call(self.bus, SESSION_MANAGER, 'Inhibit',
-                               GLib.Variant('(susu)', ('org.cezanne.Usb', 0,
-                                                       'Streaming the screen over USB',
-                                                       INHIBIT_IDLE)), '(u)').unpack()[0]
+            # no session manager in niri: cezanne-shell inhibits idle itself
+            # while the screen streams
+            try:
+                self.cookie = call(self.bus, SESSION_MANAGER, 'Inhibit',
+                                   GLib.Variant('(susu)', ('org.cezanne.Usb', 0,
+                                                           'Streaming the screen over USB',
+                                                           INHIBIT_IDLE)), '(u)').unpack()[0]
+            except GLib.Error as e:
+                log(f'idle inhibit: {e.message}')
         elif not on and self.cookie:
             try:
                 call(self.bus, SESSION_MANAGER, 'Uninhibit', GLib.Variant('(u)', (self.cookie,)))

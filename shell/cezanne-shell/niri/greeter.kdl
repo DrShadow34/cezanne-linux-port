@@ -1,0 +1,58 @@
+// niri for the login screen (greetd runs it as the greeter user, see
+// /etc/greetd/cezanne.toml): only the cezanne-shell greeter; when it has
+// started the session it quits, niri with it, and greetd starts the user's
+// niri-session.
+
+input {
+    touch {
+        map-to-output "DSI-1"
+    }
+    disable-power-key-handling
+}
+
+output "DSI-1" {
+    scale 2
+    transform "normal"
+}
+
+layout {
+    gaps 0
+    focus-ring {
+        off
+    }
+    border {
+        off
+    }
+    background-color "#000000"
+}
+
+gestures {
+    hot-corners {
+        off
+    }
+}
+
+cursor {
+    hide-when-typing
+    hide-after-inactive-ms 1000
+}
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+environment {
+    QT_QPA_PLATFORM "wayland"
+    QS_ICON_THEME "Adwaita"
+    // the greeter user has no home (tmpfiles.d/cezanne-shell.conf)
+    XDG_CACHE_HOME "/var/lib/cezanne-greeter/cache"
+    XDG_STATE_HOME "/var/lib/cezanne-greeter/state"
+    XDG_DATA_HOME "/var/lib/cezanne-greeter/data"
+}
+
+spawn-sh-at-startup "qs -p /usr/share/cezanne-shell/greeter.qml; niri msg action quit --skip-confirmation"
+
+binds {
+    XF86AudioRaiseVolume { spawn-sh "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.05+ -l 1.0"; }
+    XF86AudioLowerVolume { spawn-sh "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.05-"; }
+}

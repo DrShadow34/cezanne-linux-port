@@ -1,12 +1,13 @@
 # Redmi K30 Ultra (cezanne) hardware under Arch Linux
 
 Phone: Redmi K30 Ultra, M2006J10C, MediaTek Dimensity 1000+ (MT6885).
-Kernel: mainline 7.3.1 + linux/patches 0001-0075 + the out-of-tree drivers
+Kernel: mainline 7.3.1 + linux/patches 0001-0083 + the out-of-tree drivers
 in linux/drivers, package linux-cezanne (linux/packaging); userspace: Arch
-Linux ARM + GNOME with the port's own software (gnome-apps,
-gnome-extensions) and patched packages (software-patches), all built from
-PKGBUILDs so the phone updates with a plain `pacman -Syu`. State as of
-2026-11-08 (linux-cezanne 7.3.1-13); open items at the end. Hardware gaps
+Linux ARM + niri with the port's own shell (shell/cezanne-shell, since
+2026-11-13; GNOME before, see SHELL.md), its own software (gnome-apps) and
+patched packages (software-patches), all built from PKGBUILDs so the phone
+updates with a plain `pacman -Syu`. State as of 2026-11-14 (linux-cezanne
+7.3.1-33); open items at the end. Hardware gaps
 found by comparing the stock MIUI device tree with the running phone are
 marked "(2026-11-04)"; a second pass on 2026-11-08 also compared MIUI's
 active interrupts and every enabled MMIO block / I2C device by address.
@@ -56,10 +57,10 @@ not started).
 | GPU Mali-G77 MC9 (kernel) | panfrost + Mali-G77 / MT6885 (0010, 0054, 0061), G57 id for containers (0080), implicit sync only on shared BOs for render-pass overlap (0081, 0082) | adapted | works; 350-836 MHz; MFGPLL is hardware-capped at ~854 MHz, CON1 and FHCTL alike (no overclock) | none |
 | GPU OpenGL ES / OpenGL | Mesa panfrost + G77 (mesa-g77 0001) | adapted | works (GL 3.1, GLES 3.1) | none |
 | GPU Vulkan | Mesa PanVK for Valhall on the job manager (mesa-g77 0002) + DXVK features 0004-0015 (geometry shaders through Mesa's poly from Asahi, clip / cull, wireframe, robustness2), compressed textures (0017), render-pass overlap (0018, on by default) | new (v9 JM), adapted (poly) | works (Vulkan 1.4, DXVK); gaps in software-patches/mesa/DXVK.md | none |
-| Display pipeline (OVL, RDMA, DSC, DSI command mode, dual pipe 120 Hz) | mediatek-drm + MT6885 (0005, 0011, 0021-0027, 0029-0031, 0034) | adapted | works (120 Hz, HDR10, AOD, DC dimming + MIUI colour schemes via cezanne-dc-dimming); CRTC has CTM / GAMMA_LUT (GNOME Night Light untested); AAL (content-adaptive brightness) and the display resizer unused | none |
+| Display pipeline (OVL, RDMA, DSC, DSI command mode, dual pipe 120 Hz) | mediatek-drm + MT6885 (0005, 0011, 0021-0027, 0029-0031, 0034) | adapted | works (120 Hz, HDR10, AOD, DC dimming + MIUI colour schemes via cezanne-dc-dimming); CRTC has CTM / GAMMA_LUT (no night light: GNOME's was never tested, niri has none); AAL (content-adaptive brightness) and the display resizer unused | none |
 | Panel 6.67" AMOLED 1080x2400 (j10) | panel-xiaomi-j10 (0028) | new (vendor panel tables) | works; 60 / 120 Hz only | none (init tables in the driver) |
 | Touchscreen Goodix GT9896 | goodix-yellowstone (0007, 0057, 0058) | new | works; no gestures / double-tap wake | none (the GT9896 runs from its own flash) |
-| Under-display fingerprint Goodix GF3658 | goodix_fp + cezanne_teei (Microtrust TEE) + cezanne-fp | new | partial: authentication works (MIUI-enrolled fingers), no enrolment | Goodix's trusted app in the Microtrust TEE (`tee` partitions); the TEE's storage in RPMB |
+| Under-display fingerprint Goodix GF3658 | goodix_fp + cezanne_teei (Microtrust TEE) + cezanne-fp | new | partial: authentication works (MIUI-enrolled fingers; cezanne-shell's lock screen through fprintd's API and pam_fprintd), no enrolment | Goodix's trusted app in the Microtrust TEE (`tee` partitions); the TEE's storage in RPMB |
 
 ## Multimedia
 
@@ -99,7 +100,7 @@ not started).
 | SIM tray switch (GPIO 43, MIUI xiaomi,simtray-status) | none | - | open (2026-11-04): unused; a lead for the SIM cold-boot detection | - |
 | NFC NXP SN100U | nxp-nci (0048) + neard + cezanne-nfc | mainline + fix | partial: tag read / write, no card emulation | none (the controller runs from its own flash) |
 | IR blaster | gpio-ir-tx + Remote Control app (IRext) | mainline (driver), new (app) | works | none |
-| USB (device, host / OTG) | mtu3 (0004, 0041, 0051, 0067-0070), tphy (0001); device modes from cezanne-usb: UVC webcam (screen / cameras), MTP (uMTP-Responder), RNDIS developer network | mainline + fixes | works (high speed only; isoc 1024 B per microframe, no high-bandwidth); a host that autosuspended the phone misses mode switches; the RNDIS network does not share the phone's internet (no NAT) | none |
+| USB (device, host / OTG) | mtu3 (0004, 0041, 0051, 0067-0070, 0083), tphy (0001); device modes from cezanne-usb: UVC webcam (screen / cameras), MTP (uMTP-Responder), RNDIS developer network | mainline + fixes | works (high speed only; isoc 1024 B per microframe, no high-bandwidth); deep suspend resets the SSUSB IP, mtu3 sets it up again on resume (0083, 2026-11-14); a host that autosuspended the phone misses mode switches; the RNDIS network does not share the phone's internet (no NAT) | none |
 | USB-C / PD (MT6360 TCPC) | tcpci_mt6360 (0035, 0040), cezanne-tcpc-guard | mainline + fixes | works: PD / PPS sink, source (OTG); a power bank whose USB-C port only takes power gets charged by the phone (DRP, Try.SNK) | none |
 | FM radio (MT6635) | fmradio_drv (linux/drivers/connectivity: the 4.14 BSP driver + patches/fmradio.patch), DT fm node, cezanne-fm.service, FM Radio app (gnome-apps/cezanne-fm) | ported (4.14 BSP driver, CONNAC2 / conninfra), app new | driver + app work (tune, scan, audio into PipeWire); no usable reception: RSSI floor -114 dBm with or without a wired USB-C headset, the board likely has no FM antenna connection | `mt6635_fm_v1_patch.bin`, `mt6635_fm_v1_coeff.bin`, `fm_cust.cfg` (vendor `/firmware`; cezanne-firmware) |
 

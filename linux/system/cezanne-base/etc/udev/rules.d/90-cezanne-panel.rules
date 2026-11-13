@@ -3,3 +3,7 @@
 ACTION=="add|bind", SUBSYSTEM=="mipi-dsi", KERNEL=="1400e000.dsi.0", RUN+="/bin/sh -c 'cd /sys%p && chgrp video hbm dc_dimming color_mode doze && chmod g+w hbm dc_dimming color_mode doze'"
 # RTC wake alarm for the AOD clock updates (cezanne-aod extension)
 ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", RUN+="/bin/sh -c 'chgrp video /sys%p/wakealarm && chmod g+w /sys%p/wakealarm'"
+# the backlight for cezanne-shell's automatic brightness: its ramps write
+# ~25 times a second, through one open shell (logind's SetBrightness would
+# cost a process per step)
+ACTION=="add", SUBSYSTEM=="backlight", KERNEL=="1400e000.dsi.0", RUN+="/bin/sh -c 'chgrp video /sys%p/brightness && chmod g+w /sys%p/brightness'"

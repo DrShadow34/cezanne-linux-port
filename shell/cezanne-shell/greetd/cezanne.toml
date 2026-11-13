@@ -1,0 +1,15 @@
+# greetd for the cezanne phone (greetd.service.d/cezanne.conf points greetd
+# here; the package's config.toml stays as it is): the cezanne-shell greeter
+# in its own niri, which quits once the user's niri-session is started.
+
+[terminal]
+vt = 1
+
+[general]
+# the user's session: faillock-safe auth plus the keyring (pam.d/cezanne-greetd)
+service = "cezanne-greetd"
+
+[default_session]
+command = "niri -c /usr/share/cezanne-shell/greeter-niri.kdl"
+user = "greeter"
+service = "greetd"

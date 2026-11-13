@@ -1,0 +1,142 @@
+// niri for the cezanne phone session (system default: a user's
+// ~/.config/niri/config.kdl replaces it as a whole). The shell around it is
+// cezanne-shell (Quickshell): panel, quick menu, notifications, launcher,
+// dock, lock screen, rotation; started by systemd user units on
+// graphical-session.target, not spawn-at-startup.
+
+input {
+    keyboard {
+        xkb {
+        }
+    }
+    touch {
+        map-to-output "DSI-1"
+    }
+    // the power key: the shell's while the always-on display is on (it holds
+    // logind's handle-power-key inhibitor; bind below), else logind's
+    // (HandlePowerKey=suspend, cezanne-base); swayidle locks before a sleep
+    disable-power-key-handling
+}
+
+// the panel is a portrait 1080x2400 DSI panel; cezanne-shell rotates it
+// (niri msg output DSI-1 transform) from the accelerometer
+output "DSI-1" {
+    scale 2
+    transform "normal"
+}
+
+layout {
+    // windows open maximized (full width, window-rule below); an app's
+    // unmaximize gives it half the width, next to another one
+    gaps 0
+    center-focused-column "never"
+    default-column-width { proportion 0.5; }
+    preset-column-widths {
+        proportion 0.5
+        proportion 1.0
+    }
+    focus-ring {
+        off
+    }
+    border {
+        off
+    }
+    shadow {
+        off
+    }
+    background-color "transparent"
+}
+
+overview {
+    zoom 0.5
+    // no shadow (it outlined the workspaces) around the workspaces
+    workspace-shadow {
+        off
+    }
+}
+
+gestures {
+    hot-corners {
+        off
+    }
+}
+
+cursor {
+    hide-when-typing
+    hide-after-inactive-ms 1000
+}
+
+// windows without decorations of their own: no shadows or rounded corners
+// around full-screen phone windows (libadwaita keeps its header bar)
+prefer-no-csd
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+screenshot-path "~/Pictures/Screenshots/Screenshot From %Y-%m-%d %H-%M-%S.png"
+
+environment {
+    QT_QPA_PLATFORM "wayland"
+    ELECTRON_OZONE_PLATFORM_HINT "auto"
+    // niri's own (niri.service.d/cezanne.conf), not for the apps it starts:
+    // games and FEX run many threads
+    MALLOC_ARENA_MAX null
+}
+
+window-rule {
+    open-maximized true
+}
+
+// cezanne-home: the empty first column (wallpaper and dock show there)
+window-rule {
+    match app-id="^cezanne-home$"
+    draw-border-with-background false
+}
+
+window-rule {
+    match app-id=r#"firefox$"# title="^Picture-in-Picture$"
+    open-floating true
+}
+
+// the wallpaper stays visible behind the workspaces in the overview
+layer-rule {
+    match namespace="^cezanne-wallpaper$"
+    place-within-backdrop true
+}
+
+binds {
+    // the power key: lock and into the always-on display / out of it
+    XF86PowerOff allow-when-locked=true repeat=false { spawn "cezanne-shell-ctl" "aod" "power"; }
+
+    // the volume keys (also on the lock screen); cezanne-shell shows the level
+    XF86AudioRaiseVolume allow-when-locked=true { spawn-sh "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.05+ -l 1.0"; }
+    XF86AudioLowerVolume allow-when-locked=true { spawn-sh "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.05-"; }
+    XF86AudioMute        allow-when-locked=true { spawn-sh "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"; }
+    XF86AudioPlay        allow-when-locked=true { spawn-sh "playerctl play-pause"; }
+    XF86AudioPrev        allow-when-locked=true { spawn-sh "playerctl previous"; }
+    XF86AudioNext        allow-when-locked=true { spawn-sh "playerctl next"; }
+
+    // a keyboard, when one is attached
+    Mod+O repeat=false { toggle-overview; }
+    Mod+A repeat=false { spawn "cezanne-shell-ctl" "launcher" "toggle"; }
+    Mod+L repeat=false { spawn "cezanne-shell-ctl" "lock" "lock"; }
+    Mod+Q repeat=false { close-window; }
+    Mod+F { maximize-column; }
+    Mod+Shift+F { fullscreen-window; }
+    Mod+Left  { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+Up    { focus-workspace-up; }
+    Mod+Down  { focus-workspace-down; }
+    Mod+Ctrl+Left  { move-column-left; }
+    Mod+Ctrl+Right { move-column-right; }
+    Mod+Ctrl+Up    { move-column-to-workspace-up; }
+    Mod+Ctrl+Down  { move-column-to-workspace-down; }
+    Mod+R { switch-preset-column-width; }
+    // the shell's screenshot UI (GNOME's: selection / screen / window,
+    // screenshot / screencast); niri's own quick ones on Ctrl / Alt
+    Print { spawn "cezanne-shell-ctl" "screenshot" "open"; }
+    Ctrl+Print { screenshot-screen; }
+    Alt+Print { screenshot-window; }
+    Mod+Shift+E { quit; }
+}

@@ -1,0 +1,21 @@
+[Unit]
+Description=On-screen keyboard (squeekboard) for the cezanne shell
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+
+[Service]
+Slice=session.slice
+Type=dbus
+BusName=sm.puri.OSK0
+# squeekboard only comes up when GNOME's screen keyboard setting is on
+ExecStartPre=-/usr/bin/gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled true
+# dark, as GNOME's keyboard was
+Environment=GTK_THEME=Adwaita:dark
+# glibc's per-thread arenas (22 for 12 threads): 67 -> 24 MB PSS
+Environment=MALLOC_ARENA_MAX=2
+ExecStart=/usr/bin/squeekboard
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

@@ -28,6 +28,7 @@ cezanne-extensions  own      gnome-extensions
 
 # our software
 cezanne-boost       own      gnome-apps/cezanne-boost
+cezanne-shell       own      shell/cezanne-shell
 cezanne-top         own      gnome-apps/cezanne-top
 cezanne-power       own      gnome-apps/cezanne-power
 cezanne-fm          own      gnome-apps/cezanne-fm

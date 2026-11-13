@@ -1,0 +1,23 @@
+[Unit]
+Description=cezanne shell (Quickshell): panel, dock, launcher, lock screen
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+# niri's session only (niri-session sets XDG_CURRENT_DESKTOP=niri)
+ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+
+[Service]
+Slice=session.slice
+# Qt has no GTK platform theme here: GNOME's icon theme for the shell
+Environment=QS_ICON_THEME=Adwaita
+# Quickshell's jemalloc: one arena (default 4 per CPU: each of its ~16
+# threads kept its own), small thread caches, freed pages back after 2 s.
+# 246 -> 118 MB PSS at start, 265 -> 135 after the menus (sandbox,
+# test/mem.steps); the threaded render loop stays (basic: no further gain)
+Environment=MALLOC_CONF=narenas:1,tcache_max:1024,dirty_decay_ms:2000,muzzy_decay_ms:0
+ExecStart=/usr/bin/qs -p /usr/share/cezanne-shell/shell.qml
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,12 @@
+#!/bin/sh
+# aod-ctl-dummy: cezanne-aod-ctl for the sandbox (no doze, no alarm, no
+# sleep); logs every call to /var/tmp/cezsb/out/aod.log. A "sleep" waits
+# 4 s and reports an RTC-like wake (no PMIC), so the AOD sleeps again.
+echo "$(date +%T.%N | cut -c1-12) $*" >>/var/tmp/cezsb/out/aod.log
+case $1 in
+sleep) sleep 4; echo "1 999 rtc" ;;
+lux) echo 12 ;;
+power) echo "1 81 charging 0" ;;
+charge) echo "${CEZANNE_DUMMY_CHARGE:-direct 21400}" ;;
+esac
+exit 0

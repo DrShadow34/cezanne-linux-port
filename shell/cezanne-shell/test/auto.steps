@@ -1,0 +1,7 @@
+run sh -c "for i in \$(seq 1 40); do echo \$(date +%s.%N | cut -c7-14) \$(cat /var/tmp/cezsb/out/backlight/test/brightness); sleep 0.5; done > /var/tmp/cezsb/out/bl.log"
+sleep 21
+ipc popup toggle quick
+sleep 1.5
+shot a1-quick
+ipc popup close
+sleep 1

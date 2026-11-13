@@ -1,0 +1,7 @@
+#!/bin/sh
+# light-dummy: monitor-sensor --light for the sandbox (the sensor claim
+# needs the active session): 5 lux, 300 lux after 4 s, 2 lux 4 s later
+echo "=== Has ambient light sensor (value: 5.000000, unit: lux)"
+sleep 4; echo "    Light changed: 300.000000 (lux)"
+sleep 4; echo "    Light changed: 2.000000 (lux)"
+exec sleep 600

@@ -1,0 +1,13 @@
+sleep 6
+run notify-send -a TestApp Hello World
+sleep 2
+ipc popup toggle calendar
+sleep 1.5
+ipc popup close
+sleep 0.5
+run notify-send -u low LowOne x
+sleep 1.5
+ipc lock lock
+sleep 1.5
+run notify-send -a App2 WhileLocked x
+sleep 2

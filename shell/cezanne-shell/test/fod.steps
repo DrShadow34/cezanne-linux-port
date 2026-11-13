@@ -1,0 +1,14 @@
+sleep 5
+ipc lock lock
+sleep 4
+shot f0-locked
+sleep 3.5
+shot f1-spot
+run cat /var/tmp/cezsb/out/hbm >> /var/tmp/cezsb/out/hbm.log
+sleep 3.5
+shot f2-press
+run cat /var/tmp/cezsb/out/hbm >> /var/tmp/cezsb/out/hbm.log
+sleep 4
+shot f3-after
+run cat /var/tmp/cezsb/out/hbm >> /var/tmp/cezsb/out/hbm.log
+sleep 1

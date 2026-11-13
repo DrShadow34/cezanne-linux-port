@@ -1,0 +1,22 @@
+[Unit]
+Description=Idle blank, lock and sleep for the cezanne shell (swayidle)
+PartOf=graphical-session.target
+After=graphical-session.target cezanne-shell.service
+ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+
+[Service]
+Slice=session.slice
+# 60 s without input: the shell locks and sleeps, into the always-on
+# display when it is on (Aod.qml), else blanked and through logind. A
+# fullscreen window or Caffeine holds an idle inhibitor (cezanne-shell), so
+# a game keeps the screen on. Any logind sleep waits for the lock screen.
+ExecStart=/usr/bin/swayidle -w \
+	timeout 60 'cezanne-shell-ctl aod idle' \
+	resume 'niri msg action power-on-monitors' \
+	before-sleep 'cezanne-shell-ctl lock-wait' \
+	lock 'cezanne-shell-ctl lock lock'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,11 @@
+sleep 5
+ipc popup toggle quick
+sleep 1.5
+shot q1-quick
+ipc popup close
+ipc launcher toggle
+sleep 1.5
+shot q2-launcher
+ipc launcher close
+sleep 1
+shot q3-home

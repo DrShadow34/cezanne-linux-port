@@ -1,0 +1,14 @@
+[Unit]
+Description=Home column for the cezanne shell (empty space beside the apps)
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+
+[Service]
+Slice=session.slice
+ExecStart=/usr/lib/cezanne-shell/cezanne-home
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

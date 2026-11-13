@@ -1,0 +1,12 @@
+sleep 5
+ipc screenshot open
+sleep 2
+shot s1-selection
+run wtype -k Return
+sleep 2.5
+shot s2-after
+ipc screenshot open
+sleep 2
+shot s3-again
+run wtype -k Escape
+sleep 1

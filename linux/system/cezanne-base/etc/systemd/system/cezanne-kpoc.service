@@ -1,0 +1,14 @@
+[Unit]
+Description=Reboot a power-off charging start into a normal boot (lk loads no modem then)
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/cezanne/cezanne-kpoc
+StateDirectory=cezanne-kpoc
+
+[Install]
+WantedBy=sysinit.target

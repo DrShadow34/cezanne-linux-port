@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- two bolts: fast charging, 9 V PD or QC (cezanne-shell's quick menu) -->
+  <path fill="#2e3436" transform="translate(1.3 1)" d="M4.2 0 0 8.2h2.6L1.6 14 6 5.4H3.4z"/>
+  <path fill="#2e3436" transform="translate(8.7 1)" d="M4.2 0 0 8.2h2.6L1.6 14 6 5.4H3.4z"/>
+</svg>

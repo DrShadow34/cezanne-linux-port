@@ -1,0 +1,9 @@
+#!/bin/sh
+# fod-dummy: cezanne-fpd's org.cezanne.Fod State for the sandbox, as gdbus
+# monitor prints it: waiting 6 s after the lock, pressed 4 s later, waiting
+# again after 4 s (the shell starts it when it locks).
+st() { echo "/org/cezanne/Fod: org.freedesktop.DBus.Properties.PropertiesChanged ('org.cezanne.Fod', {'State': <uint32 $1>}, @as [])"; }
+sleep 6; st 1
+sleep 4; st 2
+sleep 4; st 1
+exec sleep 600

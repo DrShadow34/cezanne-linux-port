@@ -1,0 +1,27 @@
+#%PAM-1.0
+# cezanne: the user's login through greetd (the cezanne-shell greeter). As
+# cezanne-base's gdm-password: Arch's system-local-login with the auth part
+# inlined so that a cancelled conversation (PAM_AUTHTOK_ERR / PAM_CONV_ERR)
+# fails without counting for pam_faillock; a wrong password still counts.
+# The keyring is unlocked with the login password.
+
+auth       required                    pam_securetty.so
+auth       required                    pam_shells.so
+auth       requisite                   pam_nologin.so
+auth       required                    pam_faillock.so      preauth
+-auth      [success=4 default=ignore]  pam_systemd_home.so
+auth       [success=2 conv_err=1 authtok_err=1 default=bad] pam_unix.so try_first_pass nullok
+auth       [default=die]               pam_faillock.so      authfail
+auth       requisite                   pam_deny.so
+auth       optional                    pam_permit.so
+auth       required                    pam_env.so
+auth       required                    pam_faillock.so      authsucc
+-auth      optional                    pam_gnome_keyring.so
+
+account    include                     system-local-login
+
+password   include                     system-local-login
+-password  optional                    pam_gnome_keyring.so use_authtok
+
+session    include                     system-local-login
+-session   optional                    pam_gnome_keyring.so auto_start

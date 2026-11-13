@@ -9,7 +9,7 @@
 # and run its boot-flashing hook).
 pkgname=cezanne-usb
 pkgver=1.0
-pkgrel=7
+pkgrel=8
 pkgdesc="USB modes: webcam stream, MTP storage, developer network, charge only"
 arch=(aarch64)
 license=(MIT)

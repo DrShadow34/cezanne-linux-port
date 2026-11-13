@@ -1,0 +1,6 @@
+sleep 5
+run qs -p /var/tmp/cezsb/test/typetarget.qml
+sleep 4
+run sh -c "niri msg --json windows > /var/tmp/cezsb/out/win.json; niri msg --json outputs > /var/tmp/cezsb/out/out.json"
+sleep 1
+shot w1

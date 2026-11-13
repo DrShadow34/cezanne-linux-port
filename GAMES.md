@@ -15,7 +15,7 @@ Mesa (`software-patches/fex-guestos-mesa`).
 | Big-core clocks under load | `linux/dts/mt6885.dtsi` (cpu-big thermal zones), `linux/system/cezanne-base` `etc/udev/rules.d/69-cezanne-thermal.rules` | The A77 thermal zones run the power_allocator governor (switch-on 55 C, control 80 C, 1.1 W sustainable). In games the big cores hold 1.75-1.93 GHz at 65-77 C. The previous step_wise trip (75 C, 15 C hysteresis) left them at 730 MHz, and the game threads ran on the A55s. |
 | MangoHud | `software-patches/mangohud`, `linux/system/cezanne-base` `etc/MangoHud.conf` | Arch's MangoHud with the MediaTek temperature sensors. The system config sets the default panels and a control socket for each game process (`control=mangohud-%p`). |
 | Hide / show MangoHud from a gamepad | `linux/system/cezanne-base` `usr/local/bin/cezanne-hud-pad` (user service) | Hold L3 for 0.4 s to hide or show the overlay; a short click doesn't toggle it (the game sees L3 either way). The service sends `:hud;` to every MangoHud control socket. It reads the pads without grabbing them and skips Steam's virtual pad. Keyboard: Shift_R+F12. Back paddles: assign one to L3 on the controller (they send nothing until assigned). |
-| Screen stays on | `gnome-extensions/cezanne-game-awake@arch-port` | Inhibits idle while a Steam game runs or a window is fullscreen. |
+| Screen stays on | `shell/cezanne-shell` `shell/shell.qml` | A fullscreen window holds an idle inhibitor and hides the panel, dock and banners. Under GNOME it was `gnome-extensions/cezanne-game-awake@arch-port`, which also covered a running Steam game. |
 
 ## MangoHud for every Steam game
 

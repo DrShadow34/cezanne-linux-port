@@ -1,0 +1,24 @@
+#!/bin/sh
+# cezanne-kpoc: a charger that powers the phone on makes lk start it for
+# power-off charging (boot mode 8, KERNEL_POWER_OFF_CHARGING); lk then
+# loads no modem image, and our kernel comes up as a normal system without
+# the modem (+~20 mA in standby, no calls). Like MIUI's charger screen on
+# a power key press: reboot, which lk starts as a normal boot. Once only:
+# after a reboot that came back in mode 8 again, stay up as it is (the
+# marker goes on the next normal boot).
+M=/var/lib/cezanne-kpoc/rebooted
+mode=$(/usr/local/lib/cezanne/cezanne-bootmode) || { echo "lk boot mode unknown"; exit 0; }
+if [ "$mode" != 8 ]; then
+	rm -f $M
+	exit 0
+fi
+if [ -e $M ]; then
+	echo "power-off charging boot again after a reboot: staying up, without the modem"
+	exit 0
+fi
+: > $M
+sync
+echo "power-off charging boot (lk mode 8): rebooting into a normal boot"
+# this early there is no system bus: systemctl logs that logind is out of
+# reach and starts reboot.target itself
+systemctl --no-block reboot

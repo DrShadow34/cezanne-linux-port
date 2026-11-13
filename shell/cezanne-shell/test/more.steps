@@ -1,0 +1,18 @@
+# notifications, Wi-Fi list, unlock prompt
+sleep 5
+shot 11-dock
+run notify-send -a Chats "Alice" "Are we still on for tonight? I can bring the board games."
+sleep 1
+shot 12-banner
+ipc popup toggle calendar
+sleep 1
+shot 13-list
+ipc popup quick wifi
+sleep 4
+shot 14-wifi
+ipc popup close
+ipc lock lock
+sleep 1
+ipc lock prompt
+sleep 1
+shot 15-prompt

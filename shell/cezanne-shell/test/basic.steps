@@ -1,0 +1,27 @@
+# the shell's screens one after the other
+sleep 5
+shot 01-home
+ipc popup toggle quick
+sleep 1
+shot 02-quick
+ipc popup toggle calendar
+sleep 1
+shot 03-calendar
+ipc popup toggle power
+sleep 1
+shot 04-power
+ipc popup close
+ipc launcher toggle
+sleep 1.5
+shot 05-launcher
+ipc launcher close
+run gnome-text-editor
+sleep 4
+shot 06-app
+niri toggle-overview
+sleep 1.2
+shot 07-overview
+niri toggle-overview
+ipc lock lock
+sleep 1.5
+shot 08-lock

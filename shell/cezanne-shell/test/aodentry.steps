@@ -1,0 +1,12 @@
+sleep 5
+ipc lock lock
+sleep 2
+run sh -c "echo MARK-power >> /var/tmp/cezsb/out/aod.log"
+ipc aod power
+sleep 0.25
+shot d1-fading
+sleep 0.3
+shot d2-black
+sleep 0.6
+shot d3-clock
+sleep 2

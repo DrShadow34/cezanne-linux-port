@@ -1,0 +1,77 @@
+# The phone shell on niri, in place of GNOME Shell and GDM (2026-11-13):
+# a Quickshell config (panel, quick menu, calendar and notifications,
+# launcher, dock, lock screen, polkit agent, rotation, volume OSD), niri's
+# session config, the greeter (greetd + its own niri + the same Quickshell
+# components), swayidle for blank / lock / sleep, squeekboard as the
+# on-screen keyboard. See README.md.
+pkgname=cezanne-shell
+pkgver=0.1
+pkgrel=26
+pkgdesc="Phone shell for niri: panel, quick menu, notifications, launcher, dock, lock screen, greeter"
+arch=(aarch64)
+license=(MIT)
+depends=(niri xwayland-satellite quickshell squeekboard greetd swayidle iio-sensor-proxy
+         wireplumber xdg-desktop-portal-gnome xdg-desktop-portal-gtk geoclue gnome-keyring
+         glib2 adwaita-icon-theme adwaita-fonts wtype feedbackd grim wl-clipboard ffmpeg
+         gstreamer gst-plugins-bad gst-plugin-pipewire)
+optdepends=('playerctl: media keys'
+            'cezanne-fp: fingerprint unlock on the lock screen (with fprintd'\''s pam_fprintd)')
+backup=(etc/niri/config.kdl
+        etc/greetd/cezanne.toml
+        etc/pam.d/cezanne-greetd
+        etc/pam.d/cezanne-shell
+        etc/pam.d/cezanne-shell-fingerprint)
+makedepends=(wayland-protocols)
+install=cezanne-shell.install
+
+build() {
+  # resident all session long: C, not scripts
+  cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -o cezanne-touch "$startdir/cezanne-touch.c"
+  local p=/usr/share/wayland-protocols/stable
+  wayland-scanner client-header $p/xdg-shell/xdg-shell.xml xdg-shell-client-protocol.h
+  wayland-scanner private-code $p/xdg-shell/xdg-shell.xml xdg-shell-protocol.c
+  wayland-scanner client-header $p/viewporter/viewporter.xml viewporter-client-protocol.h
+  wayland-scanner private-code $p/viewporter/viewporter.xml viewporter-protocol.c
+  cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -I. -o cezanne-home "$startdir/cezanne-home.c" \
+    xdg-shell-protocol.c viewporter-protocol.c $(pkg-config --cflags --libs wayland-client)
+  # shellcheck disable=SC2046
+  cc $CFLAGS $CPPFLAGS $LDFLAGS -Wall -o cezanne-screencast "$startdir/cezanne-screencast.c" \
+    $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-video-1.0 gio-unix-2.0)
+}
+
+package() {
+  install -Dm755 cezanne-touch "$pkgdir/usr/lib/cezanne-shell/cezanne-touch"
+  install -Dm755 cezanne-home "$pkgdir/usr/lib/cezanne-shell/cezanne-home"
+  install -Dm755 cezanne-screencast "$pkgdir/usr/lib/cezanne-shell/cezanne-screencast"
+  cd "$startdir"
+  local f
+  for f in shell/*.qml; do
+    install -Dm644 "$f" "$pkgdir/usr/share/cezanne-shell/${f#shell/}"
+  done
+  for f in shell/icons/*.svg; do
+    install -Dm644 "$f" "$pkgdir/usr/share/cezanne-shell/icons/${f##*/}"
+  done
+  install -Dm644 niri/greeter.kdl "$pkgdir/usr/share/cezanne-shell/greeter-niri.kdl"
+  install -Dm644 niri/config.kdl "$pkgdir/etc/niri/config.kdl"
+  install -Dm755 bin/cezanne-shell-ctl "$pkgdir/usr/bin/cezanne-shell-ctl"
+  install -Dm755 bin/cezanne-aod-ctl "$pkgdir/usr/lib/cezanne-shell/cezanne-aod-ctl"
+
+  install -Dm644 greetd/cezanne.toml "$pkgdir/etc/greetd/cezanne.toml"
+  install -Dm644 systemd/system/greetd.service.d/cezanne.conf \
+    "$pkgdir/usr/lib/systemd/system/greetd.service.d/cezanne.conf"
+  install -Dm644 pam.d/cezanne-greetd "$pkgdir/etc/pam.d/cezanne-greetd"
+  install -Dm644 pam.d/cezanne-shell "$pkgdir/etc/pam.d/cezanne-shell"
+  install -Dm644 pam.d/cezanne-shell-fingerprint "$pkgdir/etc/pam.d/cezanne-shell-fingerprint"
+  install -Dm644 tmpfiles.d/cezanne-shell.conf "$pkgdir/usr/lib/tmpfiles.d/cezanne-shell.conf"
+
+  # the session's user units, on for every user (they only start in niri)
+  install -d "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants"
+  for f in systemd/user/*.service; do
+    install -Dm644 "$f" "$pkgdir/usr/lib/systemd/user/${f##*/}"
+    ln -s "../${f##*/}" "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants/${f##*/}"
+  done
+  install -Dm644 systemd/user/niri.service.d/cezanne.conf \
+    "$pkgdir/usr/lib/systemd/user/niri.service.d/cezanne.conf"
+
+  install -Dm644 README.md "$pkgdir/usr/share/doc/cezanne-shell/README.md"
+}

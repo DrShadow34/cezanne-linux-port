@@ -1,0 +1,89 @@
+#!/bin/sh
+# cezanne-aod-ctl: the always-on display's system side, for cezanne-shell
+# (Aod.qml), and the charging state for the quick menu. The desktop user may
+# do all of it: the video group writes the panel's doze attribute, the RTC
+# alarm and /sys/power (cezanne-base: tmpfiles cezanne-aod.conf, udev).
+#   doze LEVEL         panel doze: 0 off, 1 low, 2 high (it shows its frame
+#                      memory by itself, through crtc disable and suspend);
+#                      fails while the DSI link is off
+#   alarm EPOCH        RTC wake alarm at EPOCH (0: none)
+#   sleep deep|s2idle  sleep now, not through logind (on every logind resume
+#                      NetworkManager re-associates Wi-Fi, and geoclue's
+#                      lookup after it woke the phone again); prints
+#                      "SLEPT IRQ ACTION": SLEPT 1 if it slept, IRQ the wake
+#                      interrupt (0: none), ACTION its handler
+#   lux                ambient light (waits ~0.4 s for the first sample)
+#   power              "VBUS CAPACITY CHARGING BLOCKED": cable 0/1, battery %,
+#                      none / charging / fast / direct, 1 when something holds
+#                      logind's sleep block inhibitor
+#   charge             "CHARGING MW": as above, and the power into the battery
+#                      (gauge current x voltage, mW)
+DOZE=/sys/bus/mipi-dsi/devices/1400e000.dsi.0/doze
+WAKEALARM=/sys/class/rtc/rtc0/wakealarm
+PS=/sys/class/power_supply
+
+# none / charging (5 V) / fast (PD above 5 V or a QC charger raised: 9 V
+# into the MT6360) / direct (a BQ25970 charge pump session, PPS or QC 3:
+# cezanne-dcharge holds /run/cezanne-dcharge; the pump itself is not read,
+# an I2C read of a stopped pump can take seconds)
+kind() {
+	[ "$(cat $PS/battery/status 2>/dev/null)" = Charging ] || { echo none; return; }
+	[ -e /run/cezanne-dcharge ] && { echo direct; return; }
+	for p in $PS/tcpm-source-psy-*; do
+		[ -e "$p/online" ] || continue
+		[ "$(cat "$p/online")" != 0 ] && [ "$(cat "$p/voltage_now")" -gt 5500000 ] && { echo fast; return; }
+	done
+	[ "$(cat $PS/xmusb350/qc_voltage 2>/dev/null || echo 0)" -gt 5500 ] && { echo fast; return; }
+	echo charging
+}
+
+case $1 in
+doze)
+	echo "$2" >$DOZE 2>/dev/null
+	;;
+alarm)
+	echo 0 >$WAKEALARM && { [ "$2" = 0 ] || echo "$2" >$WAKEALARM; }
+	;;
+sleep)
+	# no wakeup_count handshake: the Wi-Fi driver's wakelocks count as
+	# wakeup events (~30/s) and aborted every suspend; as with logind only
+	# a wake interrupt aborts it (the write fails, EBUSY)
+	if [ "$2" = deep ]; then
+		echo deep >/sys/power/mem_sleep && echo mem >/sys/power/state 2>/dev/null
+	else
+		echo freeze >/sys/power/state 2>/dev/null
+	fi
+	slept=$?
+	irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null)
+	action=$(cat /sys/kernel/irq/${irq:-0}/actions 2>/dev/null)
+	echo "$([ $slept = 0 ] && echo 1 || echo 0) ${irq:-0} ${action:-none}"
+	;;
+lux)
+	for d in /sys/bus/iio/devices/*; do
+		[ -r "$d/in_illuminance_input" ] && exec cat "$d/in_illuminance_input"
+	done
+	echo 0
+	;;
+power)
+	vbus=0
+	for p in $PS/mt6360-chg*; do
+		[ "$(cat "$p/online" 2>/dev/null)" = 1 ] && vbus=1
+	done
+	cap=$(cat $PS/battery/capacity 2>/dev/null)
+	kind=$(kind)
+	blocked=0
+	busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+		org.freedesktop.login1.Manager BlockInhibited 2>/dev/null |
+		tr ':"' '\n\n' | grep -qx sleep && blocked=1
+	echo "$vbus ${cap:-0} $kind $blocked"
+	;;
+charge)
+	ua=$(cat $PS/battery/current_now 2>/dev/null || echo 0)
+	uv=$(cat $PS/battery/voltage_now 2>/dev/null || echo 0)
+	echo "$(kind) $(( ua / 1000 * (uv / 1000) / 1000 ))"
+	;;
+*)
+	echo "usage: cezanne-aod-ctl doze LEVEL | alarm EPOCH | sleep deep|s2idle | lux | power | charge" >&2
+	exit 2
+	;;
+esac

@@ -1,0 +1,9 @@
+sleep 6
+ipc usb dialog modes
+sleep 1.5
+shot u1-modes
+ipc usb dialog sources
+sleep 1.5
+shot u2-sources
+ipc popup close
+sleep 1

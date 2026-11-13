@@ -2320,6 +2320,14 @@ static void wait_driver(int timeout)
 
 	while (access(SYS "/state", F_OK) || access("/dev/ccci_fs", F_OK)) {
 		if (now_s() > end) {
+			/* module loaded, device not bound: the probe found no MD
+			 * image from lk (charger or recovery boot), which no retry
+			 * changes this boot (the unit's RestartPreventExitStatus) */
+			if (!access("/sys/module/cezanne_ccci", F_OK) &&
+			    !access(SYS, F_OK) && access(SYS "/driver", F_OK)) {
+				fputs("cezanne-ccci: no MD image from lk this boot, not retrying\n", stderr);
+				exit(3);
+			}
 			fputs("cezanne-ccci driver not loaded\n", stderr);
 			exit(1);
 		}

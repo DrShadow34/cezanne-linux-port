@@ -6,7 +6,7 @@
 # the stock vendor image, mainline/modem/tools/install-mdota.sh).
 pkgname=cezanne-modem
 pkgver=1.0
-pkgrel=17
+pkgrel=19
 pkgdesc="Modem file service, RPC, boot and call audio for the cezanne"
 arch=(aarch64)
 license=(MIT)
@@ -20,8 +20,11 @@ source=(cezanne-modemd.c
         cezanne-modem-nvram-import
         cezanne-modem.service
         cezanne-speechd.service
-        78-cezanne-modem.rules)
-sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP)
+        78-cezanne-modem.rules
+        cezanne-sim-watch
+        cezanne-sim-watch.service
+        cezanne-sim.conf)
+sha256sums=(SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP SKIP)
 
 build() {
   # resident: C, not Python (~0.2 instead of ~11 MiB; speechd ~25 MiB)
@@ -45,4 +48,16 @@ package() {
   install -d "$wants"
   ln -s ../calls-daemon.service "$wants/calls-daemon.service"
   ln -s ../sm.puri.Chatty-daemon.service "$wants/sm.puri.Chatty-daemon.service"
+  # niri: XDG autostart starts them; only once the modem has a SIM
+  # (cezanne-sim-watch), else they and their contacts / accounts services
+  # hold ~186 MB for nothing
+  local u="$pkgdir/usr/lib/systemd/user" d
+  install -Dm755 cezanne-sim-watch "$pkgdir/usr/lib/cezanne-modem/cezanne-sim-watch"
+  install -Dm644 cezanne-sim-watch.service "$u/cezanne-sim-watch.service"
+  install -d "$u/graphical-session.target.wants"
+  ln -s ../cezanne-sim-watch.service "$u/graphical-session.target.wants/cezanne-sim-watch.service"
+  for d in 'app-org.gnome.Calls\x2ddaemon@autostart.service.d' \
+           'app-sm.puri.Chatty\x2ddaemon@autostart.service.d'; do
+    install -Dm644 cezanne-sim.conf "$u/$d/cezanne-sim.conf"
+  done
 }

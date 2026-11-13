@@ -1,0 +1,13 @@
+[Unit]
+Description=Geoclue agent for the cezanne shell (GNOME Shell was it before)
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+
+[Service]
+Slice=session.slice
+ExecStart=/usr/lib/geoclue-2.0/demos/agent
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

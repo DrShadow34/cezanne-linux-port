@@ -1,0 +1,6 @@
+sleep 6
+run sh -c "echo MARK-LOCK >&2"
+ipc lock lock
+sleep 4
+run sh -c "echo MARK-END >&2"
+sleep 1

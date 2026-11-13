@@ -1,0 +1,10 @@
+sleep 5
+ipc lock lock
+sleep 2
+ipc lock prompt
+sleep 1
+run wtype abcd
+sleep 1
+shot p1-typed
+run wtype -k Escape
+sleep 1

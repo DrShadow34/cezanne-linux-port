@@ -1,0 +1,7 @@
+sleep 6
+ipc popup toggle quick
+sleep 1.5
+shot t1-quick
+ipc popup close
+sleep 1
+run cat /var/tmp/cezsb/out/panel/dc_dimming /var/tmp/cezsb/out/panel/color_mode > /var/tmp/cezsb/out/panel.log

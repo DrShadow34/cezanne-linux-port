@@ -1,0 +1,18 @@
+sleep 8
+mem start
+ipc popup toggle quick
+sleep 1.5
+ipc popup close
+sleep 1
+ipc launcher toggle
+sleep 2
+ipc launcher close
+sleep 1
+ipc popup toggle calendar
+sleep 1.5
+ipc popup close
+sleep 12
+mem menus
+ipc lock lock
+sleep 3
+mem locked

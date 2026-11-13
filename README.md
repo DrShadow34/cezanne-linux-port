@@ -44,6 +44,12 @@ There are couple caveats:
 
 ### Other known quirks?
 
+> [!NOTE]
+> The port has migrated from GNOME to [niri](https://github.com/niri-wm/niri) with its own Quickshell shell (`shell/cezanne-shell`, see [SHELL.md](SHELL.md)). Because of that, some links to GNOME still exist:
+> - the `gnome-extensions/` and `gnome-apps/` directory names;
+> - apps relying on GTK4 / libadwaita and other GNOME parts (Snapshot, GSettings, GNOME Settings, Nautilus);
+> - the mutter and gnome-shell patches described below, which only matter to a GNOME session.
+
 Yep, a few:
 1. Those who will bother to check this repo, will notice, that custom PKGBUILDs have even gnome-shell and mutter. The reason behind it is that gnome's UX/UI absolutely awful on the phone:
    - Mutter pre-rotates image if your screen is rotated (or even if not rotated, just for fun I guess), doing so cost enormous amount of GPU performance, which this particular iGPU have none to spare. It can cost ~30-40% in vkQuake simply due to mutter compositing. Patch helps with hardware pre-rotating, which fixes that.

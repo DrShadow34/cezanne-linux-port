@@ -24,7 +24,8 @@ pkgver() {
 
 # c/NAME.c -> install path
 _cbins=(cezanne-popupd:usr/local/bin cezanne-dcharge:usr/local/bin
-        cezanne-amp-usecase:usr/local/bin sunlight-boost:usr/local/lib/cezanne)
+        cezanne-amp-usecase:usr/local/bin sunlight-boost:usr/local/lib/cezanne
+        cezanne-bootmode:usr/local/lib/cezanne)
 
 build() {
   local b

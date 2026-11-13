@@ -1,0 +1,18 @@
+#!/bin/sh
+# cezanne-shell-ctl TARGET FUNCTION [ARGS...]: call the running cezanne-shell
+# (Quickshell IPC), e.g. `launcher toggle`, `popup toggle quick`, `lock lock`.
+# cezanne-shell-ctl lock-wait: lock and wait (up to 3 s) until niri shows
+# the lock surface; swayidle runs it before the system sleeps.
+SHELL_QML=${CEZANNE_SHELL_QML:-/usr/share/cezanne-shell/shell.qml}
+
+if [ "$1" = lock-wait ]; then
+	qs ipc -p "$SHELL_QML" call lock lock || exit 1
+	i=0
+	while [ $i -lt 30 ]; do
+		[ "$(qs ipc -p "$SHELL_QML" call lock isLocked 2>/dev/null)" = true ] && exit 0
+		sleep 0.1
+		i=$((i + 1))
+	done
+	exit 1
+fi
+exec qs ipc -p "$SHELL_QML" call "$@"

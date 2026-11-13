@@ -1,0 +1,13 @@
+[Unit]
+Description=Calls and SMS daemons once the modem has a SIM (cezanne)
+PartOf=graphical-session.target
+After=graphical-session.target
+# in niri they come from XDG autostart (GNOME starts its own units)
+ConditionEnvironment=XDG_CURRENT_DESKTOP=niri
+
+[Service]
+Slice=session.slice
+ExecStart=/usr/lib/cezanne-modem/cezanne-sim-watch
+
+[Install]
+WantedBy=graphical-session.target

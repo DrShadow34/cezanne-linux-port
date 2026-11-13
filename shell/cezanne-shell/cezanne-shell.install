@@ -1,0 +1,19 @@
+post_install() {
+  systemd-tmpfiles --create cezanne-shell.conf
+  # the login screen: greetd in place of GDM (both are display-manager.service)
+  if systemctl -q is-enabled gdm.service 2>/dev/null; then
+    systemctl disable gdm.service
+  fi
+  systemctl enable greetd.service
+  echo ":: greetd is the display manager now; it starts at the next boot"
+  echo "   (or: systemctl restart display-manager, which ends a running GNOME session)"
+}
+
+post_upgrade() {
+  systemd-tmpfiles --create cezanne-shell.conf
+}
+
+pre_remove() {
+  systemctl disable greetd.service 2>/dev/null
+  echo ":: greetd disabled; enable a display manager again (e.g. systemctl enable gdm)"
+}

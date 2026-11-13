@@ -1,0 +1,21 @@
+sleep 5
+run qs -p /var/tmp/cezsb/test/typetarget.qml
+sleep 4
+run wtype before
+sleep 1
+shot k1-target
+ipc launcher toggle
+sleep 1.5
+run wtype LEAK
+sleep 1
+shot k2-launcher-typed
+ipc popup toggle quick
+sleep 1.5
+shot k3-launcher-to-quick
+run wtype LEAK2
+sleep 1
+ipc popup close
+sleep 1
+run wtype after
+sleep 1
+shot k4-target-after

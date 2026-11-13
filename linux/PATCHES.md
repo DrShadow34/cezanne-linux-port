@@ -103,6 +103,7 @@ Not in the patches:
 | 0068 | mtu3: GPD ring for UVC isochronous requests |
 | 0069 | UVC gadget: disable the endpoint on alternate setting 0 |
 | 0070 | mtu3: suspend the device MAC without a bound gadget |
+| 0083 | mtu3: set the IP up again after deep suspend (the SPM resets it; no enumeration after resume before) |
 | 0035 | TCPCI MT6360: enable the alerts |
 | 0040 | TCPCI MT6360: source VBUS (OTG) from the MT6360 boost |
 | 0039 | FSA4480: MIC / GND swap fallback when detection misses a headset |

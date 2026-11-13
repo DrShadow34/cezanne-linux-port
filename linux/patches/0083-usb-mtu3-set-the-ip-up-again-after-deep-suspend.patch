@@ -1,0 +1,73 @@
+From: cezanne port
+Subject: [PATCH] usb: mtu3: set the IP up again when deep suspend reset it
+
+On the cezanne (MT6885) the deepest SPM suspend resets the SSUSB IP's
+power control block (IPPC), as it does the LVTS and SVS controllers
+(0063, 0064): SSUSB_IP_PW_CTRL0 comes back with the software reset
+asserted, IP_PW_STS1 reads 0 ("clks of sts1 are not stable"), every
+device MAC register reads 0 and the gadget's pull-up does nothing: no
+host sees the phone again until a reboot. Seen 2026-11-13 after the
+phone slept unplugged; clearing the reset by hand plus a role toggle
+brought the link back at once.
+
+On resume, when the reset bit is set: pulse it as probe does, restore the
+dual-role force mode, and in the gadget resume enable port 0 for the
+device MAC and redo its probe-time register setup.
+
+--- a/drivers/usb/mtu3/mtu3.h
++++ b/drivers/usb/mtu3/mtu3.h
+@@ -268,6 +268,7 @@
+ 	int u3p_dis_msk;
+ 	bool force_vbus;
+ 	bool kept_powered;
++	bool ip_lost;
+ 	bool no_partner;
+ 	struct dentry *dbgfs_root;
+ 	/* usb wakeup for host mode */
+--- a/drivers/usb/mtu3/mtu3_plat.c
++++ b/drivers/usb/mtu3/mtu3_plat.c
+@@ -589,7 +589,25 @@
+ 	if (ret)
+ 		goto phy_err;
+ 
+-	return resume_ip_and_ports(ssusb, msg);
++	/*
++	 * The deepest SPM suspend resets the IP's power control block, as it
++	 * does the LVTS and SVS controllers: the software reset asserted
++	 * again, the clocks never stable ("clks of sts1 are not stable"), the
++	 * gadget's pull-up without effect until a reboot. Pulse the reset as
++	 * probe does; the ports come up again in ssusb_gadget_resume().
++	 */
++	if (mtu3_readl(ssusb->ippc_base, U3D_SSUSB_IP_PW_CTRL0) & SSUSB_IP_SW_RST) {
++		dev_info(dev, "IP was reset in suspend, setting it up again\n");
++		ssusb_ip_sw_reset(ssusb);
++		if (ssusb->dr_mode == USB_DR_MODE_OTG)
++			ssusb_set_force_mode(ssusb, ssusb->is_host ?
++					     MTU3_DR_FORCE_HOST : MTU3_DR_FORCE_DEVICE);
++		ssusb->ip_lost = true;
++	}
++
++	ret = resume_ip_and_ports(ssusb, msg);
++	ssusb->ip_lost = false;		/* host role: no gadget resume */
++	return ret;
+ 
+ phy_err:
+ 	clk_bulk_disable_unprepare(BULK_CLKS_CNT, ssusb->clks);
+--- a/drivers/usb/mtu3/mtu3_core.c
++++ b/drivers/usb/mtu3/mtu3_core.c
+@@ -1081,6 +1081,15 @@
+ {
+ 	struct mtu3 *mtu = ssusb->u3d;
+ 
++	/* the IP was reset in suspend (mtu3_resume_common()): port 0 to the
++	 * device MAC and its registers as at probe */
++	if (ssusb->ip_lost) {
++		ssusb->ip_lost = false;
++		mtu3_device_enable(mtu);
++		mtu3_regs_init(mtu);
++		mtu3_set_speed(mtu, mtu->speed);
++	}
++
+ 	if (!mtu->gadget_driver) {
+ 		mtu3_dev_resume(mtu);		/* see ssusb_gadget_suspend() */
+ 		return 0;

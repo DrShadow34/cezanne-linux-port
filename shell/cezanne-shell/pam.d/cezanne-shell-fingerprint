@@ -1,0 +1,15 @@
+#%PAM-1.0
+# cezanne: the cezanne-shell lock screen's fingerprint conversation
+# (Quickshell PamContext, beside the password one): pam_fprintd on
+# cezanne-fpd (cezanne-fp), which watches the sensor spot itself. The lock
+# screen aborts it for the AOD and the password keyboard and starts it again.
+# A fingerprint unlock resets pam_faillock's count, as a password does.
+
+auth       required                    pam_shells.so
+auth       requisite                   pam_nologin.so
+auth       requisite                   pam_faillock.so      preauth
+auth       required                    pam_fprintd.so max-tries=5 timeout=600
+auth       required                    pam_faillock.so      authsucc
+auth       optional                    pam_permit.so
+
+account    include                     system-local-login

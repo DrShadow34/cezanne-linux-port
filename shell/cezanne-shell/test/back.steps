@@ -1,0 +1,10 @@
+sleep 5
+ipc lock lock
+sleep 7
+shot b1-spot
+ipc lock prompt
+sleep 1
+shot b2-prompt
+run wtype -k Escape
+sleep 0.6
+shot b3-back
