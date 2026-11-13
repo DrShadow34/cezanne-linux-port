@@ -6,7 +6,7 @@
 # on-screen keyboard. See README.md.
 pkgname=cezanne-shell
 pkgver=0.1
-pkgrel=26
+pkgrel=27
 pkgdesc="Phone shell for niri: panel, quick menu, notifications, launcher, dock, lock screen, greeter"
 arch=(aarch64)
 license=(MIT)

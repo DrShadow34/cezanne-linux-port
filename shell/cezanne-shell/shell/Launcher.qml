@@ -23,13 +23,23 @@ PanelWindow {
     WlrLayershell.keyboardFocus: wanted ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
 
     onWantedChanged: if (!wanted) { search.text = ""; search.focus = false; grid.contentY = 0 }
+    Connections {
+        target: ShellState
+        function onLauncherQueryChanged() {
+            if (ShellState.launcherQuery === "") return
+            search.text = ShellState.launcherQuery
+            ShellState.launcherQuery = ""
+        }
+    }
 
     readonly property var apps: {
         const q = search.text.trim().toLowerCase()
         return DesktopEntries.applications.values
             .filter(e => !e.noDisplay && !e.runInTerminal)
+            // keywords is a QML sequence (QStringList), not a JS array:
+            // anything that isn't a string becomes one through Array.from
             .filter(e => q === "" || [e.name, e.genericName, e.keywords, e.id, e.comment]
-                .some(s => (Array.isArray(s) ? s.join(" ") : (s ?? "")).toLowerCase().includes(q)))
+                .some(s => (typeof s === "string" ? s : Array.from(s ?? []).join(" ")).toLowerCase().includes(q)))
             .sort((a, b) => a.name.localeCompare(b.name))
     }
 

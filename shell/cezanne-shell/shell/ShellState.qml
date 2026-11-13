@@ -12,6 +12,9 @@ Singleton {
     property string popup: ""
     // the quick menu's list open when it opens: "", "wifi", "bt"
     property string quickSection: ""
+    // text for the launcher's search field (IPC `launcher search`: the
+    // sandbox has no touch to focus the field)
+    property string launcherQuery: ""
     function toggle(name) { quickSection = ""; popup = popup === name ? "" : name }
     function close() { popup = ""; quickSection = "" }
 

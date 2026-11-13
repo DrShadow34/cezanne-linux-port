@@ -1,0 +1,15 @@
+sleep 5
+ipc launcher open
+sleep 1.5
+shot s1-launcher
+ipc launcher search standby
+sleep 1
+shot s2-keyword
+ipc launcher search sett
+sleep 1
+shot s3-name
+ipc launcher search zzzz
+sleep 1
+shot s4-none
+ipc launcher close
+sleep 1

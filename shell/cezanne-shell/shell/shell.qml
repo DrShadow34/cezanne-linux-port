@@ -123,6 +123,7 @@ ShellRoot {
         target: "launcher"
         function toggle(): void { Niri.closeOverview(); ShellState.toggle("launcher") }
         function open(): void { ShellState.popup = "launcher" }
+        function search(text: string): void { Niri.closeOverview(); ShellState.popup = "launcher"; ShellState.launcherQuery = text }
         function close(): void { ShellState.close() }
     }
     IpcHandler {

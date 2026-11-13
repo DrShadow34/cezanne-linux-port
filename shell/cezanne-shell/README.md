@@ -42,7 +42,7 @@ The shell does not reload itself when its QML changes (`settings.watchFiles: fal
 niri's system config is `/etc/niri/config.kdl`; a user's `~/.config/niri/config.kdl` replaces it as a whole.
 
 IPC: `cezanne-shell-ctl TARGET FUNCTION [ARGS]`:
-- `launcher toggle|open|close`;
+- `launcher toggle|open|close`, `launcher search TEXT` (opens it with TEXT in the search field);
 - `popup toggle quick|calendar|power`, `popup quick wifi|bt`, `popup close`;
 - `lock lock|isLocked|prompt`, and `lock-wait`;
 - `aod power|idle`;
